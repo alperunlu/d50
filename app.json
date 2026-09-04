@@ -1,0 +1,71 @@
+{
+  "expo": {
+    "name": "d50",
+    "slug": "d50",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "scheme": "d50",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.alu.d50",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSMotionUsageDescription": "İvmeölçer, sürüş kaydına hızlanma/frenleme şiddetini eklemek için kullanılır. Veri telefonundan hiçbir yere gönderilmez."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-sqlite",
+      "expo-sharing",
+      "expo-updates",
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": false,
+          "bluetoothAlwaysPermission": "Bu uygulama OBD2 adaptörünüzden (Vgate iCar Pro) motor verilerini SADECE OKUMAK için Bluetooth kullanır. Araca hiçbir zaman yazma/komut göndermez."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Konum, kaydettiğin sürüşe hız/rakım/eğim bilgisini eklemek için kullanılır. 0-100 ölçümü, yokuş düzeltmeli güç tahmini ve kilometre saati sapması bu veriye dayanır. Konum verisi telefonundan hiçbir yere gönderilmez.",
+          "locationWhenInUsePermission": "Konum, kaydettiğin sürüşe hız/rakım/eğim bilgisini eklemek için kullanılır. Veri telefonundan hiçbir yere gönderilmez.",
+          "isIosBackgroundLocationEnabled": false,
+          "isAndroidBackgroundLocationEnabled": false
+        }
+      ]
+    ],
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "83893338-ca07-458b-9158-992327547057"
+      }
+    },
+    "owner": "alperunlu",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/83893338-ca07-458b-9158-992327547057"
+    }
+  }
+}
