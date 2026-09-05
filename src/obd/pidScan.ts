@@ -98,7 +98,7 @@ export async function scanPids(
 
     try {
       rawResponse = (await queue.send(`01${pid}`, timeoutMs)).trim();
-      const hex = extractDataHex(rawResponse);
+      const hex = extractDataHex(rawResponse, pid);
       answered = hex.length > 0;
 
       const def = getPidDefinition(pid);

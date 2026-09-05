@@ -12,6 +12,16 @@
  * kendi aracını tartıp burayı güncellemeli.
  */
 
+/** Lastik ebadı — aracın verisi olduğu için profil dosyasında tanımlı. */
+export interface TyreSize {
+  /** Kesit genişliği (mm), ör. 175. */
+  readonly widthMm: number;
+  /** Yanak oranı (%), ör. 65. */
+  readonly aspectRatio: number;
+  /** Jant çapı (inç), ör. 15. */
+  readonly rimInch: number;
+}
+
 export interface VehicleProfile {
   readonly name: string;
   /** Motor hacmi (litre). */
@@ -30,6 +40,17 @@ export interface VehicleProfile {
   readonly thermostatOpenC: number;
   /** Normal çalışma sıcaklığı (°C). */
   readonly normalCoolantC: number;
+  /**
+   * ECU'nun hız/mesafe hesabında varsaydığı FABRİKA lastik ebadı.
+   * Araca ait sabit bir değer; kullanıcı değiştirmez.
+   */
+  readonly factoryTyre: TyreSize;
+  /**
+   * Fiilen takılı lastik. Varsayılan olarak fabrika ebadı; kullanıcı
+   * kendi ebadını girdiğinde bu alan değişir ve hız/mesafe düzeltmesi,
+   * aktarma oranı ve tork tahmini bu değere dayanır.
+   */
+  readonly fittedTyre: TyreSize;
 }
 
 /** MINI Cooper R50 (2001-2006, W10B16 1.6L). */
@@ -43,7 +64,17 @@ export const MINI_R50: VehicleProfile = {
   idleRpm: 850,
   thermostatOpenC: 88,
   normalCoolantC: 95,
+  // R50 Cooper'ın standart ebadı. Kullanıcı farklı bir ebat taktıysa
+  // `fittedTyre` ayarlardan güncellenir; fabrika değeri sabit kalır çünkü
+  // ECU'nun hız hesabı ona göre kalibre edilmiştir.
+  factoryTyre: { widthMm: 175, aspectRatio: 65, rimInch: 15 },
+  fittedTyre: { widthMm: 175, aspectRatio: 65, rimInch: 15 },
 };
+
+/** Profili farklı bir takılı lastikle kopyalar. */
+export function withFittedTyre(vehicle: VehicleProfile, tyre: TyreSize): VehicleProfile {
+  return { ...vehicle, fittedTyre: tyre };
+}
 
 /** Standart fiziksel sabitler. */
 export const PHYSICS = {

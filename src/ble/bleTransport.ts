@@ -35,6 +35,8 @@ interface PendingRequest {
 const DEFAULT_TIMEOUT_MS = 5000;
 /** Profil sınama komutunun timeout'u — ATI adaptöre gider, hızlı cevaplanır. */
 const PROBE_TIMEOUT_MS = 3000;
+/** Bluetooth yığınının hazır olması için beklenecek azami süre. */
+const BLE_READY_TIMEOUT_MS = 8000;
 
 export class BleTransport implements ObdTransport {
   private readonly manager: BleManager;
@@ -58,18 +60,92 @@ export class BleTransport implements ObdTransport {
     this.manager = manager ?? new BleManager();
   }
 
-  /** UI'nin tarama listesinden bir adaptör göstermesi/seçmesi için. */
+  /**
+   * iOS'un Bluetooth yığını hazır olana kadar bekler.
+   *
+   * NEDEN GEREKLİ (2026-09-05 araç testi): `CBCentralManager` uygulama
+   * açıldığında `Unknown` durumunda başlar ve `PoweredOn`'a birkaç yüz
+   * milisaniye içinde ASENKRON geçer. Bu geçişten önce tarama başlatmak
+   * "device not ready" hatası verir — ilk basışın neden başarısız olup
+   * ikincisinin çalıştığının açıklaması budur. Kullanıcının aynı düğmeye
+   * iki kez basmasını beklemek yerine burada bekliyoruz.
+   *
+   * Bluetooth GERÇEKTEN kapalıysa beklemenin anlamı yok: o durumda net
+   * bir mesajla hemen dönüyoruz, kullanıcı ayarlardan açsın.
+   */
+  private async waitUntilReady(timeoutMs = BLE_READY_TIMEOUT_MS): Promise<void> {
+    const current = await this.manager.state();
+    if (current === 'PoweredOn') return;
+
+    if (current === 'PoweredOff') {
+      throw new Error('Bluetooth is off. Turn it on in Settings and try again.');
+    }
+    if (current === 'Unauthorized') {
+      throw new Error('Bluetooth permission was denied. Allow it for D50 in Settings.');
+    }
+    if (current === 'Unsupported') {
+      throw new Error('This device has no Bluetooth Low Energy support.');
+    }
+
+    this.log(`Bluetooth not ready yet (${current}) — waiting`);
+
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        subscription.remove();
+        reject(new Error('Bluetooth did not become ready in time. Try again.'));
+      }, timeoutMs);
+
+      // `true` = mevcut durumu da hemen bir kez bildir.
+      const subscription = this.manager.onStateChange((state) => {
+        if (state === 'PoweredOn') {
+          clearTimeout(timer);
+          subscription.remove();
+          this.log('Bluetooth ready');
+          resolve();
+        } else if (state === 'PoweredOff' || state === 'Unauthorized' || state === 'Unsupported') {
+          clearTimeout(timer);
+          subscription.remove();
+          reject(new Error(`Bluetooth unavailable (${state}).`));
+        }
+      }, true);
+    });
+  }
+
+  /**
+   * UI'nin tarama listesinden bir adaptör göstermesi/seçmesi için.
+   *
+   * Hazırlık beklemesi yüzünden tarama asenkron başlıyor; dönen durdurma
+   * fonksiyonu bu yüzden "henüz başlamadıysa başlatma" bayrağı da taşıyor.
+   */
   scan(onDevice: (d: ScannedDevice) => void, onError?: (err: Error) => void): () => void {
-    this.manager.startDeviceScan(null, { allowDuplicates: false }, (error, device) => {
-      if (error) {
-        onError?.(new Error(error.message));
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        await this.waitUntilReady();
+      } catch (e) {
+        onError?.(e instanceof Error ? e : new Error(String(e)));
         return;
       }
-      if (device) {
-        onDevice({ id: device.id, name: device.name ?? device.localName ?? null, rssi: device.rssi });
-      }
-    });
+      if (cancelled) return;
+
+      this.manager.startDeviceScan(null, { allowDuplicates: false }, (error, device) => {
+        if (error) {
+          onError?.(new Error(error.message));
+          return;
+        }
+        if (device) {
+          onDevice({
+            id: device.id,
+            name: device.name ?? device.localName ?? null,
+            rssi: device.rssi,
+          });
+        }
+      });
+    })();
+
     return () => {
+      cancelled = true;
       this.manager.stopDeviceScan();
     };
   }
@@ -115,6 +191,8 @@ export class BleTransport implements ObdTransport {
 
     this.setState('connecting');
     try {
+      // Tarama gibi bağlanma da yığın hazır olmadan denenirse başarısız olur.
+      await this.waitUntilReady();
       await this.manager.stopDeviceScan();
 
       const device = await this.manager.connectToDevice(this.targetDeviceId, { autoConnect: false });

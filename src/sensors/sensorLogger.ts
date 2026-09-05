@@ -26,6 +26,11 @@
  * yoksa temiz bir "sensors unavailable" mesajı veriliyor ve uygulamanın geri
  * kalanı çalışmaya devam ediyor.
  */
+import { MicLevelMeter } from './micLevel';
+import { EngineSoundListener, isAudioStreamAvailable } from './engineSound';
+import { DEFAULT_SPL_CALIBRATION_DB } from '../analysis/spl';
+import type { SensorGroupKey } from '../data/channels';
+
 type LocationModule = typeof import('expo-location');
 type SensorsModule = typeof import('expo-sensors');
 
@@ -70,6 +75,19 @@ export interface SensorSample {
 export interface SensorLoggerOptions {
   /** Örnekleri dışarı veren callback (store bunu DB'ye yazar). */
   readonly onSamples: (samples: SensorSample[]) => void;
+  /**
+   * Çalıştırılacak sensör grupları — kullanıcının kanal seçim ekranında
+   * işaretledikleri. Seçilmeyen donanım hiç açılmaz: GPS ve mikrofon pil
+   * yakar, istenmeyen bir sensörü "nasılsa açık" diye çalıştırmak doğru olmaz.
+   */
+  readonly groups: readonly SensorGroupKey[];
+  /**
+   * O anki OBD devri. Order analizinin referansı — devir bilinmeden ses
+   * spektrumundan order çıkarılamaz (bkz. analysis/orderTracking.ts).
+   */
+  readonly getRpm?: () => number | null;
+  /** dBFS -> dB(A) SPL kalibrasyonu (bkz. analysis/spl.ts). */
+  readonly getCalibrationDb?: () => number;
   /** Zaman ekseni referansı — poller ile AYNI olmalı. */
   readonly startedAt: number;
   /** İvmeölçer örnekleme aralığı (ms). Varsayılan 100ms = 10Hz. */
@@ -78,6 +96,8 @@ export interface SensorLoggerOptions {
 }
 
 export type SensorPermission = 'granted' | 'denied' | 'unavailable';
+
+export { isMicrophoneAvailable, requestMicrophonePermission } from './micLevel';
 
 const DEFAULT_ACCEL_INTERVAL_MS = 100;
 /** Örnekler bu aralıkla toplu verilir — örnek başına DB yazımı pahalı. */
@@ -112,6 +132,8 @@ export async function isAccelerometerAvailable(): Promise<boolean> {
 export class SensorLogger {
   private locationSub: { remove: () => void } | null = null;
   private accelSub: { remove: () => void } | null = null;
+  private mic: MicLevelMeter | null = null;
+  private engineSound: EngineSoundListener | null = null;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private buffer: SensorSample[] = [];
   private running = false;
@@ -127,8 +149,44 @@ export class SensorLogger {
 
     this.flushTimer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS);
 
-    await this.startLocation();
-    this.startAccelerometer();
+    if (this.opts.groups.includes('gps')) await this.startLocation();
+    if (this.opts.groups.includes('motion')) this.startAccelerometer();
+    if (this.opts.groups.includes('mic')) await this.startMicrophone();
+  }
+
+  /**
+   * Mikrofon. İki yol var, sırayla deneniyor:
+   *
+   * 1. Ham PCM akışı (`EngineSoundListener`) — hem ses seviyesini hem
+   *    order analizini verir, üstelik diske hiç ses yazmaz. Tercih edilen.
+   * 2. Metering'li kayıt (`MicLevelMeter`) — yalnızca seviye. Ham akış
+   *    çalışmazsa buna düşülüyor: seviyesiz kalmaktansa order'sız kalmak
+   *    yeğdir, ve arabaya ikinci kez gitmek pahalı.
+   *
+   * Hiçbir durumda ses saklanmıyor.
+   */
+  private async startMicrophone(): Promise<void> {
+    if (isAudioStreamAvailable()) {
+      this.engineSound = new EngineSoundListener({
+        getRpm: () => this.opts.getRpm?.() ?? null,
+        getCalibrationDb: () =>
+          this.opts.getCalibrationDb?.() ?? DEFAULT_SPL_CALIBRATION_DB,
+        onSamples: (samples) => {
+          const ts = Date.now() - this.opts.startedAt;
+          for (const s of samples) this.push({ key: s.key, ts, value: s.value });
+        },
+        onError: (m) => this.opts.onError?.(m),
+        onNote: (m) => this.opts.onError?.(`Order tracking: ${m}`),
+      });
+      if (await this.engineSound.start()) return;
+      this.engineSound = null;
+    }
+
+    this.opts.onError?.('Falling back to level-only microphone (no order tracking)');
+    this.mic = new MicLevelMeter({ onError: (m) => this.opts.onError?.(m) });
+    await this.mic.start((dbfs) => {
+      this.push({ key: 'mic_db', ts: Date.now() - this.opts.startedAt, value: dbfs });
+    });
   }
 
   private async startLocation(): Promise<void> {
@@ -198,6 +256,10 @@ export class SensorLogger {
 
   stop(): void {
     this.running = false;
+    void this.mic?.stop();
+    this.mic = null;
+    this.engineSound?.stop();
+    this.engineSound = null;
     this.locationSub?.remove();
     this.locationSub = null;
     this.accelSub?.remove();

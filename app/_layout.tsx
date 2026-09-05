@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { Tabs } from 'expo-router';
 import { View, Text, StyleSheet } from 'react-native';
 import Svg, { Path } from 'react-native-svg';
@@ -75,6 +75,12 @@ export default function RootLayout() {
     BarlowCondensed_600SemiBold,
     Barlow_400Regular,
   });
+
+  // Kalıcı ayarlar (takılı lastik ebadı) açılışta bir kez yükleniyor.
+  const loadSettings = useAppStore((s) => s.loadSettings);
+  useEffect(() => {
+    void loadSettings();
+  }, [loadSettings]);
 
   // Fontlar yüklenene kadar zemin rengini gösteriyoruz — sistem fontuyla bir
   // kare çizip sonra Barlow'a atlamak göze çarpan bir sıçrama yaratıyordu.

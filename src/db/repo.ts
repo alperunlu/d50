@@ -8,15 +8,50 @@
 
 import type { SQLiteDatabase } from 'expo-sqlite';
 import { getDb } from './index';
-import type { Sample, Session } from './types';
+import type { Sample, Session, SupportedPidMap } from './types';
 
-export async function startSession(pids: readonly string[]): Promise<Session> {
+/**
+ * TÜM yazma işlemleri tek bir zincirden geçer.
+ *
+ * 2026-09-05 araç testinde saniyede iki kez "cannot start a transaction within
+ * a transaction" alındı ve o oturumda DİSKE HİÇBİR ÖRNEK YAZILMADI. Sebep:
+ * üç bağımsız yazıcı (OBD poller flush'ı, sensör logger flush'ı, oturum log
+ * flush'ı) aynı SQLite bağlantısında eşzamanlı `withTransactionAsync`
+ * çağırıyordu; expo-sqlite tek bağlantıda iç içe transaction'a izin vermiyor.
+ *
+ * Kilit yerine kuyruk: her yazma bir öncekinin bitmesini bekler. Yazma
+ * hacmimiz saniyede birkaç toplu insert olduğu için sıraya almanın maliyeti
+ * yok, kazancı ise çakışmanın yapısal olarak imkânsız hâle gelmesi.
+ */
+let writeQueue: Promise<unknown> = Promise.resolve();
+
+function serialize<T>(work: () => Promise<T>): Promise<T> {
+  const run = writeQueue.then(work, work);
+  // Zincir bir hatayla kopmamalı; hata çağırana iletilir ama kuyruk devam eder.
+  writeQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+/**
+ * Oturumu açar. `supportedPids` verilirse ECU'nun destek bitmask'i de
+ * saklanır; sonraki analizlerde "kanal seçilmemiş" ile "araçta o sensör
+ * yok" ayrımı buna dayanıyor.
+ */
+export async function startSession(
+  pids: readonly string[],
+  supportedPids?: SupportedPidMap | null,
+): Promise<Session> {
+  return serialize(async () => {
   const db = await getDb();
   const startedAt = Date.now();
   const result = await db.runAsync(
-    'INSERT INTO sessions (started_at, ended_at, note, pids) VALUES (?, NULL, NULL, ?)',
+    'INSERT INTO sessions (started_at, ended_at, note, pids, supported_pids) VALUES (?, NULL, NULL, ?, ?)',
     startedAt,
     JSON.stringify(pids),
+    supportedPids ? JSON.stringify(supportedPids) : null,
   );
   return {
     id: result.lastInsertRowId,
@@ -24,28 +59,34 @@ export async function startSession(pids: readonly string[]): Promise<Session> {
     endedAt: null,
     note: null,
     pids,
+    supportedPids: supportedPids ?? null,
   };
+  });
 }
 
 export async function endSession(sessionId: number): Promise<void> {
-  const db = await getDb();
-  await db.runAsync('UPDATE sessions SET ended_at = ? WHERE id = ?', Date.now(), sessionId);
+  return serialize(async () => {
+    const db = await getDb();
+    await db.runAsync('UPDATE sessions SET ended_at = ? WHERE id = ?', Date.now(), sessionId);
+  });
 }
 
 /** Bir örnek grubunu tek transaction içinde toplu yazar. */
 export async function insertSamples(samples: readonly Sample[]): Promise<void> {
   if (samples.length === 0) return;
-  const db = await getDb();
-  await db.withTransactionAsync(async () => {
-    for (const s of samples) {
-      await db.runAsync(
-        'INSERT INTO samples (session_id, ts, pid, value) VALUES (?, ?, ?, ?)',
-        s.sessionId,
-        s.ts,
-        s.pid,
-        s.value,
-      );
-    }
+  return serialize(async () => {
+    const db = await getDb();
+    await db.withTransactionAsync(async () => {
+      for (const s of samples) {
+        await db.runAsync(
+          'INSERT INTO samples (session_id, ts, pid, value) VALUES (?, ?, ?, ?)',
+          s.sessionId,
+          s.ts,
+          s.pid,
+          s.value,
+        );
+      }
+    });
   });
 }
 
@@ -57,7 +98,10 @@ export async function listSessions(): Promise<Session[]> {
     ended_at: number | null;
     note: string | null;
     pids: string;
-  }>('SELECT id, started_at, ended_at, note, pids FROM sessions ORDER BY started_at DESC');
+    supported_pids: string | null;
+  }>(
+    'SELECT id, started_at, ended_at, note, pids, supported_pids FROM sessions ORDER BY started_at DESC',
+  );
 
   return rows.map(rowToSession);
 }
@@ -70,7 +114,11 @@ export async function getSession(sessionId: number): Promise<Session | null> {
     ended_at: number | null;
     note: string | null;
     pids: string;
-  }>('SELECT id, started_at, ended_at, note, pids FROM sessions WHERE id = ?', sessionId);
+    supported_pids: string | null;
+  }>(
+    'SELECT id, started_at, ended_at, note, pids, supported_pids FROM sessions WHERE id = ?',
+    sessionId,
+  );
   return row ? rowToSession(row) : null;
 }
 
@@ -92,17 +140,19 @@ export async function insertSessionLogs(
   entries: readonly { ts: number; direction: string; text: string }[],
 ): Promise<void> {
   if (entries.length === 0) return;
-  const db = await getDb();
-  await db.withTransactionAsync(async () => {
-    for (const e of entries) {
-      await db.runAsync(
-        'INSERT INTO session_logs (session_id, ts, direction, text) VALUES (?, ?, ?, ?)',
-        sessionId,
-        e.ts,
-        e.direction,
-        e.text,
-      );
-    }
+  return serialize(async () => {
+    const db = await getDb();
+    await db.withTransactionAsync(async () => {
+      for (const e of entries) {
+        await db.runAsync(
+          'INSERT INTO session_logs (session_id, ts, direction, text) VALUES (?, ?, ?, ?)',
+          sessionId,
+          e.ts,
+          e.direction,
+          e.text,
+        );
+      }
+    });
   });
 }
 
@@ -126,9 +176,33 @@ export async function countSessionLogs(sessionId: number): Promise<number> {
 }
 
 export async function deleteSession(sessionId: number): Promise<void> {
+  return serialize(async () => {
+    const db = await getDb();
+    // ON DELETE CASCADE ile samples de silinir (PRAGMA foreign_keys = ON).
+    await db.runAsync('DELETE FROM sessions WHERE id = ?', sessionId);
+  });
+}
+
+/** Ayar okur. Yoksa null. */
+export async function getSetting(key: string): Promise<string | null> {
   const db = await getDb();
-  // ON DELETE CASCADE ile samples de silinir (PRAGMA foreign_keys = ON).
-  await db.runAsync('DELETE FROM sessions WHERE id = ?', sessionId);
+  const row = await db.getFirstAsync<{ value: string }>(
+    'SELECT value FROM settings WHERE key = ?',
+    key,
+  );
+  return row?.value ?? null;
+}
+
+/** Ayar yazar (upsert). Diğer yazımlarla aynı kuyruktan geçer. */
+export async function setSetting(key: string, value: string): Promise<void> {
+  return serialize(async () => {
+    const db = await getDb();
+    await db.runAsync(
+      'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+      key,
+      value,
+    );
+  });
 }
 
 function rowToSession(row: {
@@ -137,6 +211,7 @@ function rowToSession(row: {
   ended_at: number | null;
   note: string | null;
   pids: string;
+  supported_pids?: string | null;
 }): Session {
   return {
     id: row.id,
@@ -144,7 +219,19 @@ function rowToSession(row: {
     endedAt: row.ended_at,
     note: row.note,
     pids: JSON.parse(row.pids) as string[],
+    // Bozuk/eksik JSON oturumu okunamaz yapmamalı; en kötü ihtimalle
+    // maskeyi bilmeden eski davranışa düşeriz.
+    supportedPids: parseMask(row.supported_pids),
   };
+}
+
+function parseMask(raw: string | null | undefined): SupportedPidMap | null {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as SupportedPidMap;
+  } catch {
+    return null;
+  }
 }
 
 /** Test/tip amaçlı re-export — repo dışında SQLiteDatabase tipine ihtiyaç duyan olmasın diye. */

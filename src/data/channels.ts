@@ -12,7 +12,7 @@
 
 import { PIDS, type PidDefinition, type RefreshClass } from '../obd/pids';
 
-export type ChannelSource = 'obd' | 'gps' | 'motion' | 'derived';
+export type ChannelSource = 'obd' | 'gps' | 'motion' | 'mic' | 'derived';
 
 export interface Channel {
   /** `Sample.pid` alanına yazılan benzersiz anahtar. */
@@ -121,7 +121,152 @@ export const SENSOR_CHANNELS: readonly Channel[] = [
     refresh: 'fast',
     source: 'motion',
   },
+  /**
+   * Gürültü seviyesi — dB(A) SPL, yani bir desibelmetrenin gösterdiği
+   * büyüklük (A-ağırlıklı ses basıncı seviyesi).
+   *
+   * Ham dBFS yerine bunu saklıyoruz çünkü kullanıcı için anlamlı olan bu:
+   * "kabinde 72 dB" cümlesi kurulabiliyor. Mutlak doğruluk mikrofon
+   * kalibrasyonuna bağlı (bkz. analysis/spl.ts); kalibrasyon ayarlanabilir.
+   */
+  {
+    key: 'mic_db',
+    name: 'Noise Level',
+    short: 'Noise',
+    unit: 'dB(A)',
+    csvKey: 'noise_dba',
+    refresh: 'fast',
+    source: 'mic',
+  },
+  /**
+   * Order takibi çıktıları (bkz. analysis/orderTracking.ts).
+   *
+   * Hepsi ORAN: mutlak genlik iOS'un otomatik kazancıyla kayar, order'lar
+   * arası oran kaymaz. Bu yüzden birim yok.
+   */
+  {
+    key: 'order_half_ratio',
+    name: 'Half-order ratio',
+    short: '½ order',
+    unit: '',
+    csvKey: 'order_half_ratio',
+    refresh: 'fast',
+    source: 'mic',
+  },
+  {
+    key: 'order_1_ratio',
+    name: 'First-order ratio',
+    short: '1st order',
+    unit: '',
+    csvKey: 'order_1_ratio',
+    refresh: 'fast',
+    source: 'mic',
+  },
+  {
+    key: 'audio_rpm',
+    name: 'RPM from sound',
+    short: 'Audio rpm',
+    unit: 'rpm',
+    csvKey: 'audio_rpm',
+    refresh: 'fast',
+    source: 'mic',
+  },
 ];
+
+/**
+ * Telefon sensörü kanallarını süren DONANIM grupları.
+ *
+ * Grup, izin ve donanım açma/kapama birimidir — tek bir GPS güncellemesi
+ * hız, rakım ve yönü birlikte getirir, ayrı ayrı kapatılamaz.
+ *
+ * AMA KULLANICI GRUP SEÇMİYOR. Kullanıcı hangi KANALI kaydedeceğini/
+ * göreceğini seçiyor; gereken donanım ondan türetiliyor. Aradaki fark
+ * pratikte şu: desibelmetreyi açmak isteyen birinin ekranına tekleme
+ * order'ları da gelmemeli, GPS hızı isteyen birine rakım kartı
+ * açılmamalı. Donanımın nasıl gruplandığı kullanıcının sorunu değil.
+ */
+export type SensorGroupKey = 'gps' | 'motion' | 'mic';
+
+/** Her sensör kanalının hangi donanımı gerektirdiği. */
+const CHANNEL_GROUP: Readonly<Record<string, SensorGroupKey>> = {
+  gps_speed: 'gps',
+  gps_altitude: 'gps',
+  gps_accuracy: 'gps',
+  gps_heading: 'gps',
+  accel_magnitude: 'motion',
+  accel_x: 'motion',
+  accel_y: 'motion',
+  accel_z: 'motion',
+  mic_db: 'mic',
+  order_half_ratio: 'mic',
+  order_1_ratio: 'mic',
+  audio_rpm: 'mic',
+};
+
+/** Seçim ekranında gösterilen sensör kanalları, kaynak donanımıyla. */
+export interface SelectableSensorChannel {
+  readonly key: string;
+  readonly name: string;
+  readonly detail: string;
+  readonly group: SensorGroupKey;
+}
+
+/**
+ * Seçilebilir kanallar.
+ *
+ * Ham ivmeölçer eksenleri (accel_x/y/z) listede YOK: tek başlarına
+ * okunabilir bir kart üretmiyorlar (telefonun kendi eksenlerindeler,
+ * aracın değil) ve toplam büyüklük seçildiğinde zaten CSV'ye yazılıyorlar.
+ * Listeyi kullanılabilir tutmak için gizli tutuldular.
+ */
+export const SELECTABLE_SENSOR_CHANNELS: readonly SelectableSensorChannel[] = [
+  { key: 'mic_db', name: 'Noise Level', detail: 'dB(A) sound meter', group: 'mic' },
+  { key: 'gps_speed', name: 'GPS Speed', detail: 'independent of the ECU speedo', group: 'gps' },
+  { key: 'accel_magnitude', name: 'Acceleration', detail: 'total g from the phone', group: 'motion' },
+  { key: 'gps_altitude', name: 'Altitude', detail: 'used for grade and vacuum', group: 'gps' },
+  { key: 'gps_heading', name: 'Heading', detail: 'direction of travel', group: 'gps' },
+  {
+    key: 'order_half_ratio',
+    name: 'Cylinder balance',
+    detail: 'half-order ratio — misfire signature',
+    group: 'mic',
+  },
+  {
+    key: 'order_1_ratio',
+    name: 'Rotational balance',
+    detail: 'first-order ratio',
+    group: 'mic',
+  },
+  { key: 'audio_rpm', name: 'RPM from sound', detail: 'cross-check for order tracking', group: 'mic' },
+];
+
+/** Seçili kanalların çalıştırılmasını gerektirdiği donanım grupları. */
+export function sensorGroupsForChannels(keys: readonly string[]): SensorGroupKey[] {
+  const groups = new Set<SensorGroupKey>();
+  for (const key of keys) {
+    const group = CHANNEL_GROUP[key];
+    if (group) groups.add(group);
+  }
+  return [...groups];
+}
+
+/**
+ * Bir kanal seçildiğinde oturuma yazılan anahtarlar.
+ *
+ * İvmeölçer seçilirse ham eksenler de kaydediliyor: CSV'de sonradan
+ * analiz için değerliler ve zaten sensör açık olduğu için ek maliyetleri yok.
+ * Ekranda kart olarak görünmüyorlar.
+ */
+export function recordedKeysForSensorChannels(keys: readonly string[]): string[] {
+  const out = new Set<string>(keys);
+  if (keys.includes('accel_magnitude')) {
+    out.add('accel_x');
+    out.add('accel_y');
+    out.add('accel_z');
+  }
+  if (keys.some((k) => CHANNEL_GROUP[k] === 'gps')) out.add('gps_accuracy');
+  return [...out];
+}
 
 const ALL_CHANNELS: readonly Channel[] = [...PIDS.map(channelForPid), ...SENSOR_CHANNELS];
 

@@ -43,6 +43,15 @@ export interface PidDefinition {
   readonly csvKey: string;
   /** Poller önceliği. Belirtilmezse 'fast' sayılır. */
   readonly refresh: RefreshClass;
+  /**
+   * Bir turda kaç kez sorulacağı. Varsayılan 1.
+   *
+   * Bütün "hızlı" PID'ler eşit hızlı değil: devir ve hız saniyede birkaç
+   * kez değişirken gaz kelebeği ve yakıt düzeltmesi çok daha yavaş hareket
+   * eder. Kıt K-line kapasitesini eşit bölmek, en çok ihtiyaç duyulan iki
+   * kanalı gereğinden seyrek örneklemek demekti.
+   */
+  readonly weight?: number;
 }
 
 export const PIDS: readonly PidDefinition[] = [
@@ -55,6 +64,9 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 2,
     csvKey: 'rpm',
     refresh: 'fast',
+    // Devir her şeyin referansı: 0-100 ölçümü, rölanti kararlılığı ve
+    // order takibi hep buna dayanıyor. Turda iki kez soruluyor.
+    weight: 2,
     decode: ([a, b]) => (a * 256 + b) / 4,
   },
   {
@@ -65,6 +77,9 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'speed_kmh',
     refresh: 'fast',
+    // Hızın türevi ivme, ivmenin türevi güç/tork tahmini: seyrek
+    // örneklenirse üçü birden bozuluyor.
+    weight: 2,
     decode: ([a]) => a,
   },
   {
@@ -228,6 +243,36 @@ export const PIDS: readonly PidDefinition[] = [
     csvKey: 'distance_mil_km',
     refresh: 'slow',
     decode: ([a, b]) => a * 256 + b,
+  },
+  /**
+   * Lambda sondaları (2026-09-05 araç taramasıyla doğrulandı: R50 hem 14 hem
+   * 15'i cevaplıyor).
+   *
+   * İki bayt dönüyor: A gerilim, B o sonda için kısa dönem yakıt düzeltmesi.
+   * Kanal olarak GERİLİM loglanıyor, çünkü teşhis değeri onda: B1S1 sürekli
+   * salınmalı (kapalı çevrimde saniyede ~1 kez 0.1–0.9 V arası), B1S2 ise
+   * katalizör sağlamsa neredeyse düz ~0.6–0.8 V durmalı. İkisi birlikte
+   * salınıyorsa katalizör verimi düşmüş demektir.
+   */
+  {
+    pid: '14',
+    name: 'O2 Sensor B1S1 (pre-cat)',
+    short: 'O2 pre',
+    unit: 'V',
+    bytes: 2,
+    csvKey: 'o2_b1s1_v',
+    refresh: 'fast',
+    decode: ([a]) => a / 200,
+  },
+  {
+    pid: '15',
+    name: 'O2 Sensor B1S2 (post-cat)',
+    short: 'O2 post',
+    unit: 'V',
+    bytes: 2,
+    csvKey: 'o2_b1s2_v',
+    refresh: 'fast',
+    decode: ([a]) => a / 200,
   },
 ];
 

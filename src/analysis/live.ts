@@ -3,18 +3,20 @@
  *
  * Bunlar DB'ye YAZILMAZ. Hepsi kayıtlı kanalların fonksiyonu olduğu için
  * saklamak veriyi ikizlemek olurdu; üstelik formül geliştiğinde eski
- * oturumlar eski sonuçla kalırdı. Gösterim anında hesaplanıyorlar, aynı
- * hesap Trips ekranında geçmiş oturumlara da uygulanabiliyor.
+ * oturumlar eski sonuçla kalırdı. Gösterim anında hesaplanıyorlar.
  *
- * Bir metrik hesaplanamıyorsa `value: null` ve `missing` ile HANGİ kanalın
- * eksik olduğu döner — "—" gösterip kullanıcıyı neyin eksik olduğunu tahmin
- * etmeye bırakmak yerine, hangi kanalı açması gerektiğini söylüyoruz.
+ * Üç durum ayrı ayrı ele alınıyor, çünkü kullanıcı için üçü farklı şey:
+ *   - hesaplandı           → değer var
+ *   - kanal seçili değil   → EYLEM alınabilir: kanalı aç
+ *   - araç desteklemiyor   → eylem yok, metrik bu araçta hiç mümkün değil
+ * Üçünü "—" ile göstermek kullanıcıyı boşuna uğraştırırdı.
  */
 
 import {
   volumetricEfficiency,
   fuelPer100Km,
   fuelRateLitersPerHour,
+  estimateAirflowSpeedDensity,
   estimatedWheelPowerKw,
   accelerationSeries,
   type SeriesMap,
@@ -24,37 +26,42 @@ import { MINI_R50, type VehicleProfile } from './vehicle';
 export interface DerivedReading {
   readonly key: string;
   readonly name: string;
-  /** Izgara hücresi etiketi. */
   readonly short: string;
   readonly unit: string;
   readonly value: number | null;
-  /** Hesap için eksik olan kanalların insan okur adları. */
+  /** Seçilmediği için eksik olan kanalların adları — kullanıcı açabilir. */
   readonly missing: readonly string[];
+  /** Aracın hiç desteklemediği için imkânsız olan kanalların adları. */
+  readonly unsupported: readonly string[];
+  /** Değer ölçüm değil tahminse kısa gerekçe (UI'da gösterilir). */
+  readonly estimateNote?: string;
 }
 
-/** Bir kanalın en son değeri. */
 function latest(series: SeriesMap, key: string): number | null {
   const s = series[key];
   if (!s || s.length === 0) return null;
   return s[s.length - 1].value;
 }
 
-/** Hız için önce GPS, yoksa OBD — GPS mutlak referans olduğu için önce o. */
 function speedSeries(series: SeriesMap) {
   const gps = series['gps_speed'];
   if (gps && gps.length > 1) return gps;
   return series['0D'] ?? [];
 }
 
-/**
- * Canlı türetilmiş okumalar. Girdi kanalları seçili değilse metrik
- * hesaplanmaz ama listede kalır — böylece kullanıcı neyin mümkün olduğunu
- * ve ne açması gerektiğini görür.
- */
-export function deriveLive(
-  series: SeriesMap,
-  vehicle: VehicleProfile = MINI_R50,
-): DerivedReading[] {
+export interface DeriveOptions {
+  readonly vehicle?: VehicleProfile;
+  /**
+   * Aracın PID desteği. Verilirse "kanalı aç" ile "araç desteklemiyor"
+   * ayrımı yapılabilir; verilmezse hepsi "kanalı aç" sayılır.
+   */
+  readonly isPidSupported?: (pid: string) => boolean;
+}
+
+export function deriveLive(series: SeriesMap, options: DeriveOptions = {}): DerivedReading[] {
+  const vehicle = options.vehicle ?? MINI_R50;
+  const supported = options.isPidSupported ?? (() => true);
+
   const rpm = latest(series, '0C');
   const maf = latest(series, '10');
   const map = latest(series, '0B');
@@ -63,19 +70,58 @@ export function deriveLive(
   const gpsSpeed = latest(series, 'gps_speed');
   const speed = gpsSpeed ?? obdSpeed;
 
+  /** Bir PID eksikse, aracın desteklememesinden mi yoksa seçilmemesinden mi? */
+  const classify = (
+    pid: string,
+    name: string,
+    value: number | null,
+    missing: string[],
+    unsupported: string[],
+  ) => {
+    if (value !== null) return;
+    if (!supported(pid)) unsupported.push(name);
+    else missing.push(name);
+  };
+
   const out: DerivedReading[] = [];
 
-  // --- Volumetrik verim: motorun nefes alma sağlığı ---
+  // --- Hava kütlesi: ölçüm (MAF) varsa o, yoksa speed-density tahmini ---
+  const mafMeasured = maf;
+  const airflowEstimated =
+    mafMeasured === null && rpm !== null && map !== null && iat !== null
+      ? estimateAirflowSpeedDensity({ rpm, mapKpa: map, iatC: iat, vehicle })
+      : null;
+  const airflow = mafMeasured ?? airflowEstimated;
+  const airflowIsEstimate = mafMeasured === null && airflowEstimated !== null;
+  const estimateNote = airflowIsEstimate ? 'speed-density estimate, no MAF sensor' : undefined;
+
+  const airflowMissing: string[] = [];
+  const airflowUnsupported: string[] = [];
+  if (airflow === null) {
+    // MAF yoksa speed-density için gerekenleri say.
+    classify('10', 'Air mass', mafMeasured, [], airflowUnsupported);
+    classify('0C', 'RPM', rpm, airflowMissing, airflowUnsupported);
+    classify('0B', 'MAP', map, airflowMissing, airflowUnsupported);
+    classify('0F', 'Intake air', iat, airflowMissing, airflowUnsupported);
+  }
+
+  // --- Volumetrik verim ---
   {
     const missing: string[] = [];
-    if (rpm === null) missing.push('RPM');
-    if (map === null) missing.push('MAP');
-    if (iat === null) missing.push('Intake air');
-    if (maf === null) missing.push('Air mass');
+    const unsupported: string[] = [];
+    classify('0C', 'RPM', rpm, missing, unsupported);
+    classify('0B', 'MAP', map, missing, unsupported);
+    classify('0F', 'Intake air', iat, missing, unsupported);
+    // VE ancak GERÇEK hava kütlesi ölçümüyle hesaplanabilir. Speed-density
+    // tahmini zaten VE varsayımı içerdiği için onunla VE hesaplamak döngüsel
+    // olurdu — bu araçta metrik dürüstçe "mümkün değil" olarak işaretleniyor.
+    classify('10', 'Air mass (MAF)', mafMeasured, missing, unsupported);
+
     const value =
-      missing.length === 0
-        ? volumetricEfficiency({ rpm: rpm!, mapKpa: map!, iatC: iat!, mafGs: maf!, vehicle })
+      rpm !== null && map !== null && iat !== null && mafMeasured !== null
+        ? volumetricEfficiency({ rpm, mapKpa: map, iatC: iat, mafGs: mafMeasured, vehicle })
         : null;
+
     out.push({
       key: 'derived_ve',
       name: 'Volumetric efficiency',
@@ -83,15 +129,16 @@ export function deriveLive(
       unit: '%',
       value,
       missing,
+      unsupported,
     });
   }
 
   // --- Anlık tüketim ---
   {
-    const missing: string[] = [];
-    if (maf === null) missing.push('Air mass');
-    if (speed === null) missing.push('Speed');
-    const value = missing.length === 0 ? fuelPer100Km(maf!, speed!) : null;
+    const missing = [...airflowMissing];
+    const unsupported = [...airflowUnsupported];
+    classify('0D', 'Speed', speed, missing, unsupported);
+    const value = airflow !== null && speed !== null ? fuelPer100Km(airflow, speed) : null;
     out.push({
       key: 'derived_consumption',
       name: 'Consumption',
@@ -99,30 +146,35 @@ export function deriveLive(
       unit: 'L/100km',
       value,
       missing,
+      unsupported,
+      estimateNote: value !== null ? estimateNote : undefined,
     });
   }
 
-  // --- Yakıt debisi (durağanken de anlamlı, rölanti tüketimi) ---
+  // --- Yakıt debisi (rölantide de anlamlı) ---
   {
-    const missing = maf === null ? ['Air mass'] : [];
-    const value = maf !== null ? fuelRateLitersPerHour(maf) : null;
+    const value = airflow !== null ? fuelRateLitersPerHour(airflow) : null;
     out.push({
       key: 'derived_fuel_rate',
       name: 'Fuel rate',
       short: 'Fuel rate',
       unit: 'L/h',
       value,
-      missing,
+      missing: [...airflowMissing],
+      unsupported: [...airflowUnsupported],
+      estimateNote: value !== null ? estimateNote : undefined,
     });
   }
 
   // --- Tahmini teker gücü ---
   {
+    const missing: string[] = [];
+    const unsupported: string[] = [];
     const spd = speedSeries(series);
     const accel = accelerationSeries(spd);
-    const missing: string[] = [];
-    if (spd.length < 2) missing.push('Speed');
     const lastAccel = accel.length > 0 ? accel[accel.length - 1].value : null;
+    if (spd.length < 2) classify('0D', 'Speed', null, missing, unsupported);
+
     const value =
       speed !== null && lastAccel !== null
         ? estimatedWheelPowerKw({ speedKmh: speed, accelMs2: lastAccel, vehicle })
@@ -134,15 +186,18 @@ export function deriveLive(
       unit: 'kW',
       value,
       missing,
+      unsupported,
+      estimateNote: value !== null ? 'from mass and acceleration, not a dyno' : undefined,
     });
   }
 
-  // --- Kilometre saati sapması: OBD hızı ile GPS hızı farkı ---
+  // --- Kilometre saati sapması ---
   {
     const missing: string[] = [];
-    if (obdSpeed === null) missing.push('Speed');
+    const unsupported: string[] = [];
+    classify('0D', 'Speed', obdSpeed, missing, unsupported);
     if (gpsSpeed === null) missing.push('GPS speed');
-    // Düşük hızda GPS gürültülü olduğu için eşik derived.ts içinde uygulanıyor.
+
     const value =
       obdSpeed !== null && gpsSpeed !== null && gpsSpeed >= 30
         ? ((obdSpeed - gpsSpeed) / gpsSpeed) * 100
@@ -154,6 +209,7 @@ export function deriveLive(
       unit: '%',
       value,
       missing,
+      unsupported,
     });
   }
 

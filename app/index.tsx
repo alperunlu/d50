@@ -1,9 +1,17 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { View, Text, StyleSheet, Pressable, ScrollView, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAppStore } from '../src/state/store';
 import { VehicleChrome } from '../src/ui/VehicleChrome';
 import { SectionRule, PrimaryAction, GhostAction, Note, Label } from '../src/ui/primitives';
+import {
+  formatTyreSize,
+  rollingCircumferenceMm,
+  revsPerKm,
+  sameTyreSize,
+  TYRE_OPTIONS,
+} from '../src/analysis/tyre';
+import type { TyreSize } from '../src/analysis/vehicle';
 import { color, type, space, hairlineWidth } from '../src/ui/theme';
 
 /**
@@ -29,9 +37,13 @@ export default function LinkScreen() {
   const stopScan = useAppStore((s) => s.stopScan);
   const selectDevice = useAppStore((s) => s.selectDevice);
 
-  const sensorsEnabled = useAppStore((s) => s.sensorsEnabled);
+  const selectedSensorChannels = useAppStore((s) => s.selectedSensorChannels);
   const sensorStatus = useAppStore((s) => s.sensorStatus);
-  const setSensorsEnabled = useAppStore((s) => s.setSensorsEnabled);
+
+  const vehicle = useAppStore((s) => s.vehicle);
+  const tyreError = useAppStore((s) => s.tyreError);
+  const setFittedTyre = useAppStore((s) => s.setFittedTyre);
+  const [tyreOpen, setTyreOpen] = useState(false);
 
   const busy = connectionState === 'connecting';
   const linked = connectionState === 'connected';
@@ -113,23 +125,79 @@ export default function LinkScreen() {
         <View style={{ marginTop: space(6) }}>
           <SectionRule
             label="Phone sensors"
-            meta={sensorsEnabled ? 'On' : 'Off'}
-            metaColor={sensorsEnabled ? color.linked : undefined}
+            meta={
+              selectedSensorChannels.length > 0
+                ? `${selectedSensorChannels.length} selected`
+                : 'None selected'
+            }
+            metaColor={selectedSensorChannels.length > 0 ? color.linked : undefined}
           />
           <Note>
-            GPS and accelerometer are logged alongside OBD data — they enable 0-100 timing,
-            grade-corrected power and speedometer error.
+            GPS, accelerometer and microphone are logged alongside OBD data — they enable 0-100
+            timing, grade-corrected power, speedometer error and the sound-based checks. Pick them
+            in Live → Choose channels, next to the OBD channels.
           </Note>
           {sensorStatus ? (
             <Text style={[type.metaSmall, { marginTop: space(2) }]}>{sensorStatus}</Text>
           ) : null}
-          <GhostAction
-            label={sensorsEnabled ? 'Disable sensors' : 'Enable sensors'}
-            onPress={() => void setSensorsEnabled(!sensorsEnabled)}
-            tint={sensorsEnabled ? color.linked : color.hairlineStrong}
-            textTint={sensorsEnabled ? color.linked : color.ink}
-            style={{ marginTop: space(3) }}
-          />
+        </View>
+
+        {/*
+          Lastik ebadı bir "tercih" değil ÖLÇÜM PARAMETRESİ: ECU hızı fabrika
+          lastiğine göre hesaplıyor, dolayısıyla mesafe ve tüketim dahil ondan
+          türeyen her şey buna bağlı. O yüzden ayarlar ekranına gömülmedi,
+          bağlantı ekranında görünür duruyor.
+
+          Seçim listeden yapılıyor, elle yazılmıyor: yanlış yazılmış bir ebat
+          bütün mesafe ve tüketim rakamlarını sessizce kaydırırdı. Listede her
+          seçeneğin fabrika ebadına göre sapması da yazıyor — kullanıcı
+          seçtiği şeyin okumaları ne kadar değiştireceğini o anda görüyor.
+        */}
+        <View style={{ marginTop: space(6) }}>
+          <SectionRule label="Tyres" meta={formatTyreSize(vehicle.fittedTyre)} />
+          <Note>
+            The ECU computes speed from wheel revolutions using the factory size
+            ({formatTyreSize(vehicle.factoryTyre)}). Telling the app what is actually fitted
+            corrects speed and distance, and unlocks the drive-ratio and rolling-circumference
+            checks.
+          </Note>
+
+          <Pressable style={styles.tyreSelect} onPress={() => setTyreOpen((v) => !v)}>
+            <View style={{ flex: 1 }}>
+              <Text style={[type.prose, { color: color.ink }]}>
+                {formatTyreSize(vehicle.fittedTyre)}
+              </Text>
+              <Text style={[type.metaSmall, { marginTop: space(0.75) }]}>
+                {`${Math.round(rollingCircumferenceMm(vehicle.fittedTyre))} mm rolling circumference · ${Math.round(revsPerKm(vehicle.fittedTyre))} revs/km`}
+              </Text>
+            </View>
+            <Text style={[type.status, { color: color.chrome, fontSize: 12 }]}>
+              {tyreOpen ? 'Close' : 'Change'}
+            </Text>
+          </Pressable>
+
+          {tyreOpen && (
+            <View style={styles.tyreList}>
+              {TYRE_OPTIONS.map((option) => (
+                <TyreOption
+                  key={formatTyreSize(option)}
+                  option={option}
+                  factory={vehicle.factoryTyre}
+                  selected={sameTyreSize(option, vehicle.fittedTyre)}
+                  onPick={() => {
+                    void setFittedTyre(option);
+                    setTyreOpen(false);
+                  }}
+                />
+              ))}
+            </View>
+          )}
+
+          {tyreError ? (
+            <Text style={[type.meta, { color: color.caution, marginTop: space(2) }]}>
+              {tyreError}
+            </Text>
+          ) : null}
         </View>
       </ScrollView>
 
@@ -155,6 +223,52 @@ export default function LinkScreen() {
         )}
       </View>
     </SafeAreaView>
+  );
+}
+
+/**
+ * Listedeki tek bir ebat.
+ *
+ * Fabrika ebadına göre sapma yüzdesi burada gösteriliyor çünkü seçimin
+ * sonucu tam olarak bu: ECU'nun hız ve mesafe okumasının ne kadar kayacağı.
+ * Fabrika ebadı ayrıca etiketleniyor ki "hangisi orijinaldi" sorusu
+ * kullanıcıda kalmasın.
+ */
+function TyreOption({
+  option,
+  factory,
+  selected,
+  onPick,
+}: {
+  option: TyreSize;
+  factory: TyreSize;
+  selected: boolean;
+  onPick: () => void;
+}) {
+  const deviation =
+    (rollingCircumferenceMm(option) / rollingCircumferenceMm(factory) - 1) * 100;
+  const isFactory = sameTyreSize(option, factory);
+
+  return (
+    <Pressable style={styles.tyreOption} onPress={onPick}>
+      <View style={styles.pickMark}>{selected ? <View style={styles.pickMarkFill} /> : null}</View>
+      <View style={{ flex: 1 }}>
+        <Text style={[type.prose, { color: selected ? color.ink : color.chrome }]}>
+          {formatTyreSize(option)}
+        </Text>
+        <Text style={type.metaSmall}>
+          {`${Math.round(rollingCircumferenceMm(option))} mm${isFactory ? ' · factory size' : ''}`}
+        </Text>
+      </View>
+      <Text
+        style={[
+          type.metaSmall,
+          { color: Math.abs(deviation) < 0.5 ? color.muted : color.caution },
+        ]}
+      >
+        {`${deviation > 0 ? '+' : ''}${deviation.toFixed(1)} %`}
+      </Text>
+    </Pressable>
   );
 }
 
@@ -199,6 +313,29 @@ const styles = StyleSheet.create({
     paddingVertical: space(2.5),
     borderBottomWidth: hairlineWidth,
     borderBottomColor: color.hairlineFaint,
+  },
+  tyreSelect: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space(3),
+    marginTop: space(3),
+    minHeight: 48,
+    paddingHorizontal: space(3),
+    paddingVertical: space(2),
+    borderWidth: hairlineWidth,
+    borderColor: color.hairlineStrong,
+    backgroundColor: color.groundAlt,
+  },
+  tyreList: { marginTop: space(1) },
+  tyreOption: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space(3),
+    paddingVertical: space(2.5),
+    paddingHorizontal: space(3),
+    borderBottomWidth: hairlineWidth,
+    borderBottomColor: color.hairlineFaint,
+    minHeight: 44,
   },
   actions: { flexDirection: 'row', gap: space(3), paddingHorizontal: space(5), paddingVertical: space(3) },
   loading: { flex: 1, minHeight: 48, alignItems: 'center', justifyContent: 'center', gap: space(1.5) },

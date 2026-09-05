@@ -34,9 +34,27 @@ import {
   requestLocationPermission,
   isAccelerometerAvailable,
   areSensorModulesAvailable,
+  isMicrophoneAvailable,
+  requestMicrophonePermission,
   type SensorSample,
+  type SensorPermission,
 } from '../sensors/sensorLogger';
-import { SENSOR_CHANNELS } from '../data/channels';
+import { orderedCards, moveInOrder } from '../data/cardOrder';
+import {
+  sensorGroupsForChannels,
+  recordedKeysForSensorChannels,
+  SELECTABLE_SENSOR_CHANNELS,
+  type SensorGroupKey,
+} from '../data/channels';
+import { MINI_R50, withFittedTyre, type TyreSize, type VehicleProfile } from '../analysis/vehicle';
+import { parseTyreSize, formatTyreSize } from '../analysis/tyre';
+import {
+  DEFAULT_SPL_CALIBRATION_DB,
+  clampCalibration,
+  dbfsToSpl,
+} from '../analysis/spl';
+import { EngineSoundListener, isAudioStreamAvailable } from '../sensors/engineSound';
+import { MicLevelMeter } from '../sensors/micLevel';
 import * as repo from '../db/repo';
 import type { Sample, Session } from '../db/types';
 
@@ -108,9 +126,59 @@ interface AppState {
   runPidScan: () => Promise<string | null>;
 
   // --- telefon sensörleri ---
-  sensorsEnabled: boolean;
+  /**
+   * Seçili telefon sensörü KANALLARI (grup değil).
+   *
+   * Kullanıcı "hangi kartı istiyorum" diye seçiyor; hangi donanımın
+   * açılacağı bundan türetiliyor (bkz. sensorGroupsForChannels). Gruplar
+   * üzerinden seçtirmek, desibelmetre isteyen birine tekleme order'ı
+   * kartı da açıyordu.
+   */
+  selectedSensorChannels: readonly string[];
   sensorStatus: string | null;
-  setSensorsEnabled: (enabled: boolean) => Promise<void>;
+  toggleSensorChannel: (key: string) => Promise<void>;
+
+  /**
+   * Live ekranındaki kartların GÖRÜNÜM sırası.
+   *
+   * Seçim listelerinden ayrı tutuluyor: `selectedPids` neyin
+   * sorgulanacağını, bu ise neyin nerede duracağını söylüyor. İkisini
+   * birleştirmek, sırayı değiştirmenin poller'ı yeniden kurmasına yol
+   * açardı. Listede olmayan yeni seçimler sona ekleniyor (bkz. orderedCards).
+   */
+  cardOrder: readonly string[];
+  moveCard: (from: number, to: number) => void;
+
+  /**
+   * Araç profili — takılı lastik ebadı dahil.
+   *
+   * Lastik bir "ayar" gibi görünse de aslında ARACIN verisi: hız/mesafe
+   * düzeltmesi, aktarma oranı ve tork tahmini ona dayanıyor. Bu yüzden
+   * profilin içinde tutuluyor ve analiz katmanına profil olarak geçiyor.
+   */
+  vehicle: VehicleProfile;
+  tyreError: string | null;
+  loadSettings: () => Promise<void>;
+  setFittedTyre: (tyre: TyreSize) => Promise<void>;
+
+  /**
+   * --- Gürültü ölçer ---
+   *
+   * OBD'den BAĞIMSIZ çalışır: adaptör takılı olmasa da, kayıt sürmese de
+   * kullanılabilir. Amaç bunun tek başına bir desibelmetre olması;
+   * araç bağlantısını şart koşmak onu kullanılamaz kılardı.
+   */
+  soundMeterOn: boolean;
+  soundNow: number | null;
+  soundMin: number | null;
+  soundMax: number | null;
+  soundAvg: number | null;
+  soundError: string | null;
+  splCalibrationDb: number;
+  startSoundMeter: () => Promise<void>;
+  stopSoundMeter: () => void;
+  resetSoundStats: () => void;
+  setSplCalibration: (db: number) => Promise<void>;
 
   // --- arıza kodları (SALT OKUMA — silme yok) ---
   dtcGroups: Readonly<Record<DtcKind, readonly Dtc[]>> | null;
@@ -136,6 +204,10 @@ let stopScanFn: (() => void) | null = null;
  * gereksiz yere yavaş olurdu.
  */
 let sensorLogger: SensorLogger | null = null;
+/** Kayıttan bağımsız gürültü ölçer (bkz. startSoundMeter). */
+let soundMeter: EngineSoundListener | null = null;
+let fallbackMeter: MicLevelMeter | null = null;
+let soundSampleCount = 0;
 let loggingSessionId: number | null = null;
 let pendingLogRows: { ts: number; direction: string; text: string }[] = [];
 /** BleTransport tekil olduğu için log aboneliği de yalnızca bir kez kurulmalı. */
@@ -207,44 +279,238 @@ export const useAppStore = create<AppState>((set, get) => ({
   dtcReading: false,
 
   // Sensörler varsayılan olarak KAPALI: izin istemek kullanıcının kararı
-  // olmalı, ayrıca GPS pil tüketiyor. Açıldığında kayıtla birlikte çalışır.
-  sensorsEnabled: false,
+  // olmalı, ayrıca GPS ve mikrofon pil tüketiyor.
+  selectedSensorChannels: [],
   sensorStatus: null,
+  cardOrder: [],
 
-  setSensorsEnabled: async (enabled) => {
-    if (!enabled) {
-      sensorLogger?.stop();
-      sensorLogger = null;
-      set({ sensorsEnabled: false, sensorStatus: null });
+  /**
+   * Kartı taşır. Sıra, o an seçili olan kanallar üzerinden hesaplanıp
+   * yeniden yazılıyor: arada silinmiş bir kanal varsa listede kalıntı
+   * bırakmıyor.
+   */
+  moveCard: (from: number, to: number) => {
+    const next = moveInOrder(orderedCards(get()), from, to);
+    set({ cardOrder: next });
+    // Kullanıcının kurduğu düzen her açılışta sıfırlanmamalı.
+    void repo.setSetting('card_order', JSON.stringify(next)).catch(() => undefined);
+  },
+
+  /**
+   * Bir sensör kanalını açar/kapatır ve gerekiyorsa donanımının iznini ister.
+   *
+   * İzin seçim anında isteniyor, kayıt başlarken değil: arabada "Record"a
+   * bastığında karşına izin diyaloğu çıkması, kaydın ilk saniyelerini
+   * kaybettirir.
+   *
+   * Kapatırken izin sorulmuyor; aynı donanımı kullanan başka bir kanal
+   * hâlâ seçiliyse donanım da açık kalmaya devam ediyor.
+   */
+  toggleSensorChannel: async (key: string) => {
+    const current = get().selectedSensorChannels;
+    if (current.includes(key)) {
+      set({ selectedSensorChannels: current.filter((k) => k !== key), sensorStatus: null });
+      return;
+    }
+
+    const definition = SELECTABLE_SENSOR_CHANNELS.find((c) => c.key === key);
+    if (!definition) return;
+    const group = definition.group;
+
+    // Aynı donanımı kullanan bir kanal zaten seçiliyse izin de alınmış demektir.
+    const alreadyOn = sensorGroupsForChannels(current).includes(group);
+    if (alreadyOn) {
+      set({ selectedSensorChannels: [...current, key], sensorStatus: null });
       return;
     }
 
     // Sensörler native modül gerektirir; OTA ile gelmezler. Eski bir binary'de
     // net bir mesaj vermek, sessizce hiçbir şey olmamasından iyidir.
-    if (!areSensorModulesAvailable()) {
+    const nativeReady = group === 'mic' ? isMicrophoneAvailable() : areSensorModulesAvailable();
+    if (!nativeReady) {
       set({
-        sensorsEnabled: false,
         sensorStatus:
-          'Sensors need a new app build (native modules). Everything else works on this version.',
+          'This sensor needs a new app build (native module). Everything else works on this version.',
       });
       return;
     }
 
-    const permission = await requestLocationPermission();
-    const hasAccel = await isAccelerometerAvailable();
+    let status: SensorPermission = 'granted';
+    if (group === 'gps') status = await requestLocationPermission();
+    if (group === 'mic') status = await requestMicrophonePermission();
+    if (group === 'motion') status = (await isAccelerometerAvailable()) ? 'granted' : 'unavailable';
 
-    if (permission !== 'granted' && !hasAccel) {
+    if (status !== 'granted') {
       set({
-        sensorsEnabled: false,
-        sensorStatus: 'Location permission denied and no accelerometer — sensors unavailable.',
+        sensorStatus:
+          status === 'denied'
+            ? `${group.toUpperCase()} permission denied — enable it in iOS Settings.`
+            : `${group.toUpperCase()} is not available on this device.`,
       });
       return;
     }
 
-    const parts: string[] = [];
-    parts.push(permission === 'granted' ? 'GPS ready' : 'GPS denied');
-    parts.push(hasAccel ? 'accelerometer ready' : 'no accelerometer');
-    set({ sensorsEnabled: true, sensorStatus: parts.join(' · ') });
+    set({
+      selectedSensorChannels: [...current, key],
+      sensorStatus:
+        group === 'mic'
+          ? 'Microphone ready — no audio is stored.'
+          : `${group.toUpperCase()} ready.`,
+    });
+  },
+
+  vehicle: MINI_R50,
+  tyreError: null,
+
+  soundMeterOn: false,
+  soundNow: null,
+  soundMin: null,
+  soundMax: null,
+  soundAvg: null,
+  soundError: null,
+  splCalibrationDb: DEFAULT_SPL_CALIBRATION_DB,
+
+  /**
+   * Gürültü ölçümünü başlatır. Kayıttan bağımsız bir dinleyici açıyor:
+   * kullanıcı sadece "şu an ne kadar gürültülü" sorusunu sormak için
+   * uygulamayı açtığında araca bağlanmak zorunda kalmasın.
+   */
+  startSoundMeter: async () => {
+    if (get().soundMeterOn) return;
+
+    if (!isMicrophoneAvailable()) {
+      set({ soundError: 'The microphone needs a new app build (native module).' });
+      return;
+    }
+    const permission = await requestMicrophonePermission();
+    if (permission !== 'granted') {
+      set({
+        soundError:
+          permission === 'denied'
+            ? 'Microphone permission denied — enable it in iOS Settings.'
+            : 'Microphone is not available on this device.',
+      });
+      return;
+    }
+
+    const push = (dbA: number) => {
+      const s = get();
+      const count = soundSampleCount++;
+      const avg =
+        s.soundAvg === null ? dbA : (s.soundAvg * count + dbA) / (count + 1);
+      set({
+        soundNow: dbA,
+        soundMin: s.soundMin === null ? dbA : Math.min(s.soundMin, dbA),
+        soundMax: s.soundMax === null ? dbA : Math.max(s.soundMax, dbA),
+        soundAvg: avg,
+      });
+    };
+
+    if (isAudioStreamAvailable()) {
+      soundMeter = new EngineSoundListener({
+        getRpm: () => {
+          const rpmSeries = get().liveSeries['0C'];
+          if (!rpmSeries || rpmSeries.length === 0) return null;
+          return rpmSeries[rpmSeries.length - 1].value;
+        },
+        getCalibrationDb: () => get().splCalibrationDb,
+        onSamples: (samples) => {
+          for (const s of samples) if (s.key === 'mic_db') push(s.value);
+        },
+        onError: (message) => set({ soundError: message }),
+      });
+      const ok = await soundMeter.start();
+      if (!ok) {
+        soundMeter = null;
+      } else {
+        set({ soundMeterOn: true, soundError: null });
+        return;
+      }
+    }
+
+    /**
+     * Ham PCM yoksa metering'li kayda düşülüyor. O yolda A-ağırlıklama
+     * yapılamıyor (spektrum yok), yani sayı daha kaba; bunu kullanıcıya
+     * söylüyoruz, sessizce daha kötü bir ölçüm sunmuyoruz.
+     */
+    fallbackMeter = new MicLevelMeter({
+      onError: (message) => set({ soundError: message }),
+    });
+    const started = await fallbackMeter.start((dbfs) => push(dbfsToSpl(dbfs, get().splCalibrationDb)));
+    if (!started) {
+      fallbackMeter = null;
+      return;
+    }
+    set({
+      soundMeterOn: true,
+      soundError: 'Unweighted reading — this build cannot do A-weighting.',
+    });
+  },
+
+  stopSoundMeter: () => {
+    soundMeter?.stop();
+    soundMeter = null;
+    void fallbackMeter?.stop();
+    fallbackMeter = null;
+    set({ soundMeterOn: false, soundNow: null });
+  },
+
+  resetSoundStats: () => {
+    soundSampleCount = 0;
+    set({ soundMin: null, soundMax: null, soundAvg: null });
+  },
+
+  /** Kalibrasyon: 0 dBFS'in kaç dB SPL sayılacağı. */
+  setSplCalibration: async (db: number) => {
+    const value = clampCalibration(db);
+    set({ splCalibrationDb: value });
+    try {
+      await repo.setSetting('spl_calibration_db', String(value));
+    } catch {
+      // Kalıcı yazılamazsa oturum boyunca geçerli kalır.
+    }
+  },
+
+  /** Kalıcı ayarları uygulama açılışında yükler. */
+  loadSettings: async () => {
+    try {
+      const raw = await repo.getSetting('fitted_tyre');
+      if (raw) {
+        const tyre = parseTyreSize(raw);
+        if (tyre) set({ vehicle: withFittedTyre(get().vehicle, tyre) });
+      }
+      const cal = await repo.getSetting('spl_calibration_db');
+      if (cal) set({ splCalibrationDb: clampCalibration(Number(cal)) });
+
+      const order = await repo.getSetting('card_order');
+      if (order) {
+        const parsed: unknown = JSON.parse(order);
+        if (Array.isArray(parsed) && parsed.every((k) => typeof k === 'string')) {
+          set({ cardOrder: parsed as string[] });
+        }
+      }
+    } catch {
+      // Ayar okunamazsa varsayılan profille devam — uygulama açılmalı.
+    }
+  },
+
+  /**
+   * Takılı lastik ebadını kaydeder.
+   *
+   * Girdi artık serbest metin değil, listeden seçilmiş bir ebat — bu yüzden
+   * ayrıştırma hatası diye bir durum yok. `tyreError` yalnızca kalıcı
+   * yazmanın başarısız olduğu durumda doluyor ve o zaman bile seçim
+   * oturum boyunca geçerli kalıyor.
+   */
+  setFittedTyre: async (tyre: TyreSize) => {
+    set({ vehicle: withFittedTyre(get().vehicle, tyre), tyreError: null });
+    try {
+      await repo.setSetting('fitted_tyre', formatTyreSize(tyre));
+    } catch (e) {
+      set({
+        tyreError: `Saved for this session only: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    }
   },
 
   /**
@@ -267,7 +533,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       let readiness: ReadinessStatus | null = null;
       try {
         const raw = await queue.send('0101');
-        const hex = extractDataHex(raw);
+        const hex = extractDataHex(raw, '01');
         if (hex) {
           const bytes = hexToBytes(hex);
           milStatus = decodeMilStatus(bytes);
@@ -472,12 +738,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       .map((p) => getPidDefinition(p))
       .filter((p): p is PidDefinition => p !== undefined);
 
-    // Sensörler açıksa kanal anahtarları da oturuma yazılır ki CSV export
+    // Seçili sensörlerin kanal anahtarları da oturuma yazılır ki CSV export
     // onları da sütun olarak çıkarsın.
-    const recordedKeys = get().sensorsEnabled
-      ? [...selectedPids, ...SENSOR_CHANNELS.map((c) => c.key)]
-      : selectedPids;
-    const session = await repo.startSession(recordedKeys);
+    const selectedSensorChannels = get().selectedSensorChannels;
+    const selectedSensors = sensorGroupsForChannels(selectedSensorChannels);
+    const recordedKeys = [
+      ...selectedPids,
+      ...recordedKeysForSensorChannels(selectedSensorChannels),
+    ];
+    // ECU'nun destek bitmask'i oturumla saklanıyor: sonradan analiz
+    // ederken "araç bunu desteklemiyor" ile "kanalı seçmemişim" ayrımı
+    // ancak bununla yapılabiliyor.
+    const session = await repo.startSession(recordedKeys, get().initResult?.supportedPids ?? null);
 
     // Bağlantı/init sırasındaki satırlar kayıttan ÖNCE oluştu ama oturuma
     // ait bağlamın en değerli kısmı (protokol, GATT profili, desteklenen
@@ -493,15 +765,32 @@ export const useAppStore = create<AppState>((set, get) => ({
       onFlush: (samples: PollSample[]) => {
         void flushSamples(session.id, samples, set, get);
       },
+      // Cevap vermeyen bir kanal seyreltildiğinde kullanıcı bunu debug
+      // log'unda görsün — sessizce yavaşlayan bir kanal kafa karıştırır.
+      onBackoff: (pid, failures) =>
+        appendLog(set, {
+          ts: Date.now(),
+          direction: 'info',
+          text: `PID ${pid} did not answer ${failures}x — polling it less often`,
+        }),
     });
     poller.start();
     set({ poller });
 
     // Sensörler açıksa OBD ile AYNI zaman referansını paylaşarak başlar —
     // CSV'de aynı satıra düşmeleri ve birleşik metriklerin çalışması buna bağlı.
-    if (get().sensorsEnabled) {
+    if (selectedSensors.length > 0) {
       sensorLogger = new SensorLogger({
         startedAt: Date.now(),
+        groups: selectedSensors,
+        // Order analizi için canlı devir. Poller'ın en son yazdığı 0C
+        // örneği; sensör tarafı OBD tarafını böyle okuyor.
+        getRpm: () => {
+          const rpmSeries = get().liveSeries['0C'];
+          if (!rpmSeries || rpmSeries.length === 0) return null;
+          return rpmSeries[rpmSeries.length - 1].value;
+        },
+        getCalibrationDb: () => get().splCalibrationDb,
         onSamples: (sensorSamples: SensorSample[]) => {
           void flushSensorSamples(session.id, sensorSamples, set);
         },
@@ -509,7 +798,11 @@ export const useAppStore = create<AppState>((set, get) => ({
           appendLog(set, { ts: Date.now(), direction: 'error', text: `Sensor: ${message}` }),
       });
       void sensorLogger.start();
-      appendLog(set, { ts: Date.now(), direction: 'info', text: 'Phone sensors started' });
+      appendLog(set, {
+        ts: Date.now(),
+        direction: 'info',
+        text: `Phone sensors started: ${selectedSensors.join(', ')}`,
+      });
     }
   },
 
@@ -558,12 +851,30 @@ async function flushSamples(
 
   try {
     await repo.insertSamples(dbSamples);
-    await flushSessionLogs();
   } catch (e) {
     appendLog(set, {
       ts: Date.now(),
       direction: 'error',
       text: `DB write error: ${e instanceof Error ? e.message : String(e)}`,
+    });
+  }
+
+  /**
+   * Oturum log'u AYRI bir try içinde yazılıyor.
+   *
+   * Önce örneklerle aynı blokta duruyordu: örnek yazımı hata verince log
+   * yazımına hiç sıra gelmiyordu. 2026-09-05 araç kaydında tam olarak bu
+   * oldu — hem veri hem log aynı anda kayboldu ve Trips ekranındaki "Log"
+   * düğmesi "bu oturumda log yok" dedi. Teşhis için en çok ihtiyaç
+   * duyulan an, bir şeylerin bozulduğu andır; log o anda kaybolmamalı.
+   */
+  try {
+    await flushSessionLogs();
+  } catch (e) {
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'error',
+      text: `Session log write error: ${e instanceof Error ? e.message : String(e)}`,
     });
   }
 
@@ -607,7 +918,14 @@ async function flushSensorSamples(
     const next: Record<string, { ts: number; value: number }[]> = {};
     for (const key of Object.keys(state.liveSeries)) next[key] = [...state.liveSeries[key]];
     for (const s of samples) {
-      if (s.key !== 'gps_speed' && s.key !== 'accel_magnitude') continue;
+      // Canlı ekranda ve türetilmiş metriklerde kullanılan hızlı kanallar.
+      if (
+        s.key !== 'gps_speed' &&
+        s.key !== 'accel_magnitude' &&
+        s.key !== 'mic_db' &&
+        s.key !== 'order_half_ratio'
+      )
+        continue;
       const arr = next[s.key] ?? [];
       arr.push({ ts: s.ts, value: s.value });
       next[s.key] = arr.filter((p) => p.ts >= s.ts - 120_000);

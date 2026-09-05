@@ -169,18 +169,41 @@ function hasNextBlockBit(blockHex: string): boolean {
 }
 
 /**
- * `41 0C 1A F8` gibi bir Mode 01 cevabından veri baytlarını (mode+PID
- * hariç) hex string olarak çıkarır. Çoklu ECU cevabı gelirse ilk satır
- * kullanılır — R50 tek ECU'lu bir K-line hattı, çoklu cevap beklenmez
- * ama ayrıştırıcı kırılmasın diye tolere edilir.
+ * Mode 01 cevabından veri baytlarını (mode+PID hariç) çıkarır.
+ *
+ * `expectedPid` verildiğinde cevabın GERÇEKTEN o PID'e ait olduğu doğrulanır.
+ * Bu isteğe bağlı bir titizlik değil, 2026-09-05 araç testinde yakalanan bir
+ * veri bozulmasının çözümü:
+ *
+ *     [error] Command "010C" was not answered within 3000ms
+ *     [tx] 010D
+ *     [rx] 410C1D80⏎410D00⏎⏎
+ *
+ * Zaman aşımına uğrayan 010C'nin geç cevabı, bir sonraki komutun (010D)
+ * cevabıyla birlikte geldi. Eşleştirme yapılmadığında ilk satır alınıyor ve
+ * DEVİR verisi HIZ olarak kaydediliyordu — araç dururken 29 km/h. Ölçüm
+ * aletinde sessizce yanlış değer, veri gelmemesinden çok daha kötüdür.
+ *
+ * Çoklu ECU cevabı gelirse eşleşen ilk satır kullanılır.
  */
-export function extractDataHex(raw: string): string {
+export function extractDataHex(raw: string, expectedPid?: string): string {
   const lines = splitResponseLines(raw);
-  const dataLine = lines.find((l) => /^[0-9A-Fa-f\s]+$/.test(l) && l.replace(/\s/g, '').length >= 4);
-  if (!dataLine) return '';
-  const bytes = dataLine.replace(/\s/g, '');
-  // İlk 2 bayt mode+0x40 ve PID'dir (ör. "410C"), onları at.
-  return bytes.slice(4).toUpperCase();
+
+  const candidates = lines
+    .map((l) => l.replace(/\s/g, '').toUpperCase())
+    .filter((l) => /^[0-9A-F]+$/.test(l) && l.length >= 4);
+
+  if (candidates.length === 0) return '';
+
+  if (expectedPid) {
+    // Mode 01 cevabı 0x40 eklenmiş mod baytıyla başlar: "41" + PID.
+    const wanted = `41${expectedPid.toUpperCase()}`;
+    const matched = candidates.find((l) => l.startsWith(wanted));
+    // Eşleşme yoksa boş dön: yanlış PID'in verisini döndürmektense veri yok.
+    return matched ? matched.slice(4) : '';
+  }
+
+  return candidates[0].slice(4);
 }
 
 /** Hex string'i bayt dizisine çevirir. "1AF8" -> [0x1A, 0xF8]. */

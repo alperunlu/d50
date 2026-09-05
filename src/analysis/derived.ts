@@ -14,6 +14,7 @@
  */
 
 import { MINI_R50, PHYSICS, type VehicleProfile } from './vehicle';
+import { rollingCircumferenceMm, totalDriveRatio, estimatedEngineTorqueNm, roadLoadForceN } from './tyre';
 
 export interface TimeSeriesPoint {
   readonly ts: number; // ms
@@ -133,6 +134,55 @@ export function volumetricEfficiency(input: {
   const actualKgPerSec = mafGs / 1000;
   return (actualKgPerSec / theoreticalKgPerSec) * 100;
 }
+
+/**
+ * Speed-density ile hava kütlesi TAHMİNİ (g/s).
+ *
+ * 2026-09-05 araç taraması kesinleştirdi: MINI R50 PID 10 (MAF) DESTEKLEMİYOR
+ * — motor speed-density çalışıyor, yani hava kütlesini ölçmüyor, MAP'ten
+ * hesaplıyor. MAF'a dayanan her metrik bu araçta olduğu gibi imkânsız.
+ *
+ * Bu fonksiyon aynı hesabı dışarıdan yapar. AMA bir varsayım içerir:
+ * volumetrik verim. Gerçek VE ölçülemez (ölçmek için MAF gerekir — döngüsel),
+ * bu yüzden nominal bir değer kullanılıyor. Sonuç:
+ *
+ *   - Mutlak doğruluğu MAF'lı bir ölçümün altındadır (kabaca ±%15-20).
+ *   - Aynı araçta zaman içindeki DEĞİŞİMİ izlemek için yeterlidir.
+ *   - Kesin yakıt hesabı için kullanılmamalıdır.
+ *
+ * Bu belirsizlik UI'da da yazıyor; tahmini ölçüm gibi göstermek olmaz.
+ */
+export function estimateAirflowSpeedDensity(input: {
+  rpm: number;
+  mapKpa: number;
+  iatC: number;
+  /** Varsayılan volumetrik verim. Kısmi gazda 0.75-0.90 tipiktir. */
+  assumedVe?: number;
+  vehicle?: VehicleProfile;
+}): number | null {
+  const v = input.vehicle ?? MINI_R50;
+  const { rpm, mapKpa, iatC } = input;
+  if (rpm <= 0 || mapKpa <= 0) return null;
+
+  const tempK = iatC + 273.15;
+  if (tempK <= 0) return null;
+
+  const ve = input.assumedVe ?? NOMINAL_VOLUMETRIC_EFFICIENCY;
+  const displacementM3 = v.displacementL / 1000;
+  const intakeCyclesPerSec = rpm / 60 / 2;
+
+  const kgPerSec =
+    (mapKpa * 1000 * displacementM3 * intakeCyclesPerSec * ve) / (PHYSICS.airGasConstant * tempK);
+  return kgPerSec * 1000; // g/s
+}
+
+/**
+ * Nominal volumetrik verim varsayımı.
+ *
+ * Ölçülemediği için sabit. Kısmi gazda gerçek değer bunun altında, tam gazda
+ * üstünde kalır — yani tahmin rölantide iyimser, tam gazda kötümserdir.
+ */
+export const NOMINAL_VOLUMETRIC_EFFICIENCY = 0.85;
 
 /**
  * Anlık yakıt tüketimi (L/saat), MAF'tan.
@@ -356,6 +406,12 @@ export interface TripSummary {
   readonly idleRpmStdDev: number | null;
   /** STFT+LTFT toplamı ve yorumu — vakum kaçağını kod çıkmadan yakalar. */
   readonly fuelTrim: { total: number; verdict: 'lean' | 'rich' | 'normal' } | null;
+  /**
+   * Tahmini azami MOTOR torku (Nm) — lastik çevresi ve ölçülen aktarma
+   * oranı üzerinden tekerlek kuvvetinden geri hesaplanır. Dinamometre
+   * değildir; kütle, sürtünme ve aktarma verimi varsayımlarına dayanır.
+   */
+  readonly maxEngineTorqueNm: number | null;
 }
 
 /** Kanal anahtarına göre gruplanmış seriler. */
@@ -398,8 +454,37 @@ export function summarizeTrip(series: SeriesMap, vehicle: VehicleProfile = MINI_
     if (p !== null && (maxPowerKw === null || p > maxPowerKw)) maxPowerKw = p;
   }
 
+  /**
+   * Hava kütlesi serisi: MAF varsa ölçüm, yoksa speed-density tahmini.
+   *
+   * R50'de MAF YOK (2026-09-05 tarama raporu: bitmask BE3EB811, PID 10
+   * desteklenmiyor). Tüketimi yalnızca MAF'a bağlamak, bu araçta metriği
+   * sonsuza kadar boş bırakırdı; MAP + emme havası sıcaklığı kaydedildiğinde
+   * tahmin üretilebiliyor. Tahmin olduğu kullanıcıya ayrıca söyleniyor.
+   */
+  const map = series['0B'] ?? [];
+  const iat = series['0F'] ?? [];
+
+  const airflow: TimeSeriesPoint[] =
+    maf.length > 0
+      ? [...maf]
+      : rpm
+          .map((r) => {
+            const mp = nearestValue(map, r.ts);
+            const it = nearestValue(iat, r.ts);
+            if (mp === null || it === null) return null;
+            const gs = estimateAirflowSpeedDensity({
+              rpm: r.value,
+              mapKpa: mp,
+              iatC: it,
+              vehicle,
+            });
+            return gs === null ? null : { ts: r.ts, value: gs };
+          })
+          .filter((p): p is TimeSeriesPoint => p !== null);
+
   const fuelValues: number[] = [];
-  for (const m of maf) {
+  for (const m of airflow) {
     const s = nearestValue(speed, m.ts);
     if (s === null) continue;
     const f = fuelPer100Km(m.value, s);
@@ -407,8 +492,6 @@ export function summarizeTrip(series: SeriesMap, vehicle: VehicleProfile = MINI_
   }
 
   // --- volumetrik verim: her örnekte hesaplanıp ortancası alınıyor ---
-  const map = series['0B'] ?? [];
-  const iat = series['0F'] ?? [];
   const veValues: number[] = [];
   for (const m of maf) {
     const r = nearestValue(rpm, m.ts);
@@ -439,6 +522,40 @@ export function summarizeTrip(series: SeriesMap, vehicle: VehicleProfile = MINI_
       ? speedoErrors.reduce((a, b) => a + b, 0) / speedoErrors.length
       : null;
 
+  /**
+   * --- tahmini motor torku ---
+   *
+   * Lastik ebadı girildiği için artık mümkün: tekerlek kuvveti × yarıçap =
+   * tekerlek torku, bunu ölçülen toplam aktarma oranına bölünce motor torku
+   * çıkıyor. Oran anlık ölçülüyor (devir / tekerlek devri), yayımlanmış bir
+   * vites tablosuna ihtiyaç yok.
+   *
+   * Yalnızca HIZLANIRKEN ve makul hızda örnekler alınıyor: sabit hızda
+   * kuvvet yalnızca sürtünmeyi yener, tepe torkla ilgisi olmaz.
+   */
+  const circumference = rollingCircumferenceMm(vehicle.fittedTyre);
+  let maxEngineTorqueNm: number | null = null;
+  for (const a of accel) {
+    if (a.value < 0.5) continue; // belirgin hızlanma yoksa anlamsız
+    const v = nearestValue(speed, a.ts);
+    const r = nearestValue(rpm, a.ts);
+    if (v === null || r === null || v < 20) continue;
+
+    const ratio = totalDriveRatio(r, v, circumference);
+    if (ratio === null) continue;
+
+    const force = roadLoadForceN({ speedKmh: v, accelMs2: a.value, vehicle });
+    const torque = estimatedEngineTorqueNm({
+      wheelForceN: force,
+      circumferenceMm: circumference,
+      totalRatio: ratio,
+    });
+    // Fizik dışı sonuçlar ölçüm hatasıdır; tepe değeri bozmasınlar.
+    if (torque !== null && torque > 0 && torque < 500) {
+      if (maxEngineTorqueNm === null || torque > maxEngineTorqueNm) maxEngineTorqueNm = torque;
+    }
+  }
+
   // --- rölanti kararlılığı ---
   const idle = idleRpmStability(rpm, speed, vehicle);
 
@@ -465,7 +582,152 @@ export function summarizeTrip(series: SeriesMap, vehicle: VehicleProfile = MINI_
     speedometerErrorPct,
     idleRpmStdDev: idle?.stdDev ?? null,
     fuelTrim,
+    maxEngineTorqueNm,
   };
+}
+
+/**
+ * Özetteki her BOŞ alanın nedeni.
+ *
+ * Gerekçe: "—" tek başına kullanıcıya hiçbir şey söylemiyor. Üç bambaşka
+ * durum aynı çizgiyle gösteriliyordu ve kullanıcı hangisi olduğunu bilemiyordu:
+ *
+ *   - kanal kaydedilmemiş        → EYLEM VAR: o kanalı seçip tekrar kaydet
+ *   - kanal var ama koşul oluşmamış → EYLEM VAR ama başka: 100 km/h'a çık,
+ *                                     soğuk motorla başla
+ *   - araç o sensöre sahip değil → EYLEM YOK
+ *
+ * Bu fonksiyon saf: seriye bakar, her boş alan için tek cümlelik sebep döner.
+ * Dolu alanlar için hiçbir şey döndürmez.
+ */
+export function explainSummaryGaps(
+  series: SeriesMap,
+  summary: TripSummary,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  const hasChannel = (key: string) => (series[key]?.length ?? 0) > 0;
+  const values = (key: string) => (series[key] ?? []).map((p) => p.value);
+
+  const speed = hasChannel('gps_speed') ? values('gps_speed') : values('0D');
+  const maxSpeed = speed.length > 0 ? Math.max(...speed) : null;
+
+  if (summary.zeroToHundredSec === null) {
+    out.zeroToHundredSec =
+      maxSpeed === null
+        ? 'needs vehicle speed'
+        : `top speed here was ${Math.round(maxSpeed)} km/h — a full 0-100 run is required`;
+  }
+
+  if (summary.warmupSec === null) {
+    const coolant = values('05');
+    out.warmupSec =
+      coolant.length === 0
+        ? 'needs coolant temperature'
+        : coolant[0] > 60
+          ? `engine was already warm at the start (${Math.round(coolant[0])} °C) — record from a cold start`
+          : 'coolant never reached the thermostat opening temperature in this trip';
+  }
+
+  if (summary.avgFuelPer100Km === null) {
+    const missing: string[] = [];
+    if (!hasChannel('0B')) missing.push('MAP');
+    if (!hasChannel('0F')) missing.push('intake air temp');
+    if (!hasChannel('0C')) missing.push('RPM');
+    out.avgFuelPer100Km =
+      hasChannel('10')
+        ? 'needs vehicle speed alongside air mass'
+        : missing.length > 0
+          ? `no MAF on this car — the speed-density estimate needs ${missing.join(' + ')}`
+          : 'needs vehicle speed alongside the air-mass estimate';
+  }
+
+  if (summary.medianVolumetricEfficiency === null) {
+    out.medianVolumetricEfficiency = hasChannel('10')
+      ? 'needs RPM + MAP + intake air temp as well'
+      : 'impossible on this car — it has no MAF sensor, and estimating airflow already assumes an efficiency';
+  }
+
+  if (summary.speedometerErrorPct === null) {
+    if (!hasChannel('gps_speed')) out.speedometerErrorPct = 'needs the GPS sensor';
+    else if (!hasChannel('0D')) out.speedometerErrorPct = 'needs vehicle speed from the ECU';
+    else
+      out.speedometerErrorPct = `needs GPS speed above 30 km/h — this trip peaked at ${Math.round(maxSpeed ?? 0)} km/h`;
+  }
+
+  if (summary.fuelTrim === null) {
+    const missing: string[] = [];
+    if (!hasChannel('06')) missing.push('short term fuel trim');
+    if (!hasChannel('07')) missing.push('long term fuel trim');
+    out.fuelTrim = missing.length > 0 ? `needs ${missing.join(' + ')}` : 'no readings in this trip';
+  }
+
+  if (summary.maxPowerKw === null) out.maxPowerKw = 'needs vehicle speed over time';
+  if (summary.maxEngineTorqueNm === null) {
+    const missing: string[] = [];
+    if (!hasChannel('0C')) missing.push('RPM');
+    if (!hasChannel('0D')) missing.push('vehicle speed');
+    out.maxEngineTorqueNm =
+      missing.length > 0
+        ? `needs ${missing.join(' + ')}`
+        : 'no accelerating pull above 20 km/h in this trip';
+  }
+  if (summary.idleRpmStdDev === null) {
+    out.idleRpmStdDev = !hasChannel('0C')
+      ? 'needs engine RPM'
+      : 'no stationary idling found in this trip';
+  }
+  if (summary.maxSpeedKmh === null) out.maxSpeedKmh = 'needs vehicle speed';
+  if (summary.avgSpeedKmh === null) out.avgSpeedKmh = 'needs vehicle speed';
+  if (summary.idlePercent === null) out.idlePercent = 'needs vehicle speed';
+
+  return out;
+}
+
+/**
+ * Bir özet alanının hangi OBD PID'lerine ihtiyacı olduğu.
+ *
+ * `alternatives`: her biri yeterli olan kümelerden herhangi biri
+ * destekleniyorsa alan hesaplanabilir demektir. Örneğin tüketim ya MAF
+ * ölçümüyle (10) ya da speed-density üçlüsüyle (0C + 0B + 0F) çıkar.
+ *
+ * Burada YALNIZCA ECU'ya bağlı alanlar var. Telefon sensörlerine dayanan
+ * alanlar (sert olay sayısı gibi) araçtan bağımsız olduğu için listede yok:
+ * onlar "araç desteklemiyor" olamaz.
+ */
+export const SUMMARY_REQUIREMENTS: readonly {
+  readonly field: string;
+  readonly alternatives: readonly (readonly string[])[];
+}[] = [
+  { field: 'warmupSec', alternatives: [['05']] },
+  { field: 'idleRpmStdDev', alternatives: [['0C']] },
+  { field: 'fuelTrim', alternatives: [['06', '07']] },
+  // Tüketim: gerçek MAF ölçümü YA DA speed-density tahmini.
+  { field: 'avgFuelPer100Km', alternatives: [['10'], ['0C', '0B', '0F']] },
+  /**
+   * Volumetrik verim yalnızca GERÇEK MAF ile mümkün. Speed-density tahmini
+   * zaten bir verim varsayımı içerdiği için onunla verim hesaplamak
+   * döngüsel olurdu — bu yüzden tek alternatif var.
+   */
+  { field: 'medianVolumetricEfficiency', alternatives: [['10', '0C', '0B', '0F']] },
+  // Tork için devir ve hız birlikte gerekiyor: oran ikisinden çıkıyor.
+  { field: 'maxEngineTorqueNm', alternatives: [['0C', '0D']] },
+];
+
+/**
+ * Bu ECU'da HİÇBİR ŞEKİLDE hesaplanamayacak özet alanları.
+ *
+ * Amaç arayüzü sadeleştirmek: kullanıcının asla dolduramayacağı bir satırı
+ * ömür boyu "—" olarak göstermek, ekranı kalabalıklaştırmaktan başka bir işe
+ * yaramıyor. Destek bilgisi yoksa (eski oturumlar, bağlantısız kayıt) hiçbir
+ * şey imkânsız sayılmaz — bilmediğimiz bir şeyi eleyemeyiz.
+ */
+export function impossibleSummaryFields(
+  isPidSupported: ((pid: string) => boolean) | null,
+): string[] {
+  if (!isPidSupported) return [];
+  return SUMMARY_REQUIREMENTS.filter(
+    (r) => !r.alternatives.some((set) => set.every((pid) => isPidSupported(pid))),
+  ).map((r) => r.field);
 }
 
 /** Verilen zamana en yakın örneğin değeri (2 sn toleransla). */

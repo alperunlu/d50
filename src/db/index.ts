@@ -59,7 +59,37 @@ async function openAndMigrate(): Promise<SQLite.SQLiteDatabase> {
 
     CREATE INDEX IF NOT EXISTS idx_session_logs_session_ts
       ON session_logs(session_id, ts);
+
+    -- Kullanıcı ayarları (ör. takılı lastik ebadı). Anahtar/değer, çünkü
+    -- ayarların sayısı ve şekli zamanla değişecek; her yeni ayar için
+    -- migration yazmak istemiyoruz.
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
 
+  await migrateSupportedPids(db);
+
   return db;
+}
+
+/**
+ * `sessions.supported_pids` sütunu — ECU'nun desteklediğini İDDİA ETTİĞİ
+ * PID bitmask'i (0100/0120/0140), oturumla birlikte saklanıyor.
+ *
+ * Neden gerekiyor: bir oturum sonradan analiz edilirken "bu metrik neden
+ * boş?" sorusunun iki farklı cevabı var — kanal seçilmemiş (kullanıcı
+ * düzeltebilir) ya da araç o sensöre sahip değil (asla düzelmeyecek).
+ * İkisini ayırmak ancak o oturumun aracının ne desteklediğini bilmekle
+ * mümkün; bağlantı koptuktan sonra bu bilgi başka hiçbir yerde yok.
+ *
+ * SQLite'ta "ADD COLUMN IF NOT EXISTS" olmadığı için sütun varlığı
+ * PRAGMA ile kontrol ediliyor. Eski oturumlar NULL kalır ve eskisi gibi
+ * davranır — veri kaybı yok.
+ */
+async function migrateSupportedPids(db: SQLite.SQLiteDatabase): Promise<void> {
+  const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(sessions)');
+  if (columns.some((c) => c.name === 'supported_pids')) return;
+  await db.execAsync('ALTER TABLE sessions ADD COLUMN supported_pids TEXT');
 }
