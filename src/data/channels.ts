@@ -18,6 +18,8 @@ export interface Channel {
   /** `Sample.pid` alanına yazılan benzersiz anahtar. */
   readonly key: string;
   readonly name: string;
+  /** Izgara hücresi için kısa etiket. */
+  readonly short: string;
   readonly unit: string;
   /** CSV sütun adı (ASCII, boşluksuz). */
   readonly csvKey: string;
@@ -31,6 +33,7 @@ export function channelForPid(pid: PidDefinition): Channel {
   return {
     key: pid.pid,
     name: pid.name,
+    short: pid.short,
     unit: pid.unit,
     csvKey: pid.csvKey,
     refresh: pid.refresh,
@@ -49,6 +52,7 @@ export const SENSOR_CHANNELS: readonly Channel[] = [
   {
     key: 'gps_speed',
     name: 'GPS Speed',
+    short: 'GPS speed',
     unit: 'km/h',
     csvKey: 'gps_speed_kmh',
     refresh: 'fast',
@@ -57,6 +61,7 @@ export const SENSOR_CHANNELS: readonly Channel[] = [
   {
     key: 'gps_altitude',
     name: 'Altitude',
+    short: 'Altitude',
     unit: 'm',
     csvKey: 'gps_altitude_m',
     refresh: 'slow',
@@ -65,6 +70,7 @@ export const SENSOR_CHANNELS: readonly Channel[] = [
   {
     key: 'gps_accuracy',
     name: 'GPS Accuracy',
+    short: 'GPS acc.',
     unit: 'm',
     csvKey: 'gps_accuracy_m',
     refresh: 'slow',
@@ -73,6 +79,7 @@ export const SENSOR_CHANNELS: readonly Channel[] = [
   {
     key: 'gps_heading',
     name: 'Heading',
+    short: 'Heading',
     unit: '°',
     csvKey: 'gps_heading_deg',
     refresh: 'slow',
@@ -81,6 +88,7 @@ export const SENSOR_CHANNELS: readonly Channel[] = [
   {
     key: 'accel_magnitude',
     name: 'Acceleration (total)',
+    short: 'Accel',
     unit: 'g',
     csvKey: 'accel_g',
     refresh: 'fast',
@@ -89,6 +97,7 @@ export const SENSOR_CHANNELS: readonly Channel[] = [
   {
     key: 'accel_x',
     name: 'Acceleration X (device)',
+    short: 'Accel X',
     unit: 'g',
     csvKey: 'accel_x_g',
     refresh: 'fast',
@@ -97,6 +106,7 @@ export const SENSOR_CHANNELS: readonly Channel[] = [
   {
     key: 'accel_y',
     name: 'Acceleration Y (device)',
+    short: 'Accel Y',
     unit: 'g',
     csvKey: 'accel_y_g',
     refresh: 'fast',
@@ -105,6 +115,7 @@ export const SENSOR_CHANNELS: readonly Channel[] = [
   {
     key: 'accel_z',
     name: 'Acceleration Z (device)',
+    short: 'Accel Z',
     unit: 'g',
     csvKey: 'accel_z_g',
     refresh: 'fast',

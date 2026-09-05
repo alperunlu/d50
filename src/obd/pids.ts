@@ -28,6 +28,11 @@ export interface PidDefinition {
   readonly pid: string;
   /** Kullanıcıya gösterilecek isim. */
   readonly name: string;
+  /**
+   * Izgara hücresi etiketi. Uzun isimler hücrelerde satır kırıp hücreleri
+   * eşitsiz yapıyor — tasarımın "eşit hücreler" kuralını bozuyordu.
+   */
+  readonly short: string;
   /** Birim (grafik ekseni ve CSV başlığı için). */
   readonly unit: string;
   /** Cevaptaki veri bayt sayısı (mode+pid hariç, A/B/C/D baytları). */
@@ -45,6 +50,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '0C',
     name: 'Engine RPM',
+    short: 'RPM',
     unit: 'rpm',
     bytes: 2,
     csvKey: 'rpm',
@@ -54,6 +60,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '0D',
     name: 'Vehicle Speed',
+    short: 'Speed',
     unit: 'km/h',
     bytes: 1,
     csvKey: 'speed_kmh',
@@ -63,6 +70,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '11',
     name: 'Throttle Position',
+    short: 'Throttle',
     unit: '%',
     bytes: 1,
     csvKey: 'throttle_pct',
@@ -72,6 +80,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '04',
     name: 'Engine Load',
+    short: 'Load',
     unit: '%',
     bytes: 1,
     csvKey: 'engine_load_pct',
@@ -81,6 +90,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '10',
     name: 'MAF (Mass Air Flow)',
+    short: 'Air mass',
     unit: 'g/s',
     bytes: 2,
     csvKey: 'maf_gs',
@@ -90,6 +100,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '0B',
     name: 'Intake Manifold Pressure',
+    short: 'MAP',
     unit: 'kPa',
     bytes: 1,
     csvKey: 'map_kpa',
@@ -99,6 +110,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '0E',
     name: 'Timing Advance',
+    short: 'Advance',
     unit: '°',
     bytes: 1,
     csvKey: 'timing_advance_deg',
@@ -108,6 +120,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '06',
     name: 'Short Term Fuel Trim',
+    short: 'STFT',
     unit: '%',
     bytes: 1,
     csvKey: 'stft_pct',
@@ -117,6 +130,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '43',
     name: 'Absolute Load',
+    short: 'Abs load',
     unit: '%',
     bytes: 2,
     csvKey: 'abs_load_pct',
@@ -128,6 +142,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '05',
     name: 'Coolant Temperature',
+    short: 'Coolant',
     unit: '°C',
     bytes: 1,
     csvKey: 'coolant_c',
@@ -137,6 +152,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '0F',
     name: 'Intake Air Temperature',
+    short: 'Intake air',
     unit: '°C',
     bytes: 1,
     csvKey: 'intake_air_c',
@@ -146,6 +162,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '2F',
     name: 'Fuel Level',
+    short: 'Fuel',
     unit: '%',
     bytes: 1,
     csvKey: 'fuel_level_pct',
@@ -155,6 +172,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '07',
     name: 'Long Term Fuel Trim',
+    short: 'LTFT',
     unit: '%',
     bytes: 1,
     csvKey: 'ltft_pct',
@@ -164,6 +182,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '33',
     name: 'Barometric Pressure',
+    short: 'Baro',
     unit: 'kPa',
     bytes: 1,
     csvKey: 'baro_kpa',
@@ -173,6 +192,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '42',
     name: 'Control Module Voltage',
+    short: 'Voltage',
     unit: 'V',
     bytes: 2,
     csvKey: 'module_voltage_v',
@@ -182,6 +202,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '46',
     name: 'Ambient Air Temperature',
+    short: 'Ambient',
     unit: '°C',
     bytes: 1,
     csvKey: 'ambient_air_c',
@@ -191,6 +212,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '1F',
     name: 'Run Time Since Start',
+    short: 'Run time',
     unit: 's',
     bytes: 2,
     csvKey: 'run_time_s',
@@ -200,6 +222,7 @@ export const PIDS: readonly PidDefinition[] = [
   {
     pid: '21',
     name: 'Distance With MIL On',
+    short: 'MIL dist',
     unit: 'km',
     bytes: 2,
     csvKey: 'distance_mil_km',

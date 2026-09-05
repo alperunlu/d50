@@ -348,6 +348,14 @@ export interface TripSummary {
   readonly maxPowerKw: number | null;
   readonly avgFuelPer100Km: number | null;
   readonly harshEventCount: number;
+  /** Sürüş boyunca ortanca volumetrik verim — motor sağlığının tek en iyi göstergesi. */
+  readonly medianVolumetricEfficiency: number | null;
+  /** OBD hızının GPS'e göre sapması (%) — lastik ebadı değişimini ortaya çıkarır. */
+  readonly speedometerErrorPct: number | null;
+  /** Rölantide devir standart sapması — tekleme/kirli enjektör erken işareti. */
+  readonly idleRpmStdDev: number | null;
+  /** STFT+LTFT toplamı ve yorumu — vakum kaçağını kod çıkmadan yakalar. */
+  readonly fuelTrim: { total: number; verdict: 'lean' | 'rich' | 'normal' } | null;
 }
 
 /** Kanal anahtarına göre gruplanmış seriler. */
@@ -398,6 +406,50 @@ export function summarizeTrip(series: SeriesMap, vehicle: VehicleProfile = MINI_
     if (f !== null && f < 100) fuelValues.push(f); // absürt değerleri ele
   }
 
+  // --- volumetrik verim: her örnekte hesaplanıp ortancası alınıyor ---
+  const map = series['0B'] ?? [];
+  const iat = series['0F'] ?? [];
+  const veValues: number[] = [];
+  for (const m of maf) {
+    const r = nearestValue(rpm, m.ts);
+    const mp = nearestValue(map, m.ts);
+    const it = nearestValue(iat, m.ts);
+    if (r === null || mp === null || it === null) continue;
+    const ve = volumetricEfficiency({ rpm: r, mapKpa: mp, iatC: it, mafGs: m.value, vehicle });
+    // Absürt değerleri ele — tek bir kötü örnek ortancayı bozmamalı ama
+    // fizik dışı sonuçlar zaten ölçüm hatasıdır.
+    if (ve !== null && ve > 5 && ve < 200) veValues.push(ve);
+  }
+  veValues.sort((a, b) => a - b);
+  const medianVolumetricEfficiency =
+    veValues.length > 0 ? veValues[Math.floor(veValues.length / 2)] : null;
+
+  // --- kilometre saati sapması: yalnızca ikisi de varken ve yeterli hızda ---
+  const obdSpeed = series['0D'] ?? [];
+  const gpsSpeed = series['gps_speed'] ?? [];
+  const speedoErrors: number[] = [];
+  for (const g of gpsSpeed) {
+    if (g.value < 30) continue;
+    const o = nearestValue(obdSpeed, g.ts);
+    if (o === null) continue;
+    speedoErrors.push(((o - g.value) / g.value) * 100);
+  }
+  const speedometerErrorPct =
+    speedoErrors.length > 0
+      ? speedoErrors.reduce((a, b) => a + b, 0) / speedoErrors.length
+      : null;
+
+  // --- rölanti kararlılığı ---
+  const idle = idleRpmStability(rpm, speed, vehicle);
+
+  // --- yakıt trim değerlendirmesi: her ikisinin son değeriyle ---
+  const stft = series['06'] ?? [];
+  const ltft = series['07'] ?? [];
+  const fuelTrim =
+    stft.length > 0 && ltft.length > 0
+      ? fuelTrimAssessment(stft[stft.length - 1].value, ltft[ltft.length - 1].value)
+      : null;
+
   return {
     durationSec,
     maxSpeedKmh,
@@ -409,6 +461,10 @@ export function summarizeTrip(series: SeriesMap, vehicle: VehicleProfile = MINI_
     avgFuelPer100Km:
       fuelValues.length > 0 ? fuelValues.reduce((a, b) => a + b, 0) / fuelValues.length : null,
     harshEventCount: detectHarshEvents(accelMag).length,
+    medianVolumetricEfficiency,
+    speedometerErrorPct,
+    idleRpmStdDev: idle?.stdDev ?? null,
+    fuelTrim,
   };
 }
 

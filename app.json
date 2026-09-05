@@ -52,7 +52,8 @@
           "isIosBackgroundLocationEnabled": false,
           "isAndroidBackgroundLocationEnabled": false
         }
-      ]
+      ],
+      "expo-font"
     ],
     "extra": {
       "router": {},

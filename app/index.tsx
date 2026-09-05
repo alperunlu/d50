@@ -1,23 +1,25 @@
 import React from 'react';
 import { View, Text, StyleSheet, Pressable, ScrollView, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useAppStore, ALL_PIDS } from '../src/state/store';
-import { theme, spacing } from '../src/ui/theme';
+import { useAppStore } from '../src/state/store';
+import { VehicleChrome } from '../src/ui/VehicleChrome';
+import { SectionRule, PrimaryAction, GhostAction, Note, Label } from '../src/ui/primitives';
+import { color, type, space, hairlineWidth } from '../src/ui/theme';
 
-export default function ConnectScreen() {
+/**
+ * Link ekranı.
+ *
+ * Tasarım gerekçesi: araç künyesi artık her ekranda kalıcı olduğu için bu
+ * ekran "sürekli bakılan bir sekme" olmaktan çıkıp yalnızca bağlantı
+ * kurulmadığında ya da bozulduğunda açılan bir sayfaya dönüşüyor.
+ */
+export default function LinkScreen() {
   const connectionState = useAppStore((s) => s.connectionState);
   const initResult = useAppStore((s) => s.initResult);
   const connectError = useAppStore((s) => s.connectError);
   const bleProfileLabel = useAppStore((s) => s.bleProfileLabel);
-  const selectedPids = useAppStore((s) => s.selectedPids);
-  const togglePid = useAppStore((s) => s.togglePid);
-  const isPidSupported = useAppStore((s) => s.isPidSupported);
   const connect = useAppStore((s) => s.connect);
   const disconnect = useAppStore((s) => s.disconnect);
-
-  const sensorsEnabled = useAppStore((s) => s.sensorsEnabled);
-  const sensorStatus = useAppStore((s) => s.sensorStatus);
-  const setSensorsEnabled = useAppStore((s) => s.setSensorsEnabled);
 
   const scanning = useAppStore((s) => s.scanning);
   const scanResults = useAppStore((s) => s.scanResults);
@@ -27,233 +29,177 @@ export default function ConnectScreen() {
   const stopScan = useAppStore((s) => s.stopScan);
   const selectDevice = useAppStore((s) => s.selectDevice);
 
-  const isBusy = connectionState === 'connecting';
-  const isConnected = connectionState === 'connected';
-  const isDisconnected = connectionState === 'disconnected';
+  const sensorsEnabled = useAppStore((s) => s.sensorsEnabled);
+  const sensorStatus = useAppStore((s) => s.sensorStatus);
+  const setSensorsEnabled = useAppStore((s) => s.setSensorsEnabled);
+
+  const busy = connectionState === 'connecting';
+  const linked = connectionState === 'connected';
 
   return (
-    <SafeAreaView style={styles.safe} edges={['bottom']}>
-      <ScrollView contentContainerStyle={styles.container}>
-        {isDisconnected && (
-          <View style={styles.statusCard}>
-            <View style={styles.statusRow}>
-              <Text style={styles.statusText}>
-                {selectedDeviceName ?? selectedDeviceId ?? 'No device selected'}
-              </Text>
-            </View>
-            <Pressable
-              style={styles.buttonSecondary}
-              onPress={() => (scanning ? stopScan() : startScan())}
-            >
-              <Text style={styles.buttonText}>{scanning ? 'Stop Scan' : 'Scan for Devices'}</Text>
-            </Pressable>
-            {scanResults.map((d) => (
-              <Pressable
-                key={d.id}
-                style={[styles.deviceRow, selectedDeviceId === d.id && styles.deviceRowSelected]}
-                onPress={() => selectDevice(d)}
-              >
-                <Text style={styles.deviceName}>{d.name ?? '(unnamed device)'}</Text>
-                <Text style={styles.deviceMeta}>
-                  {d.id} · RSSI {d.rssi ?? '—'}
+    <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
+      <VehicleChrome />
+
+      <ScrollView contentContainerStyle={styles.body} showsVerticalScrollIndicator={false}>
+        {!linked && (
+          <View>
+            <SectionRule
+              label="Adapter"
+              meta={scanning ? 'Scanning' : `${scanResults.length} found`}
+              metaColor={scanning ? color.caution : undefined}
+            />
+
+            <View style={styles.deviceList}>
+              {scanResults.map((d) => {
+                const on = selectedDeviceId === d.id;
+                return (
+                  <Pressable key={d.id} style={styles.deviceRow} onPress={() => selectDevice(d)}>
+                    <View style={styles.pickMark}>
+                      {on ? <View style={styles.pickMarkFill} /> : null}
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[type.prose, { color: on ? color.ink : color.chrome }]}>
+                        {d.name ?? 'Unnamed device'}
+                      </Text>
+                      <Text style={type.metaSmall}>{`RSSI ${d.rssi ?? '—'}`}</Text>
+                    </View>
+                  </Pressable>
+                );
+              })}
+
+              {scanning && scanResults.length === 0 && (
+                <Text style={[type.meta, { marginTop: space(3) }]}>
+                  Ignition on, adapter plugged in.
                 </Text>
-              </Pressable>
-            ))}
-            {scanning && scanResults.length === 0 && (
-              <Text style={styles.hint}>Scanning… Ignition must be on and the adapter plugged in.</Text>
+              )}
+            </View>
+
+            {/*
+              Hiç cihaz bulunmadıysa ekranın asıl eylemi taramaktır — dolu buton
+              hiyerarşiyi tek başına kurar. Cihaz listelendiğinde asıl eylem
+              aşağıdaki Connect'e geçer, tarama ikincile düşer.
+            */}
+            {scanResults.length === 0 && !scanning ? (
+              <PrimaryAction
+                label="Scan"
+                onPress={() => startScan()}
+                style={{ marginTop: space(3) }}
+              />
+            ) : (
+              <GhostAction
+                label={scanning ? 'Stop scan' : 'Scan again'}
+                onPress={() => (scanning ? stopScan() : startScan())}
+                style={{ marginTop: space(3) }}
+              />
             )}
           </View>
         )}
 
-        <View style={styles.statusCard}>
-          <View style={styles.statusRow}>
-            <StatusDot state={connectionState} />
-            <Text style={styles.statusText}>{statusLabel(connectionState)}</Text>
+        {linked && initResult && (
+          <View>
+            <SectionRule label="Session" />
+            <Fact label="Adapter" value={initResult.adapterInfo} />
+            {bleProfileLabel ? <Fact label="GATT profile" value={bleProfileLabel} /> : null}
+            <Fact label="Device" value={selectedDeviceName ?? selectedDeviceId ?? '—'} />
           </View>
+        )}
 
-          {initResult && (
-            <View style={styles.infoBlock}>
-              <InfoLine label="Adapter" value={initResult.adapterInfo} />
-              <InfoLine label="Protocol #" value={initResult.protocolNumber} />
-              {bleProfileLabel && <InfoLine label="GATT profile" value={bleProfileLabel} />}
-              {/*
-                Soru: "araç hangi PID'leri destekliyor, nasıl bileceğiz?"
-                Cevap: aracın kendisi söylüyor — 0100/0120/0140 bitmask'leri.
-                Katalogdaki PID'lerden kaçının desteklendiğini burada gösteriyoruz;
-                desteklenmeyenler aşağıdaki listede zaten pasif görünüyor.
-              */}
-              <InfoLine
-                label="Supported PIDs"
-                value={`${ALL_PIDS.filter((p) => isPidSupported(p.pid)).length} / ${ALL_PIDS.length}`}
-              />
-            </View>
-          )}
+        {connectError ? (
+          <View style={{ marginTop: space(4) }}>
+            <Text style={[type.prose, { color: color.caution }]}>{connectError}</Text>
+          </View>
+        ) : null}
 
-          {connectError && <Text style={styles.errorText}>{connectError}</Text>}
-
-          <Pressable
-            style={[styles.button, isConnected && styles.buttonDanger]}
-            onPress={() => (isConnected ? disconnect() : connect())}
-            disabled={isBusy || (!selectedDeviceId && isDisconnected)}
-          >
-            {isBusy ? (
-              <ActivityIndicator color={theme.text} />
-            ) : (
-              <Text style={styles.buttonText}>{isConnected ? 'Disconnect' : 'Connect'}</Text>
-            )}
-          </Pressable>
-        </View>
-
-        <View style={styles.statusCard}>
-          <Text style={styles.sectionTitle}>Phone sensors</Text>
-          <Text style={styles.sectionHint}>
-            GPS speed, altitude and acceleration are logged alongside OBD data — they enable
-            0-100 timing, grade-corrected power estimates and speedometer error.
-          </Text>
-          <Pressable
-            style={[styles.buttonSecondary, sensorsEnabled && styles.sensorOn]}
-            onPress={() => setSensorsEnabled(!sensorsEnabled)}
-          >
-            <Text style={styles.buttonText}>
-              {sensorsEnabled ? '✓ Sensors enabled' : 'Enable phone sensors'}
-            </Text>
-          </Pressable>
-          {sensorStatus && <Text style={styles.sectionHint}>{sensorStatus}</Text>}
-        </View>
-
-        <Text style={styles.sectionTitle}>Values to Log</Text>
-        <Text style={styles.sectionHint}>
-          Only one PID can be queried at a time on the K-line bus — fewer PIDs means a faster sample rate.
-        </Text>
-
-        <View style={styles.pidList}>
-          {ALL_PIDS.map((pid) => {
-            const selected = selectedPids.includes(pid.pid);
-            const supported = isPidSupported(pid.pid);
-            return (
-              <Pressable
-                key={pid.pid}
-                style={[styles.pidRow, selected && styles.pidRowSelected, !supported && styles.pidRowDisabled]}
-                onPress={() => supported && togglePid(pid.pid)}
-                disabled={!supported}
-              >
-                <View style={[styles.checkbox, selected && styles.checkboxChecked]} />
-                <View style={styles.pidTextBlock}>
-                  <Text style={styles.pidName}>{pid.name}</Text>
-                  <Text style={styles.pidMeta}>
-                    Mode 01 · {pid.pid} · {pid.unit}
-                    {!supported ? ' · not supported by vehicle' : ''}
-                  </Text>
-                </View>
-              </Pressable>
-            );
-          })}
+        <View style={{ marginTop: space(6) }}>
+          <SectionRule
+            label="Phone sensors"
+            meta={sensorsEnabled ? 'On' : 'Off'}
+            metaColor={sensorsEnabled ? color.linked : undefined}
+          />
+          <Note>
+            GPS and accelerometer are logged alongside OBD data — they enable 0-100 timing,
+            grade-corrected power and speedometer error.
+          </Note>
+          {sensorStatus ? (
+            <Text style={[type.metaSmall, { marginTop: space(2) }]}>{sensorStatus}</Text>
+          ) : null}
+          <GhostAction
+            label={sensorsEnabled ? 'Disable sensors' : 'Enable sensors'}
+            onPress={() => void setSensorsEnabled(!sensorsEnabled)}
+            tint={sensorsEnabled ? color.linked : color.hairlineStrong}
+            textTint={sensorsEnabled ? color.linked : color.ink}
+            style={{ marginTop: space(3) }}
+          />
         </View>
       </ScrollView>
+
+      <View style={styles.actions}>
+        {busy ? (
+          <View style={styles.loading}>
+            <ActivityIndicator color={color.ink} />
+            <Label small>Linking</Label>
+          </View>
+        ) : linked ? (
+          <GhostAction label="Disconnect" onPress={() => void disconnect()} style={{ flex: 1 }} />
+        ) : (
+          selectedDeviceId ? (
+            <PrimaryAction label="Connect" onPress={() => void connect()} style={{ flex: 1 }} />
+          ) : (
+            <GhostAction
+              label="Select an adapter"
+              onPress={() => {}}
+              disabled
+                style={{ flex: 1 }}
+            />
+          )
+        )}
+      </View>
     </SafeAreaView>
   );
 }
 
-function StatusDot({ state }: { state: string }) {
-  const color =
-    state === 'connected' ? theme.ok : state === 'error' ? theme.danger : state === 'connecting' ? theme.warning : theme.textDim;
-  return <View style={[styles.dot, { backgroundColor: color }]} />;
-}
-
-function statusLabel(state: string): string {
-  switch (state) {
-    case 'connected':
-      return 'Connected';
-    case 'connecting':
-      return 'Connecting…';
-    case 'error':
-      return 'Error';
-    default:
-      return 'Not connected';
-  }
-}
-
-function InfoLine({ label, value }: { label: string; value: string }) {
+function Fact({ label, value }: { label: string; value: string }) {
   return (
-    <View style={styles.infoLine}>
-      <Text style={styles.infoLabel}>{label}</Text>
-      <Text style={styles.infoValue}>{value}</Text>
+    <View style={styles.factRow}>
+      <Text style={type.metaSmall}>{label}</Text>
+      <Text style={[type.prose, { flex: 1, textAlign: 'right' }]} numberOfLines={2}>
+        {value}
+      </Text>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  safe: { flex: 1, backgroundColor: theme.bg },
-  container: { padding: spacing(2), gap: spacing(2) },
-  buttonSecondary: {
-    backgroundColor: theme.surfaceAlt,
-    borderRadius: 8,
-    paddingVertical: spacing(1),
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: theme.border,
-  },
+  safe: { flex: 1, backgroundColor: color.ground },
+  body: { paddingHorizontal: space(5), paddingTop: space(4), paddingBottom: space(4) },
+  deviceList: { marginTop: space(1) },
   deviceRow: {
-    backgroundColor: theme.surfaceAlt,
-    borderRadius: 8,
-    padding: spacing(1),
-    marginTop: spacing(1),
-    borderWidth: 1,
-    borderColor: theme.border,
-  },
-  deviceRowSelected: { borderColor: theme.accent },
-  deviceName: { color: theme.text, fontSize: 14, fontWeight: '600' },
-  deviceMeta: { color: theme.textDim, fontSize: 11, marginTop: 2 },
-  hint: { color: theme.textDim, fontSize: 12, marginTop: spacing(1), textAlign: 'center' },
-  sensorOn: { borderColor: theme.accent, backgroundColor: theme.surface },
-  statusCard: {
-    backgroundColor: theme.surface,
-    borderRadius: 12,
-    padding: spacing(2),
-    borderWidth: 1,
-    borderColor: theme.border,
-    gap: spacing(1.5),
-  },
-  statusRow: { flexDirection: 'row', alignItems: 'center', gap: spacing(1) },
-  dot: { width: 10, height: 10, borderRadius: 5 },
-  statusText: { color: theme.text, fontSize: 16, fontWeight: '600' },
-  infoBlock: { gap: 4 },
-  infoLine: { flexDirection: 'row', justifyContent: 'space-between' },
-  infoLabel: { color: theme.textDim, fontSize: 13 },
-  infoValue: { color: theme.text, fontSize: 13 },
-  errorText: { color: theme.danger, fontSize: 13 },
-  button: {
-    backgroundColor: theme.accent,
-    borderRadius: 8,
-    paddingVertical: spacing(1.5),
-    alignItems: 'center',
-  },
-  buttonDanger: { backgroundColor: theme.danger },
-  buttonText: { color: '#06201D', fontWeight: '700', fontSize: 15 },
-  sectionTitle: { color: theme.text, fontSize: 16, fontWeight: '700', marginTop: spacing(1) },
-  sectionHint: { color: theme.textDim, fontSize: 12, marginTop: -4 },
-  pidList: { gap: spacing(1) },
-  pidRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: spacing(1.5),
-    backgroundColor: theme.surface,
-    borderRadius: 10,
-    padding: spacing(1.5),
-    borderWidth: 1,
-    borderColor: theme.border,
+    gap: space(3),
+    paddingVertical: space(3),
+    borderBottomWidth: hairlineWidth,
+    borderBottomColor: color.hairlineFaint,
+    minHeight: 44,
   },
-  pidRowSelected: { borderColor: theme.accent },
-  pidRowDisabled: { opacity: 0.4 },
-  checkbox: {
+  pickMark: {
     width: 20,
     height: 20,
-    borderRadius: 5,
-    borderWidth: 2,
-    borderColor: theme.textDim,
+    borderWidth: hairlineWidth,
+    borderColor: color.hairlineStrong,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  checkboxChecked: { backgroundColor: theme.accent, borderColor: theme.accent },
-  pidTextBlock: { flex: 1 },
-  pidName: { color: theme.text, fontSize: 15, fontWeight: '600' },
-  pidMeta: { color: theme.textDim, fontSize: 12, marginTop: 2 },
+  pickMarkFill: { width: 10, height: 10, backgroundColor: color.ink },
+  factRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    gap: space(4),
+    paddingVertical: space(2.5),
+    borderBottomWidth: hairlineWidth,
+    borderBottomColor: color.hairlineFaint,
+  },
+  actions: { flexDirection: 'row', gap: space(3), paddingHorizontal: space(5), paddingVertical: space(3) },
+  loading: { flex: 1, minHeight: 48, alignItems: 'center', justifyContent: 'center', gap: space(1.5) },
 });
