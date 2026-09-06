@@ -818,9 +818,22 @@ export const useAppStore = create<AppState>((set, get) => ({
     keepScreenAwake(true);
     watchBackgroundGaps(set);
 
+    /**
+     * OBD ve sensör örnekleri TEK bir sıfır noktasını paylaşır.
+     *
+     * Yorum baştan beri bunu söylüyordu ama kod iki ayrı `Date.now()`
+     * çağırıyordu: poller kurulurken bir tane, sensör logger kurulurken
+     * bir tane daha. Aradaki fark küçük ama gerçek, ve iki zaman ekseni
+     * arasında sabit bir kayma bırakıyordu — hız ile ivmeyi eşleştiren
+     * her metrik o kaymayı taşıyordu. Ayrıca cycle adımları arasında
+     * poller yeniden kurulduğunda referansın değişmemesi buna bağlı.
+     */
+    const recordingStartedAt = Date.now();
+
     const poller = new Poller({
       pids: pidDefs,
       queue,
+      startedAt: recordingStartedAt,
       onFlush: (samples: PollSample[]) => {
         void flushSamples(session.id, samples, set, get);
       },
@@ -840,7 +853,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // CSV'de aynı satıra düşmeleri ve birleşik metriklerin çalışması buna bağlı.
     if (selectedSensors.length > 0) {
       sensorLogger = new SensorLogger({
-        startedAt: Date.now(),
+        startedAt: recordingStartedAt,
         groups: selectedSensors,
         // Order analizi için canlı devir. Poller'ın en son yazdığı 0C
         // örneği; sensör tarafı OBD tarafını böyle okuyor.

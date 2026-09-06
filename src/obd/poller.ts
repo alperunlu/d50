@@ -38,6 +38,18 @@ export interface PollerOptions {
   readonly slowIntervalMs?: number;
   /** Cevap vermeyen bir PID geri çekildiğinde haber verir (debug log'u için). */
   readonly onBackoff?: (pid: string, failures: number) => void;
+  /**
+   * Örnek zaman damgalarının sıfır noktası (epoch ms).
+   *
+   * Verilmezse poller'ın kendi başlangıcı kullanılır. Rehberli test
+   * cycle'ında kanal seti adım adım değiştiği için poller kayıt ortasında
+   * yeniden kuruluyor; zaman tabanı poller'ın içinde kalsaydı her yeniden
+   * kurulumda `ts` sıfırlanır ve TEK bir oturumun zaman ekseni başa
+   * sarardı — 0-100, ivme ve seri eşleştirmelerinin tamamı bozulurdu.
+   * Oturumla birlikte bir kez üretilip her poller'a aynısı geçiliyor.
+   * `SensorLogger` bunu zaten böyle alıyordu.
+   */
+  readonly startedAt?: number;
 }
 
 /**
@@ -142,7 +154,7 @@ export class Poller {
   private running = false;
   private buffer: PollSample[] = [];
   private flushTimer: ReturnType<typeof setInterval> | null = null;
-  private readonly startedAt = Date.now();
+  private readonly startedAt: number;
   private loopPromise: Promise<void> | null = null;
 
   /** Son bir saniyede tamamlanan örnek sayısı — UI'da "~N örnek/sn" göstermek için. */
@@ -150,7 +162,9 @@ export class Poller {
   private lastRateWindowStart = Date.now();
   private currentRate = 0;
 
-  constructor(private readonly opts: PollerOptions) {}
+  constructor(private readonly opts: PollerOptions) {
+    this.startedAt = opts.startedAt ?? Date.now();
+  }
 
   start(): void {
     if (this.running) return;
