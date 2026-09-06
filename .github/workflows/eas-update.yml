@@ -1,0 +1,74 @@
+# OTA yayınını GitHub Actions üzerinden yapar.
+#
+# NEDEN: yayın komutunun çalıştığı yerin api.expo.dev'e çıkabilmesi gerekiyor.
+# Geliştirme oturumunun ağ politikası o host'u kapatıyor; Actions runner'ında
+# böyle bir kısıt yok. Ayrıca token depoda secret olarak duruyor — kimsenin
+# makinesinde ya da sohbetinde değil.
+#
+# Yayından ÖNCE tip kontrolü ve testler koşuyor: kullanıcının telefonuna
+# derlenmeyen ya da testi kırık bir bundle gitmesin.
+name: EAS Update
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'EAS update branch (kanal)'
+        required: false
+        default: production
+      message:
+        description: 'Yayın notu'
+        required: false
+  push:
+    # Düzeltme henüz main'de değil; OTA'nın bu daldan çıkması bilinçli.
+    # main'e birleştikten sonra bu tetikleyici kaldırılmalı, yayın yalnızca
+    # elle (workflow_dispatch) yapılmalı.
+    branches:
+      - claude/testflight-crash-analysis-8hbzpb
+
+# İki yayın aynı anda çıkmasın.
+concurrency:
+  group: eas-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Token var mi
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          if [ -z "$EXPO_TOKEN" ]; then
+            echo "EXPO_TOKEN secret'i tanimli degil."
+            echo "Settings > Secrets and variables > Actions > New repository secret"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - name: Tip kontrolu
+        run: npx tsc --noEmit
+
+      - name: Testler
+        run: npm test
+
+      - uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      - name: OTA yayini
+        env:
+          # Kabuğa doğrudan gömmek yerine ortam değişkeni: girdi metni
+          # komutu bozamasın.
+          EAS_BRANCH: ${{ github.event.inputs.branch || 'production' }}
+          EAS_MESSAGE: ${{ github.event.inputs.message || format('{0} @ {1}', github.ref_name, github.sha) }}
+        run: eas update --branch "$EAS_BRANCH" --message "$EAS_MESSAGE" --non-interactive
