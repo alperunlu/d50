@@ -58,7 +58,11 @@ jobs:
         run: npx tsc --noEmit
 
       - name: Testler
-        run: npm test
+        # tests/ dizini .gitignore'da (ilk commit'ten beri, CLAUDE.md ve
+        # NOTES.md ile aynı blokta), yani depoda test dosyası olmayabilir.
+        # Varsa koşsun ve yayını durdursun; yoksa runner'da olmayan bir
+        # dosya yüzünden OTA tıkanmasın. Asıl kapı tip kontrolü.
+        run: npm test -- --passWithNoTests
 
       - uses: expo/expo-github-action@v8
         with:
