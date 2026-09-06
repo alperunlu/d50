@@ -1367,6 +1367,198 @@ export function tyreSizeCalibration(
 }
 
 // ---------------------------------------------------------------------------
+// Şarj sistemi ve akü — adaptörün voltmetresinden
+// ---------------------------------------------------------------------------
+
+/**
+ * Voltaj tek başına bir sayıdır; DEVİRLE eşleşince teşhis olur.
+ *
+ * Aynı 12.4 V, motor çalışırken "alternatör basmıyor", kontak açık motor
+ * kapalıyken "akü yarı dolu" demektir. Bu yüzden her iki kart da voltajı
+ * devirle birlikte okuyor ve hangi durumda ölçüldüğünü kanıtta yazıyor.
+ *
+ * Eşikler 12 V kurşun-asit sistem içindir. R50 (2001-2006) sabit gerilimli
+ * bir regülatör kullanıyor; modern araçlardaki değişken gerilimli "akıllı"
+ * alternatörlerde bu bantlar geçerli olmazdı, o yüzden araç profiline
+ * bağlı bir kontrol.
+ */
+const CHARGING_MIN_V = 13.6;
+const CHARGING_MAX_V = 15.0;
+
+/** Motor çalışırken (devir > 400) ölçülen voltaj örnekleri. */
+function voltsWhileRunning(series: SeriesMap): number[] {
+  const volts = get(series, 'battery_v');
+  const rpm = get(series, '0C');
+  if (rpm.length === 0) return [];
+  const out: number[] = [];
+  for (const v of volts) {
+    const r = sampleAt(rpm, v.ts, 15_000);
+    if (r !== null && r > 400) out.push(v.value);
+  }
+  return out;
+}
+
+/** Motor DURURKEN (devir yok ya da 0) ölçülen voltaj örnekleri. */
+function voltsWhileStopped(series: SeriesMap): number[] {
+  const volts = get(series, 'battery_v');
+  const rpm = get(series, '0C');
+  const out: number[] = [];
+  for (const v of volts) {
+    const r = rpm.length === 0 ? null : sampleAt(rpm, v.ts, 15_000);
+    if (r !== null && r <= 400) out.push(v.value);
+  }
+  return out;
+}
+
+/**
+ * Şarj sistemi: alternatör basıyor mu, ne kadar basıyor.
+ *
+ * Ayrıca rölanti ile seyir voltajını karşılaştırıyor. Yorgun bir alternatör
+ * (aşınmış kömür, kayan kayış) seyirde yeterli basar ama rölantide düşer —
+ * tek bir ortalama bunu gizler, iki koşulun farkı gösterir.
+ */
+export function chargingSystem(series: SeriesMap, vehicle: VehicleProfile = MINI_R50): Finding {
+  const key = 'charging';
+  const title = 'Charging system';
+
+  if (get(series, 'battery_v').length < 3) {
+    return inconclusive(key, title, ['Battery Voltage'],
+      'The adapter reads system voltage on its own — record with the adapter connected.');
+  }
+  if (get(series, '0C').length < 5) {
+    return inconclusive(key, title, ['Engine RPM'],
+      'Voltage only becomes a diagnosis when it is read against engine speed.');
+  }
+
+  const running = voltsWhileRunning(series);
+  if (running.length < 3) {
+    return inconclusive(key, title, [],
+      'No voltage samples with the engine running — the charging voltage is what tells you whether the alternator works.');
+  }
+
+  const level = median(running) as number;
+
+  // Rölanti / seyir farkı: ikisi de varsa anlamlı.
+  const volts = get(series, 'battery_v');
+  const rpm = get(series, '0C');
+  const speed = get(series, '0D').length > 0 ? get(series, '0D') : get(series, 'gps_speed');
+  const idleVolts: number[] = [];
+  const cruiseVolts: number[] = [];
+  for (const v of volts) {
+    const r = sampleAt(rpm, v.ts, 15_000);
+    if (r === null || r <= 400) continue;
+    const kmh = speed.length > 0 ? sampleAt(speed, v.ts, 15_000) : null;
+    if (kmh === null) continue;
+    if (kmh < 2 && r < vehicle.idleRpm * 1.6) idleVolts.push(v.value);
+    else if (kmh > 40) cruiseVolts.push(v.value);
+  }
+  const idleLevel = idleVolts.length >= 3 ? (median(idleVolts) as number) : null;
+  const cruiseLevel = cruiseVolts.length >= 3 ? (median(cruiseVolts) as number) : null;
+
+  const parts = [`${round(level, 2)} V running (${running.length} samples)`];
+  if (idleLevel !== null) parts.push(`idle ${round(idleLevel, 2)} V`);
+  if (cruiseLevel !== null) parts.push(`cruise ${round(cruiseLevel, 2)} V`);
+  const evidence = parts.join(', ');
+
+  if (level < 13.0) {
+    return {
+      key, title, verdict: 'attention',
+      headline: 'The alternator is not charging',
+      detail:
+        `System voltage stays at ${round(level, 2)} V with the engine running, which is battery voltage, not charging voltage. The car is running off the battery and will stop when it runs out. Check the belt first, then the alternator and its connections.`,
+      evidence,
+    };
+  }
+
+  if (level < CHARGING_MIN_V) {
+    return {
+      key, title, verdict: 'attention',
+      headline: 'Charging voltage is low',
+      detail:
+        `A healthy system holds ${CHARGING_MIN_V}-14.6 V with the engine running; this one sits at ${round(level, 2)} V. A slipping belt, worn brushes or a tired regulator all look like this, and the battery will slowly fall behind.`,
+      evidence,
+    };
+  }
+
+  if (level > CHARGING_MAX_V) {
+    return {
+      key, title, verdict: 'attention',
+      headline: 'Charging voltage is too high',
+      detail:
+        `${round(level, 2)} V is above what the regulator should allow. Overcharging boils the electrolyte out of the battery and shortens the life of everything electrical. The regulator is the usual cause.`,
+      evidence,
+    };
+  }
+
+  // Seyirde iyi, rölantide düşük: alternatör sınırda.
+  if (idleLevel !== null && cruiseLevel !== null && cruiseLevel - idleLevel > 0.5 && idleLevel < 13.2) {
+    return {
+      key, title, verdict: 'attention',
+      headline: 'Charging drops away at idle',
+      detail:
+        `Voltage is healthy at speed (${round(cruiseLevel, 2)} V) but falls to ${round(idleLevel, 2)} V at idle, so at a long traffic light the battery is carrying the load rather than being charged. A slipping belt or a worn alternator behaves exactly like this.`,
+      evidence,
+    };
+  }
+
+  return {
+    key, title, verdict: 'ok',
+    headline: 'Charging voltage is healthy',
+    detail: `The alternator holds the system in the normal band with the engine running.`,
+    evidence,
+  };
+}
+
+/**
+ * Akünün dinlenme voltajı — yalnızca motor DURURKEN anlamlı.
+ *
+ * Rehberli test cycle'ının ilk adımı tam olarak bu koşulu kuruyor: kontak
+ * açık, motor kapalı. Üstelik cycle sabah, araç bir gece dinlendikten sonra
+ * çalıştırıldığı için yüzey şarjı da inmiş oluyor — bu ölçümün dürüst
+ * olduğu tek an.
+ */
+export function batteryState(series: SeriesMap): Finding {
+  const key = 'battery';
+  const title = 'Battery state of charge';
+
+  const stopped = voltsWhileStopped(series);
+  if (stopped.length < 3) {
+    return inconclusive(key, title, [],
+      'Needs voltage readings with the ignition on and the engine not running — the first step of the guided test cycle does this.');
+  }
+
+  const level = median(stopped) as number;
+  const evidence = `${round(level, 2)} V with the engine off (${stopped.length} samples)`;
+
+  if (level < 12.0) {
+    return {
+      key, title, verdict: 'attention',
+      headline: 'Battery is discharged',
+      detail:
+        `${round(level, 2)} V resting is under half charge and near the point where the car will not start on a cold morning. Charge it and have it load-tested; a battery that keeps arriving here has either lost capacity or is being drained while parked.`,
+      evidence,
+    };
+  }
+
+  if (level < 12.4) {
+    return {
+      key, title, verdict: 'attention',
+      headline: 'Battery is partly discharged',
+      detail:
+        `${round(level, 2)} V resting is roughly half to three-quarters charged. Short trips that never let the alternator catch up are the usual reason; a long drive or a charger will tell you whether it holds a charge afterwards.`,
+      evidence,
+    };
+  }
+
+  return {
+    key, title, verdict: 'ok',
+    headline: 'Battery is charged',
+    detail: 'Resting voltage is in the band of a healthy, charged battery.',
+    evidence,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Hepsi bir arada
 // ---------------------------------------------------------------------------
 
@@ -1391,6 +1583,8 @@ export function runDiagnostics(series: SeriesMap, vehicle: VehicleProfile = MINI
     soundVsRpm(series),
     orderTrackingQuality(series),
     tyreCircumferenceCheck(series, vehicle),
+    chargingSystem(series, vehicle),
+    batteryState(series),
     driveRatioStability(series, vehicle),
   ];
 
