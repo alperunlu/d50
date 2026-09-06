@@ -50,6 +50,8 @@ import {
 import { orderedCards, moveInOrder } from '../data/cardOrder';
 import { CYCLE_STEPS, channelKeysForStep } from '../cycle/steps';
 import { evaluateStep, nextHeldSince, type StepProgress } from '../cycle/engine';
+import { extractVitals, cycleContext } from '../analysis/vitals';
+import { groupSeries } from '../analysis/derived';
 import {
   sensorGroupsForChannels,
   recordedKeysForSensorChannels,
@@ -280,6 +282,15 @@ let lastSampleAt = 0;
  * bölünmüyor, zaman ekseni kaymıyor, yalnızca sorulan kanallar değişiyor.
  */
 let recordingContext: { sessionId: number; startedAt: number; queue: CommandQueue } | null = null;
+/**
+ * Tamamlanan cycle adımlarının zaman pencereleri.
+ *
+ * Trendin ön şartı: hangi örneğin hangi koşulda alındığı. Cycle bitince
+ * vitals bu pencerelerden çıkarılıyor ve pencerelerle birlikte saklanıyor.
+ */
+let cycleWindows: { stepId: string; fromMs: number; toMs: number; skipped: boolean }[] = [];
+/** Şu anki adımın kayıt içindeki başlangıcı (ms, oturum başına göre). */
+let cycleStepFromMs = 0;
 /** Cycle adımlarını ilerleten sayaç. */
 let cycleTimer: ReturnType<typeof setInterval> | null = null;
 /** Akü voltajı ATRV ile ayrı ritimde okunuyor (bkz. pollAdapterVoltage). */
@@ -933,6 +944,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       direction: 'info',
       text: `Guided test cycle started — step 1/${CYCLE_STEPS.length}: ${first.title}`,
     });
+    cycleWindows = [];
+    cycleStepFromMs = 0;
     startCycleTicker(set, get);
   },
 
@@ -941,6 +954,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (!state) return;
     const current = CYCLE_STEPS[state.stepIndex];
     const nextIndex = state.stepIndex + 1;
+
+    // Biten adımın penceresini kapat. Zaman ekseni oturumun sıfır
+    // noktasına göre, çünkü örneklerin ts'i de öyle.
+    const nowMs = recordingContext ? Date.now() - recordingContext.startedAt : 0;
+    cycleWindows.push({
+      stepId: current.id,
+      fromMs: cycleStepFromMs,
+      toMs: nowMs,
+      skipped,
+    });
+    cycleStepFromMs = nowMs;
 
     appendLog(set, {
       ts: Date.now(),
@@ -974,8 +998,36 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   stopCycle: async () => {
     stopCycleTicker();
+    const sessionId = get().currentSession?.id ?? null;
+    const windows = [...cycleWindows];
     set({ cycle: null });
     await get().stopRecording();
+
+    /**
+     * Vitals kayıt BİTTİKTEN sonra çıkarılıyor: son adımın örnekleri de
+     * diske yazılmış olsun. Çıkarım başarısız olursa kayıt yine de
+     * duruyor — ham örnekler DB'de, trend sonradan hesaplanabilir.
+     */
+    if (sessionId === null || windows.length === 0) return;
+    try {
+      const samples = await repo.readSamples(sessionId);
+      const series = groupSeries(samples);
+      const vitals = extractVitals(series, windows, get().vehicle);
+      await repo.saveCycleResult(sessionId, windows, vitals, cycleContext(series, windows));
+      appendLog(set, {
+        ts: Date.now(),
+        direction: 'info',
+        text: `Cycle finished — ${vitals.length} vitals recorded for trending`,
+      });
+    } catch (e) {
+      appendLog(set, {
+        ts: Date.now(),
+        direction: 'error',
+        text: `Could not extract cycle vitals: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    } finally {
+      cycleWindows = [];
+    }
   },
 
   stopRecording: async () => {

@@ -16,6 +16,10 @@ import {
 } from '../src/analysis/derived';
 import { isPidSupported } from '../src/obd/pids';
 import { runDiagnostics, type Finding } from '../src/analysis/diagnostics';
+import { buildReportHtml } from '../src/report/html';
+import { analyseTrend } from '../src/analysis/trend';
+import { VITAL_META } from '../src/analysis/vitals';
+import { JS_BUILD_TAG } from '../src/ui/buildTag';
 import { useAppStore } from '../src/state/store';
 import { breadcrumb } from '../src/util/crashLog';
 import type { Session } from '../src/db/types';
@@ -102,6 +106,66 @@ export default function TripsScreen() {
       setBusyId(null);
     }
   }, []);
+
+  /**
+   * HTML rapor: bu gezinin ölçümleri + her vital'in kendi geçmişine göre
+   * trendi. Paylaşım sayfasından "Print → Save as PDF" ile PDF'e çevrilir;
+   * gerçek PDF `expo-print` ister ve o native modül henüz derlemede yok.
+   */
+  const exportReport = useCallback(
+    async (session: Session) => {
+      setBusyId(session.id);
+      breadcrumb(`report session ${session.id}: read`);
+      try {
+        const samples = await repo.readSamples(session.id);
+        const series = groupSeries(samples);
+        const stored = await repo.readSessionVitals(session.id);
+
+        // Her vital'in trendi kendi geçmişinden çıkıyor — bu oturumdakiler
+        // dahil, çünkü trend "bugün nerede" sorusunu da cevaplamalı.
+        const vitals = await Promise.all(
+          stored.map(async (v) => {
+            const history = await repo.readVitalHistory(v.key);
+            const meta = VITAL_META[v.key];
+            return {
+              key: v.key,
+              label: meta?.label ?? v.key,
+              value: v.value,
+              unit: v.unit,
+              trend: analyseTrend(history, meta?.betterWhen ?? 'stable'),
+            };
+          }),
+        );
+
+        const html = buildReportHtml({
+          sessionId: session.id,
+          startedAt: session.startedAt,
+          durationSec: session.endedAt ? (session.endedAt - session.startedAt) / 1000 : 0,
+          vehicle: vehicle.name,
+          buildTag: JS_BUILD_TAG,
+          summary: summarizeTrip(series, vehicle),
+          findings: runDiagnostics(series, vehicle),
+          vitals,
+          skippedSteps: await repo.readSkippedSteps(session.id),
+        });
+
+        const { uri, shared } = await writeAndShare(
+          `d50_report_${session.id}_${session.startedAt}.html`,
+          html,
+          'text/html',
+          'Share report',
+        );
+        if (!shared) Alert.alert('Sharing unavailable', `File saved: ${uri}`);
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        breadcrumb(`report session ${session.id} FAILED: ${message}`);
+        Alert.alert('Report failed', message);
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [vehicle],
+  );
 
   const exportLog = useCallback(async (session: Session) => {
     setBusyId(session.id);
@@ -206,6 +270,7 @@ export default function TripsScreen() {
 
                   <Rule style={{ marginTop: space(3) }} />
                   <View style={styles.tripActions}>
+                    <TripAction label="Report" onPress={() => void exportReport(s)} disabled={busy} />
                     <TripAction label="CSV" onPress={() => void exportCsv(s)} disabled={busy} />
                     <TripAction label="Log" onPress={() => void exportLog(s)} disabled={busy} />
                     <TripAction label="Delete" onPress={() => remove(s)} tint={color.alert} />

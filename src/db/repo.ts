@@ -236,3 +236,69 @@ function parseMask(raw: string | null | undefined): SupportedPidMap | null {
 
 /** Test/tip amaçlı re-export — repo dışında SQLiteDatabase tipine ihtiyaç duyan olmasın diye. */
 export type { SQLiteDatabase };
+
+/**
+ * Cycle adım sınırlarını ve çıkarılan vitals'ı yazar.
+ *
+ * İkisi tek bir çağrıda çünkü ayrı düşmeleri anlamsız: adım sınırları
+ * olmadan vitals'ın hangi koşulda ölçüldüğü bilinmez, vitals olmadan
+ * sınırlar tek başına bir işe yaramaz.
+ */
+export async function saveCycleResult(
+  sessionId: number,
+  windows: readonly { stepId: string; fromMs: number; toMs: number; skipped: boolean }[],
+  vitals: readonly { key: string; value: number; unit: string }[],
+  context: string | null,
+): Promise<void> {
+  return serialize(async () => {
+    const db = await getDb();
+    const recordedAt = Date.now();
+    await db.withTransactionAsync(async () => {
+      for (const w of windows) {
+        await db.runAsync(
+          'INSERT INTO cycle_steps (session_id, step_id, from_ms, to_ms, skipped) VALUES (?, ?, ?, ?, ?)',
+          sessionId, w.stepId, w.fromMs, w.toMs, w.skipped ? 1 : 0,
+        );
+      }
+      for (const v of vitals) {
+        await db.runAsync(
+          'INSERT INTO cycle_vitals (session_id, key, value, unit, recorded_at, context) VALUES (?, ?, ?, ?, ?, ?)',
+          sessionId, v.key, v.value, v.unit, recordedAt, context,
+        );
+      }
+    });
+  });
+}
+
+/** Bir vital'in bütün geçmişi, eskiden yeniye. Trend bunun üstüne kuruluyor. */
+export async function readVitalHistory(
+  key: string,
+): Promise<{ at: number; value: number; sessionId: number }[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<{ recorded_at: number; value: number; session_id: number }>(
+    'SELECT recorded_at, value, session_id FROM cycle_vitals WHERE key = ? ORDER BY recorded_at ASC',
+    key,
+  );
+  return rows.map((r) => ({ at: r.recorded_at, value: r.value, sessionId: r.session_id }));
+}
+
+/** Bir oturumun vitals'ı — raporda o cycle'ın kendi tablosu için. */
+export async function readSessionVitals(
+  sessionId: number,
+): Promise<{ key: string; value: number; unit: string }[]> {
+  const db = await getDb();
+  return db.getAllAsync<{ key: string; value: number; unit: string }>(
+    'SELECT key, value, unit FROM cycle_vitals WHERE session_id = ?',
+    sessionId,
+  );
+}
+
+/** Bir oturumda atlanan cycle adımlarının id'leri. */
+export async function readSkippedSteps(sessionId: number): Promise<string[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<{ step_id: string }>(
+    'SELECT step_id FROM cycle_steps WHERE session_id = ? AND skipped = 1',
+    sessionId,
+  );
+  return rows.map((r) => r.step_id);
+}
