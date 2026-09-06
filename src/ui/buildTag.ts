@@ -6,4 +6,4 @@
  * mi?" sorusunun tartışmasız cevabı. Arabaya çıkmadan Bus ekranına bakıp
  * beklenen değerle karşılaştırmak yeterli.
  */
-export const JS_BUILD_TAG = '2026-09-06 · js-16 (battery volts)';
+export const JS_BUILD_TAG = '2026-09-06 · js-17 (scan filter)';

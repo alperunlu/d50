@@ -13,6 +13,7 @@ import { AppState as RNAppState, type NativeEventSubscription } from 'react-nati
 import { create } from 'zustand';
 import { breadcrumb } from '../util/crashLog';
 import { BleTransport, type ScannedDevice } from '../ble/bleTransport';
+import { isScanResultVisible } from '../ble/scanFilter';
 import type { DiscoveredProfile, ProfileCandidate } from '../ble/profiles';
 import type { ObdConnectionState, ObdTransport } from '../ble/transport';
 import {
@@ -265,6 +266,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     const ble = getBleTransport();
     stopScanFn = ble.scan(
       (device) => {
+        // Gürültü listeye hiç girmiyor: sayaç da ("N found") böylece
+        // gerçekten bakmaya değer cihaz sayısını gösteriyor.
+        if (!isScanResultVisible(device)) return;
         set((s) => {
           if (s.scanResults.some((d) => d.id === device.id)) return s;
           return { scanResults: [...s.scanResults, device] };
