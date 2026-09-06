@@ -58,10 +58,19 @@ const tabular: TextStyle = { fontVariant: ['tabular-nums'] };
 
 export const type = StyleSheet.create({
   /** Ekranın sahibi olan tek sayı. */
+  /**
+   * lineHeight, fontSize'dan KÜÇÜK OLAMAZ.
+   *
+   * 88/76 idi ve iOS metin kutusunu harflerden alçak yapınca rakamların
+   * üstünü çerçeveye kırptırıyordu — gürültü kartında "45.1"in tepesi
+   * kesiliyordu (6 Eylül 2026). Temadaki diğer bütün stiller zaten
+   * 1.05-1.08 arasında; ölçü stilleri tek istisnaydı ve kırpılan da
+   * onlardı. Sıkı görünüm oranla değil, punto ile kurulur.
+   */
   heroValue: {
     fontFamily: font.measure,
     fontSize: 88,
-    lineHeight: 76,
+    lineHeight: 94,
     color: color.ink,
     letterSpacing: -1.5,
     ...tabular,
@@ -70,7 +79,7 @@ export const type = StyleSheet.create({
   cellValue: {
     fontFamily: font.measure,
     fontSize: 42,
-    lineHeight: 38,
+    lineHeight: 45,
     color: color.ink,
     ...tabular,
   },

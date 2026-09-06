@@ -97,7 +97,7 @@ export default function LiveScreen() {
             <Text
               style={[
                 type.cellValue,
-                { fontSize: 22, lineHeight: 22 },
+                { fontSize: 22, lineHeight: 24 },
                 !isRecording && { color: color.muted },
               ]}
             >
