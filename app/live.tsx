@@ -37,6 +37,7 @@ export default function LiveScreen() {
   const selectedPids = useAppStore((s) => s.selectedPids);
   const liveSeries = useAppStore((s) => s.liveSeries);
   const isRecording = useAppStore((s) => s.isRecording);
+  const recordingGaps = useAppStore((s) => s.recordingGaps);
   const sampleRate = useAppStore((s) => s.sampleRate);
   const startRecording = useAppStore((s) => s.startRecording);
   const stopRecording = useAppStore((s) => s.stopRecording);
@@ -130,6 +131,19 @@ export default function LiveScreen() {
 
           {selectedPids.length === 0 && (
             <Text style={[type.meta, styles.hint]}>No channels selected.</Text>
+          )}
+
+          {/*
+            Arka planda geçen süre kaydedilmiyor. Sessizce eksik bir gezi
+            teslim etmektense burada söylemek gerekiyor: kullanıcı ya
+            telefonu açık bırakır ya da eksiği bilerek kabul eder.
+          */}
+          {recordingGaps.length > 0 && (
+            <Text style={[type.meta, styles.hint, { color: color.caution }]}>
+              {`${recordingGaps.length} gap${recordingGaps.length === 1 ? '' : 's'} in this recording — ` +
+                `${recordingGaps.reduce((total, g) => total + g.seconds, 0)} s were not recorded while the app was in the background. ` +
+                'Keep the app open and the screen on.'}
+            </Text>
           )}
 
           {/*

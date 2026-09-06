@@ -229,6 +229,69 @@ export function warmupSeconds(
 }
 
 /**
+ * Rölanti örneklerinin TEK tanımı — özet de teşhis de bunu kullanır.
+ *
+ * Önce iki ayrı tanım vardı ve aynı ekranda iki farklı sayı çıkıyordu:
+ * 6 Eylül 2026 kaydında özet "114 rpm σ", teşhis kartı "σ 44.4 rpm" dedi.
+ * Fark üst banttaydı — özet 1.8× rölantiye kadar (1530 rpm) sayıyordu ve
+ * araç dururken gaza basılan iki örneği (1435, 1472 rpm) rölanti sanıp
+ * sapmayı iki katından fazla şişiriyordu. 850 rpm rölantili bir motorda
+ * 1472 rpm rölanti değildir; dar bant doğru olandı.
+ *
+ * Ölçüm aletinde iki sayının çelişmesi, sayının kendisinden daha kötüdür:
+ * kullanıcı hangisine bakacağını bilemez. Tanım bu yüzden tek yerde.
+ */
+export function idleSamples(
+  rpmSeries: readonly TimeSeriesPoint[],
+  speedSeries: readonly TimeSeriesPoint[],
+  vehicle: VehicleProfile = MINI_R50,
+): TimeSeriesPoint[] {
+  // "Hız verisi yok" ile "hız verisi var ama araç hareket hâlinde" farklı
+  // şeylerdir: ilkinde devir bandına güvenip devam ederiz, ikincisinde
+  // rölanti diye bir şey yoktur ve ölçüm yapılmamalıdır.
+  const haveSpeedData = speedSeries.length > 0;
+
+  const out: TimeSeriesPoint[] = [];
+  for (const r of rpmSeries) {
+    // Alt sınır motorun ÇALIŞTIĞINI söyler (kontak kapalıyken devir 0 gelir),
+    // üst sınır rölantiden çıkıldığını.
+    if (r.value <= 300 || r.value >= vehicle.idleRpm * 1.6) continue;
+    if (!haveSpeedData) {
+      out.push(r);
+      continue;
+    }
+    // O andaki hız: devir örneğiyle aynı ts'e denk gelmeyebilir, o ana kadarki
+    // son hız örneği kullanılır (3 sn'den eskiyse "bilinmiyor" sayılır).
+    const speed = valueAtOrBefore(speedSeries, r.ts, 3000);
+    if (speed !== null && speed < 2) out.push(r);
+  }
+  return out;
+}
+
+/**
+ * Serinin `ts` anındaki değeri: o ana kadarki SON örnek (forward-fill).
+ * `maxAgeMs`'ten eskiyse `null` — bayat bir değeri "şu anki" diye sunmak
+ * ölçümü uydurmak olurdu. İkili arama; uzun kayıtlarda kareli maliyet
+ * bırakmamak için (bkz. nearestValue'daki not).
+ */
+function valueAtOrBefore(
+  series: readonly TimeSeriesPoint[],
+  ts: number,
+  maxAgeMs: number,
+): number | null {
+  let lo = 0;
+  let hi = series.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (series[mid].ts <= ts) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo === 0) return null;
+  const last = series[lo - 1];
+  return ts - last.ts <= maxAgeMs ? last.value : null;
+}
+
+/**
  * Rölanti kararlılığı — devir standart sapması (RPM).
  *
  * Tekleme, kirli enjektör ya da vakum kaçağı rölantiyi dalgalandırır.
@@ -240,25 +303,21 @@ export function idleRpmStability(
   speedSeries: readonly TimeSeriesPoint[],
   vehicle: VehicleProfile = MINI_R50,
 ): { stdDev: number; meanRpm: number; sampleCount: number } | null {
-  // "Hız verisi yok" ile "hız verisi var ama araç hareket hâlinde" farklı
-  // şeylerdir: ilkinde devir bandına güvenip devam ederiz, ikincisinde
-  // rölanti diye bir şey yoktur ve ölçüm yapılmamalıdır.
-  const haveSpeedData = speedSeries.length > 0;
-  const stoppedTimes = speedSeries.filter((s) => s.value <= 1).map((s) => s.ts);
-
-  const idleBand = rpmSeries.filter((r) => {
-    const inIdleRange = r.value > vehicle.idleRpm * 0.6 && r.value < vehicle.idleRpm * 1.8;
-    if (!inIdleRange) return false;
-    if (!haveSpeedData) return true;
-    // Hız örneği tam aynı ts'te olmayabilir; en yakın 2 sn içinde duruyorsa say.
-    return stoppedTimes.some((ts) => Math.abs(ts - r.ts) <= 2000);
-  });
+  const idleBand = idleSamples(rpmSeries, speedSeries, vehicle);
 
   if (idleBand.length < 5) return null;
 
   const values = idleBand.map((p) => p.value);
   const mean = values.reduce((a, b) => a + b, 0) / values.length;
-  const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / values.length;
+  /**
+   * n-1 (örneklem standart sapması), n değil.
+   *
+   * Teşhis kartı baştan beri n-1 kullanıyordu; özet n kullanıyordu. Aynı
+   * veriden 40.0 ve 40.3 çıkıyordu — bant farkı düzeltildikten SONRA bile
+   * iki sayı tutmuyordu. Elimizdeki, rölantinin tamamı değil ondan alınmış
+   * bir örneklem; doğru tahminci de n-1 olan.
+   */
+  const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / (values.length - 1);
   return { stdDev: Math.sqrt(variance), meanRpm: mean, sampleCount: values.length };
 }
 

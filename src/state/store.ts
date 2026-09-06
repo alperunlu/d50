@@ -9,6 +9,7 @@
  * arayüzü üzerinden konuşur.
  */
 
+import { AppState as RNAppState, type NativeEventSubscription } from 'react-native';
 import { create } from 'zustand';
 import { breadcrumb } from '../util/crashLog';
 import { BleTransport, type ScannedDevice } from '../ble/bleTransport';
@@ -114,6 +115,11 @@ interface AppState {
   // --- canlı kayıt ---
   poller: Poller | null;
   isRecording: boolean;
+  /**
+   * Kayıt sırasında uygulamanın arka plana düştüğü ve HİÇBİR ŞEYİN
+   * kaydedilmediği aralıklar. Boş bir liste "delik yok" demektir.
+   */
+  recordingGaps: readonly { at: number; seconds: number }[];
   currentSession: Session | null;
   liveSeries: LiveSeries;
   sampleRate: number;
@@ -214,6 +220,22 @@ let pendingLogRows: { ts: number; direction: string; text: string }[] = [];
 /** BleTransport tekil olduğu için log aboneliği de yalnızca bir kez kurulmalı. */
 let bleLogHooked = false;
 
+/**
+ * Arka plan takibi.
+ *
+ * iOS uygulamayı arka planda ASKIYA ALIR: zamanlayıcılar donar, BLE
+ * bildirimi gelmez, hiçbir örnek kaydedilmez. Bunun için arka plan modu
+ * kapalı (app.json, react-native-ble-plx `isBackgroundEnabled: false`).
+ *
+ * 6 Eylül 2026 kaydında bu 7 dakika 39 saniyelik sessiz bir delik açtı ve
+ * deliği fark etmenin tek yolu log zaman damgalarına bakmaktı: gezi 521
+ * saniye görünüyordu, gerçek veri 62 saniyeydi. Bir ölçüm aletinde sessiz
+ * boşluk, yanlış değer kadar kötüdür — artık hem oturum loguna yazılıyor
+ * hem de ekranda söyleniyor.
+ */
+let appStateSub: NativeEventSubscription | null = null;
+let backgroundedAt: number | null = null;
+
 export const useAppStore = create<AppState>((set, get) => ({
   scanning: false,
   scanResults: [],
@@ -265,6 +287,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   poller: null,
   isRecording: false,
+  recordingGaps: [],
   currentSession: null,
   liveSeries: {},
   sampleRate: 0,
@@ -759,7 +782,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     pendingLogRows = get().rawLog.map((e) => ({ ts: e.ts, direction: e.direction, text: e.text }));
 
     breadcrumb(`recording started: session ${session.id}, ${recordedKeys.length} channels`);
-    set({ currentSession: session, liveSeries: {}, isRecording: true });
+    set({ currentSession: session, liveSeries: {}, isRecording: true, recordingGaps: [] });
+
+    keepScreenAwake(true);
+    watchBackgroundGaps(set);
 
     const poller = new Poller({
       pids: pidDefs,
@@ -810,6 +836,8 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   stopRecording: async () => {
     const { poller, currentSession } = get();
+    stopWatchingBackgroundGaps();
+    keepScreenAwake(false);
     poller?.stop();
     sensorLogger?.stop();
     sensorLogger = null;
@@ -952,6 +980,78 @@ async function flushSessionLogs(): Promise<void> {
   } catch {
     // Log yazımı kaydın kendisini bozmamalı.
   }
+}
+
+/**
+ * Kayıt sürerken ekranın kilitlenmesini engeller.
+ *
+ * Ekran kilidi = uygulama arka planda = kayıt durur. Kullanıcının bunu
+ * bilerek yapması ayrı, telefonu cebe koyup 40 dakikalık bir sürüşün
+ * yarısını kaybetmesi ayrı şeydir.
+ *
+ * `expo-keep-awake` doğrudan bağımlılık değil, `expo` paketiyle geliyor:
+ * native tarafı mevcut derlemede yoksa require patlar ve HİÇBİR ŞEY
+ * yapılmaz — kayıt bundan etkilenmemeli, bu yalnızca bir kolaylık.
+ */
+function keepScreenAwake(on: boolean): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod = require('expo-keep-awake') as {
+      activateKeepAwakeAsync?: (tag?: string) => Promise<void>;
+      deactivateKeepAwake?: (tag?: string) => void;
+    };
+    if (on) void mod.activateKeepAwakeAsync?.('d50-recording');
+    else mod.deactivateKeepAwake?.('d50-recording');
+  } catch {
+    /* native modül yoksa sessizce vazgeç */
+  }
+}
+
+/**
+ * Uygulama arka plana düştüğünde/döndüğünde oturum loguna iz bırakır ve
+ * kayıp süreyi `recordingGaps`'e ekler.
+ *
+ * Yalnızca 'background' sayılıyor: iOS bildirim merkezi ya da gelen arama
+ * bandı 'inactive' üretir, uygulama askıya alınmaz ve kayıt sürer. Onu da
+ * delik saymak her denetim merkezi açılışında yanlış uyarı verirdi.
+ */
+function watchBackgroundGaps(
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+): void {
+  stopWatchingBackgroundGaps();
+  backgroundedAt = null;
+
+  appStateSub = RNAppState.addEventListener('change', (next) => {
+    if (next === 'background') {
+      backgroundedAt = Date.now();
+      appendLog(set, {
+        ts: Date.now(),
+        direction: 'info',
+        text: 'App left the foreground — recording is paused until it returns',
+      });
+      return;
+    }
+
+    if (next === 'active' && backgroundedAt !== null) {
+      const seconds = Math.round((Date.now() - backgroundedAt) / 1000);
+      const at = backgroundedAt;
+      backgroundedAt = null;
+      // Bir saniyenin altındaki geçişler (uygulama değiştirici) delik değil.
+      if (seconds < 1) return;
+      appendLog(set, {
+        ts: Date.now(),
+        direction: 'error',
+        text: `Back in the foreground — ${seconds} s with no data recorded`,
+      });
+      set((state) => ({ recordingGaps: [...state.recordingGaps, { at, seconds }] }));
+    }
+  });
+}
+
+function stopWatchingBackgroundGaps(): void {
+  appStateSub?.remove();
+  appStateSub = null;
+  backgroundedAt = null;
 }
 
 function appendLog(

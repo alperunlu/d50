@@ -21,7 +21,7 @@
  */
 
 import { maxOf } from '../util/agg';
-import { type SeriesMap, type TimeSeriesPoint } from './derived';
+import { idleSamples, type SeriesMap, type TimeSeriesPoint } from './derived';
 import { MINI_R50, type VehicleProfile } from './vehicle';
 import {
   rollingCircumferenceMm,
@@ -623,16 +623,11 @@ export function idleQuality(series: SeriesMap, vehicle: VehicleProfile = MINI_R5
     return inconclusive(key, title, ['Engine RPM'], 'Record a minute of idling.');
   }
 
-  const idleRpm: number[] = [];
-  const idleTs: number[] = [];
-  for (const p of rpm) {
-    const v = speed.length > 0 ? sampleAt(speed, p.ts, 3000) : 0;
-    const stationary = v === null ? false : v < 2;
-    if (stationary && p.value > 300 && p.value < vehicle.idleRpm * 1.6) {
-      idleRpm.push(p.value);
-      idleTs.push(p.ts);
-    }
-  }
+  // Tanım derived.ts'te, tek yerde: özetteki "Idle stability" ile bu kartın
+  // aynı sayıyı vermesi buna bağlı (bkz. idleSamples).
+  const idlePoints = idleSamples(rpm, speed, vehicle);
+  const idleRpm = idlePoints.map((p) => p.value);
+  const idleTs = idlePoints.map((p) => p.ts);
 
   if (idleRpm.length < 10) {
     return inconclusive(key, title, [],
