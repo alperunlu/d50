@@ -741,21 +741,57 @@ export function impossibleSummaryFields(
   ).map((r) => r.field);
 }
 
-/** Verilen zamana en yakın örneğin değeri (2 sn toleransla). */
-function nearestValue(
+/**
+ * Verilen zamana en yakın örneğin değeri (2 sn toleransla).
+ *
+ * İKİLİ ARAMA, doğrusal tarama DEĞİL. Bu fonksiyon iki seriyi zamana göre
+ * eşlemek için kullanılıyor ve her çağrıda seriyi baştan sona taradığında
+ * maliyet iki serinin boyunun ÇARPIMI oluyordu. Kısa kayıtta göze
+ * batmıyordu; 4483 saniyelik 27 kanallı kayıtta `summarizeTrip` masaüstünde
+ * ~9 saniye sürdü, telefonda ise Trips ekranı "Working…" yazısında
+ * kilitlendi (2026-09-06). İkili arama aynı sonucu üretir, maliyeti
+ * çarpım yerine logaritmik.
+ *
+ * `series` zamana göre SIRALI olmak zorunda — `groupSeries` bunu garanti
+ * ediyor, bu modüldeki tüm çağrılar oradan geliyor. Sıralılık varsayımının
+ * kolay doğrulanabilmesi için dışa açık (bkz. tests/longSession.test.ts).
+ */
+export function nearestValue(
   series: readonly TimeSeriesPoint[],
   ts: number,
   toleranceMs = 2000,
 ): number | null {
+  if (series.length === 0) return null;
+
+  // İlk `ts`'ten küçük olmayan örneği bul.
+  let lo = 0;
+  let hi = series.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (series[mid].ts < ts) lo = mid + 1;
+    else hi = mid;
+  }
+
+  // En yakın aday ya bulunan örnek ya da bir öncekidir.
+  const after = lo < series.length ? series[lo] : null;
+  // Aynı zaman damgasını taşıyan örnek grubunda İLKİ seçiliyor: doğrusal
+  // tarama diziyi baştan gezdiği için ilkini bulurdu, davranış korunuyor.
+  let beforeIndex = lo - 1;
+  while (beforeIndex > 0 && series[beforeIndex - 1].ts === series[beforeIndex].ts) beforeIndex--;
+  const before = beforeIndex >= 0 ? series[beforeIndex] : null;
+
   let best: TimeSeriesPoint | null = null;
   let bestDist = Infinity;
-  for (const p of series) {
-    const d = Math.abs(p.ts - ts);
-    if (d < bestDist) {
-      bestDist = d;
-      best = p;
-    }
+  // Eşitlikte ÖNCEKİ kazanır — doğrusal taramanın davranışı da buydu.
+  if (before !== null) {
+    best = before;
+    bestDist = Math.abs(before.ts - ts);
   }
+  if (after !== null && Math.abs(after.ts - ts) < bestDist) {
+    best = after;
+    bestDist = Math.abs(after.ts - ts);
+  }
+
   return best !== null && bestDist <= toleranceMs ? best.value : null;
 }
 
