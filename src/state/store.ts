@@ -48,6 +48,8 @@ import {
   type SensorPermission,
 } from '../sensors/sensorLogger';
 import { orderedCards, moveInOrder } from '../data/cardOrder';
+import { CYCLE_STEPS, channelKeysForStep } from '../cycle/steps';
+import { evaluateStep, nextHeldSince, type StepProgress } from '../cycle/engine';
 import {
   sensorGroupsForChannels,
   recordedKeysForSensorChannels,
@@ -126,6 +128,19 @@ interface AppState {
    * kaydedilmediği aralıklar. Boş bir liste "delik yok" demektir.
    */
   recordingGaps: readonly { at: number; seconds: number }[];
+
+  // --- rehberli test cycle'ı ---
+  /** Cycle çalışmıyorsa `null`. */
+  cycle: {
+    readonly stepIndex: number;
+    readonly progress: StepProgress;
+    /** Kullanıcının atladığı adımların id'leri — raporda "ölçülmedi" der. */
+    readonly skipped: readonly string[];
+  } | null;
+  startCycle: () => Promise<void>;
+  /** Sıradaki adıma geç. Koşul sağlanmasa da geçer (kullanıcı "Atla" derse). */
+  advanceCycle: (skipped: boolean) => void;
+  stopCycle: () => Promise<void>;
   currentSession: Session | null;
   liveSeries: LiveSeries;
   sampleRate: number;
@@ -205,7 +220,14 @@ interface AppState {
   disconnect: () => Promise<void>;
   togglePid: (pid: string) => void;
   isPidSupported: (pid: string) => boolean;
-  startRecording: () => Promise<void>;
+  /**
+   * Kaydı başlatır. `channels` verilirse kullanıcının seçimi yerine o set
+   * kaydedilir — cycle adımları kanal setini böyle daraltıyor.
+   */
+  startRecording: (channels?: {
+    readonly pids: readonly string[];
+    readonly sensors: readonly string[];
+  }) => Promise<void>;
   stopRecording: () => Promise<void>;
   clearLog: () => void;
 }
@@ -251,6 +273,15 @@ let backgroundedAt: number | null = null;
  * söyler, uygulamanın hangi ekranda olduğu değil.
  */
 let lastSampleAt = 0;
+/**
+ * Süren kaydın kimliği: oturum, zaman tabanı ve komut kuyruğu.
+ *
+ * Cycle adım değiştirdiğinde poller'ı bu üçlüyle yeniden kuruyor — oturum
+ * bölünmüyor, zaman ekseni kaymıyor, yalnızca sorulan kanallar değişiyor.
+ */
+let recordingContext: { sessionId: number; startedAt: number; queue: CommandQueue } | null = null;
+/** Cycle adımlarını ilerleten sayaç. */
+let cycleTimer: ReturnType<typeof setInterval> | null = null;
 /** Akü voltajı ATRV ile ayrı ritimde okunuyor (bkz. pollAdapterVoltage). */
 let voltageTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -309,6 +340,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   poller: null,
   isRecording: false,
   recordingGaps: [],
+  cycle: null,
   currentSession: null,
   liveSeries: {},
   sampleRate: 0,
@@ -774,8 +806,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     return isPidSupported(pid, mask);
   },
 
-  startRecording: async () => {
-    const { queue, selectedPids } = get();
+  startRecording: async (channels) => {
+    const { queue } = get();
+    const selectedPids = channels?.pids ?? get().selectedPids;
     if (!queue) throw new Error('You must connect first');
     if (selectedPids.length === 0) throw new Error('You must select at least one PID');
 
@@ -810,13 +843,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
     }
 
-    const pidDefs = pollPids
-      .map((p) => getPidDefinition(p))
-      .filter((p): p is PidDefinition => p !== undefined);
-
     // Seçili sensörlerin kanal anahtarları da oturuma yazılır ki CSV export
     // onları da sütun olarak çıkarsın.
-    const selectedSensorChannels = get().selectedSensorChannels;
+    const selectedSensorChannels = channels?.sensors ?? get().selectedSensorChannels;
     const selectedSensors = sensorGroupsForChannels(selectedSensorChannels);
     const recordedKeys = [
       ...pollPids,
@@ -855,45 +884,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     watchBackgroundGaps(set);
     startVoltagePolling(session.id, recordingStartedAt, queue, set);
 
-    const poller = new Poller({
-      pids: pidDefs,
-      queue,
-      startedAt: recordingStartedAt,
-      onFlush: (samples: PollSample[]) => {
-        void flushSamples(session.id, samples, set, get);
-      },
-      // Cevap vermeyen bir kanal seyreltildiğinde kullanıcı bunu debug
-      // log'unda görsün — sessizce yavaşlayan bir kanal kafa karıştırır.
-      onBackoff: (pid, failures) =>
-        appendLog(set, {
-          ts: Date.now(),
-          direction: 'info',
-          text: `PID ${pid} did not answer ${failures}x — polling it less often`,
-        }),
-    });
+    const poller = buildPoller(session.id, recordingStartedAt, queue, pollPids, set, get);
     poller.start();
     set({ poller });
 
     // Sensörler açıksa OBD ile AYNI zaman referansını paylaşarak başlar —
     // CSV'de aynı satıra düşmeleri ve birleşik metriklerin çalışması buna bağlı.
-    if (selectedSensors.length > 0) {
-      sensorLogger = new SensorLogger({
-        startedAt: recordingStartedAt,
-        groups: selectedSensors,
-        // Order analizi için canlı devir. Poller'ın en son yazdığı 0C
-        // örneği; sensör tarafı OBD tarafını böyle okuyor.
-        getRpm: () => {
-          const rpmSeries = get().liveSeries['0C'];
-          if (!rpmSeries || rpmSeries.length === 0) return null;
-          return rpmSeries[rpmSeries.length - 1].value;
-        },
-        getCalibrationDb: () => get().splCalibrationDb,
-        onSamples: (sensorSamples: SensorSample[]) => {
-          void flushSensorSamples(session.id, sensorSamples, set);
-        },
-        onError: (message) =>
-          appendLog(set, { ts: Date.now(), direction: 'error', text: `Sensor: ${message}` }),
-      });
+    sensorLogger = buildSensorLogger(session.id, recordingStartedAt, selectedSensors, set, get);
+    activeSensorGroups = selectedSensors;
+    if (sensorLogger) {
       void sensorLogger.start();
       appendLog(set, {
         ts: Date.now(),
@@ -901,12 +900,91 @@ export const useAppStore = create<AppState>((set, get) => ({
         text: `Phone sensors started: ${selectedSensors.join(', ')}`,
       });
     }
+
+    // Cycle bu bilgiyi adım geçişlerinde kullanıyor: aynı oturuma, aynı
+    // zaman tabanıyla yeni bir kanal seti kurabilmek için.
+    recordingContext = { sessionId: session.id, startedAt: recordingStartedAt, queue };
+  },
+
+  /**
+   * Rehberli test cycle'ını başlatır.
+   *
+   * Cycle bir kayıttır: tek oturum, tek zaman ekseni. Adım değiştikçe
+   * yalnızca sorulan kanal seti değişiyor — asıl kazanç bu. 28 kanallık
+   * bir turda lambda sondası 0.29 Hz sorulabiliyordu ve Nyquist yüzünden
+   * salınımı görünmüyordu; üç kanallık bir adımda dört kat hızlı sorulur.
+   */
+  startCycle: async () => {
+    if (get().isRecording) throw new Error('Stop the current recording first');
+    const first = CYCLE_STEPS[0];
+    await get().startRecording({
+      pids: first.channels.pids,
+      sensors: first.channels.sensors,
+    });
+    set({
+      cycle: {
+        stepIndex: 0,
+        progress: evaluateStep(first, {}, null, Date.now()),
+        skipped: [],
+      },
+    });
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'info',
+      text: `Guided test cycle started — step 1/${CYCLE_STEPS.length}: ${first.title}`,
+    });
+    startCycleTicker(set, get);
+  },
+
+  advanceCycle: (skipped: boolean) => {
+    const state = get().cycle;
+    if (!state) return;
+    const current = CYCLE_STEPS[state.stepIndex];
+    const nextIndex = state.stepIndex + 1;
+
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'info',
+      text: skipped
+        ? `Cycle step skipped: ${current.title}`
+        : `Cycle step complete: ${current.title}`,
+    });
+
+    if (nextIndex >= CYCLE_STEPS.length) {
+      void get().stopCycle();
+      return;
+    }
+
+    const next = CYCLE_STEPS[nextIndex];
+    applyStepChannels(next, set, get);
+    set({
+      cycle: {
+        stepIndex: nextIndex,
+        progress: evaluateStep(next, {}, null, Date.now()),
+        skipped: skipped ? [...state.skipped, current.id] : state.skipped,
+      },
+    });
+    cycleHeldSince = null;
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'info',
+      text: `Cycle step ${nextIndex + 1}/${CYCLE_STEPS.length}: ${next.title}`,
+    });
+  },
+
+  stopCycle: async () => {
+    stopCycleTicker();
+    set({ cycle: null });
+    await get().stopRecording();
   },
 
   stopRecording: async () => {
     const { poller, currentSession } = get();
     stopWatchingBackgroundGaps();
     stopVoltagePolling();
+    stopCycleTicker();
+    recordingContext = null;
+    activeSensorGroups = [];
     keepScreenAwake(false);
     poller?.stop();
     sensorLogger?.stop();
@@ -921,7 +999,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         currentSession ? Math.round((Date.now() - currentSession.startedAt) / 1000) : 0
       } s`,
     );
-    set({ poller: null, isRecording: false });
+    set({ poller: null, isRecording: false, cycle: null });
   },
 
   clearLog: () => set({ rawLog: [] }),
@@ -1189,6 +1267,146 @@ function stopVoltagePolling(): void {
     clearInterval(voltageTimer);
     voltageTimer = null;
   }
+}
+
+/**
+ * Verilen kanal setiyle bir poller kurar.
+ *
+ * Ayrı bir fonksiyon çünkü cycle her adımda kanal setini değiştiriyor ve
+ * poller'ı YENİDEN kuruyor. Oturum, zaman tabanı ve akış hedefi aynı
+ * kalıyor; değişen tek şey sorulan PID listesi.
+ */
+/**
+ * Cycle sayacı: saniyede bir adımı canlı seriye karşı değerlendirir.
+ *
+ * Koşullar KESİNTİSİZ sağlanmalı; `cycleHeldSince` bunun için tutuluyor.
+ * Bir saniyeliğine 80 km/h'a değip geçmek "bir dakika sabit sürdüm"
+ * değildir ve ölçüm o farkı görür.
+ */
+let cycleHeldSince: number | null = null;
+
+function startCycleTicker(
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): void {
+  stopCycleTicker();
+  cycleHeldSince = null;
+  cycleTimer = setInterval(() => {
+    const state = get().cycle;
+    if (!state) return;
+    const step = CYCLE_STEPS[state.stepIndex];
+    const now = Date.now();
+    const progress = evaluateStep(step, get().liveSeries, cycleHeldSince, now);
+    cycleHeldSince = nextHeldSince(progress, cycleHeldSince, now);
+
+    set((s) => (s.cycle ? { cycle: { ...s.cycle, progress } } : {}));
+
+    // Elle ilerleyen adımlar (kontak açma gibi) dokunuş bekler.
+    if (progress.complete && !step.manualAdvance) get().advanceCycle(false);
+  }, 1000);
+}
+
+function stopCycleTicker(): void {
+  if (cycleTimer) {
+    clearInterval(cycleTimer);
+    cycleTimer = null;
+  }
+  cycleHeldSince = null;
+}
+
+/**
+ * Adımın kanal setini uygular: poller yeniden kurulur, sensör grupları
+ * değiştiyse logger da. Oturum ve zaman tabanı korunur.
+ */
+function applyStepChannels(
+  step: (typeof CYCLE_STEPS)[number],
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): void {
+  const context = recordingContext;
+  if (!context) return;
+
+  get().poller?.stop();
+  const poller = buildPoller(
+    context.sessionId,
+    context.startedAt,
+    context.queue,
+    step.channels.pids,
+    set,
+    get,
+  );
+  poller.start();
+  set({ poller });
+
+  const groups = sensorGroupsForChannels(step.channels.sensors);
+  const currentGroups = sensorLogger ? [...activeSensorGroups].sort().join(',') : '';
+  if (currentGroups !== [...groups].sort().join(',')) {
+    sensorLogger?.stop();
+    sensorLogger = buildSensorLogger(context.sessionId, context.startedAt, groups, set, get);
+    activeSensorGroups = groups;
+    if (sensorLogger) void sensorLogger.start();
+  }
+}
+
+/** Şu an açık olan sensör grupları — gereksiz yeniden kurulumu önlemek için. */
+let activeSensorGroups: readonly SensorGroupKey[] = [];
+
+function buildPoller(
+  sessionId: number,
+  startedAt: number,
+  queue: CommandQueue,
+  pidCodes: readonly string[],
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): Poller {
+  const pidDefs = pidCodes
+    .map((p) => getPidDefinition(p))
+    .filter((p): p is PidDefinition => p !== undefined);
+
+  return new Poller({
+    pids: pidDefs,
+    queue,
+    startedAt,
+    onFlush: (samples: PollSample[]) => {
+      void flushSamples(sessionId, samples, set, get);
+    },
+    // Cevap vermeyen bir kanal seyreltildiğinde kullanıcı bunu debug
+    // log'unda görsün — sessizce yavaşlayan bir kanal kafa karıştırır.
+    onBackoff: (pid, failures) =>
+      appendLog(set, {
+        ts: Date.now(),
+        direction: 'info',
+        text: `PID ${pid} did not answer ${failures}x — polling it less often`,
+      }),
+  });
+}
+
+/** Verilen sensör gruplarıyla bir logger kurar. Grup yoksa `null`. */
+function buildSensorLogger(
+  sessionId: number,
+  startedAt: number,
+  groups: readonly SensorGroupKey[],
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): SensorLogger | null {
+  if (groups.length === 0) return null;
+  return new SensorLogger({
+    startedAt,
+    groups: [...groups],
+    // Order analizi için canlı devir. Poller'ın en son yazdığı 0C
+    // örneği; sensör tarafı OBD tarafını böyle okuyor.
+    getRpm: () => {
+      const rpmSeries = get().liveSeries['0C'];
+      if (!rpmSeries || rpmSeries.length === 0) return null;
+      return rpmSeries[rpmSeries.length - 1].value;
+    },
+    getCalibrationDb: () => get().splCalibrationDb,
+    onSamples: (sensorSamples: SensorSample[]) => {
+      void flushSensorSamples(sessionId, sensorSamples, set);
+    },
+    onError: (message) =>
+      appendLog(set, { ts: Date.now(), direction: 'error', text: `Sensor: ${message}` }),
+  });
 }
 
 function appendLog(
