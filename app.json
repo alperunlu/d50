@@ -57,6 +57,7 @@
       [
         "expo-audio",
         {
+          "enableBackgroundRecording": true,
           "microphonePermission": "Mikrofon YALNIZCA ses seviyesini (göreceli dB) ölçmek için kullanılır; ölçüm sırasında oluşan geçici ses dosyası kayıt biter bitmez silinir. Hiçbir ses saklanmaz, dinlenmez ya da telefondan dışarı gönderilmez."
         }
       ]

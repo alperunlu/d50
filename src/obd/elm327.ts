@@ -214,3 +214,19 @@ export function hexToBytes(hex: string): number[] {
   }
   return bytes;
 }
+
+/**
+ * ELM327'nin kendi voltmetresinin cevabını okur (`ATRV` → "12.6V").
+ *
+ * Bu ölçüm ARAÇTAN gelmiyor: adaptör OBD soketinin 16. pinindeki beslemeyi
+ * kendisi ölçüyor. Bu yüzden aracın PID 0142'yi (control module voltage)
+ * desteklememesi önemli değil — bu R50 desteklemiyor ve o kanal boş
+ * kalıyordu, oysa voltaj bilgisi adaptörde hazır duruyordu.
+ */
+export function parseAdapterVoltage(raw: string): number | null {
+  const match = /(\d{1,2}(?:\.\d+)?)\s*V/i.exec(raw);
+  if (!match) return null;
+  const value = Number(match[1]);
+  // 0 V ya da 30 V bu soketten gelmez; ölçüm değil gürültüdür.
+  return Number.isFinite(value) && value > 5 && value < 20 ? value : null;
+}

@@ -12,7 +12,7 @@
 
 import { PIDS, type PidDefinition, type RefreshClass } from '../obd/pids';
 
-export type ChannelSource = 'obd' | 'gps' | 'motion' | 'mic' | 'derived';
+export type ChannelSource = 'obd' | 'gps' | 'motion' | 'mic' | 'adapter' | 'derived';
 
 export interface Channel {
   /** `Sample.pid` alanına yazılan benzersiz anahtar. */
@@ -49,6 +49,31 @@ export function channelForPid(pid: PidDefinition): Channel {
  * ölçümünde GPS daha güvenilir referanstır (mutlak, kalibrasyona bağlı değil).
  */
 export const SENSOR_CHANNELS: readonly Channel[] = [
+  /**
+   * Akü / sistem voltajı — ARAÇTAN DEĞİL, ADAPTÖRDEN.
+   *
+   * Bu araç PID 0142'yi (control module voltage) desteklemiyor: 0120
+   * cevabı 80000000, yani 0x40 bloğu hiç yok, ve 6 Eylül 2026 kaydında
+   * 0142 her sorulduğunda `NO DATA` döndü. Ama ELM327'nin kendi
+   * voltmetresi var — OBD soketinin 16. pinini ölçer ve `ATRV` ile
+   * söyler. Car Scanner'ın gösterdiği voltaj da budur; araca değil
+   * adaptöre sorulur, o yüzden PID desteğinden bağımsız her araçta
+   * çalışır.
+   *
+   * Soketteki voltaj ECU'nun gördüğüyle birebir aynı değil (kablo
+   * üzerindeki düşüş kadar fark var) ama şarj sistemini yargılamak için
+   * fazlasıyla yeterli: motor çalışırken 13.8-14.4 V beklenir, 12.6 V
+   * civarı alternatörün basmadığını söyler.
+   */
+  {
+    key: 'battery_v',
+    name: 'Battery Voltage',
+    short: 'Battery',
+    unit: 'V',
+    csvKey: 'battery_v',
+    refresh: 'slow',
+    source: 'adapter',
+  },
   {
     key: 'gps_speed',
     name: 'GPS Speed',

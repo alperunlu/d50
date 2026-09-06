@@ -15,7 +15,12 @@ import { breadcrumb } from '../util/crashLog';
 import { BleTransport, type ScannedDevice } from '../ble/bleTransport';
 import type { DiscoveredProfile, ProfileCandidate } from '../ble/profiles';
 import type { ObdConnectionState, ObdTransport } from '../ble/transport';
-import { CommandQueue, initElm327, type InitResult } from '../obd/elm327';
+import {
+  CommandQueue,
+  initElm327,
+  parseAdapterVoltage,
+  type InitResult,
+} from '../obd/elm327';
 import { Poller, type PollSample } from '../obd/poller';
 import { PIDS, getPidDefinition, isPidSupported, type PidDefinition } from '../obd/pids';
 import { scanPids, formatScanReport, type PidScanProgress, type PidScanRow } from '../obd/pidScan';
@@ -245,6 +250,8 @@ let backgroundedAt: number | null = null;
  * söyler, uygulamanın hangi ekranda olduğu değil.
  */
 let lastSampleAt = 0;
+/** Akü voltajı ATRV ile ayrı ritimde okunuyor (bkz. pollAdapterVoltage). */
+let voltageTimer: ReturnType<typeof setInterval> | null = null;
 
 export const useAppStore = create<AppState>((set, get) => ({
   scanning: false,
@@ -809,6 +816,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     const selectedSensors = sensorGroupsForChannels(selectedSensorChannels);
     const recordedKeys = [
       ...pollPids,
+      // Adaptörün voltmetresi her araçta çalışıyor ve seçim gerektirmiyor:
+      // bedeli 10 saniyede bir komut, karşılığı şarj sisteminin durumu.
+      'battery_v',
       ...recordedKeysForSensorChannels(selectedSensorChannels),
     ];
     // ECU'nun destek bitmask'i oturumla saklanıyor: sonradan analiz
@@ -822,12 +832,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     loggingSessionId = session.id;
     pendingLogRows = get().rawLog.map((e) => ({ ts: e.ts, direction: e.direction, text: e.text }));
 
-    breadcrumb(`recording started: session ${session.id}, ${recordedKeys.length} channels`);
-    set({ currentSession: session, liveSeries: {}, isRecording: true, recordingGaps: [] });
-
-    keepScreenAwake(true);
-    watchBackgroundGaps(set);
-
     /**
      * OBD ve sensör örnekleri TEK bir sıfır noktasını paylaşır.
      *
@@ -839,6 +843,13 @@ export const useAppStore = create<AppState>((set, get) => ({
      * poller yeniden kurulduğunda referansın değişmemesi buna bağlı.
      */
     const recordingStartedAt = Date.now();
+
+    breadcrumb(`recording started: session ${session.id}, ${recordedKeys.length} channels`);
+    set({ currentSession: session, liveSeries: {}, isRecording: true, recordingGaps: [] });
+
+    keepScreenAwake(true);
+    watchBackgroundGaps(set);
+    startVoltagePolling(session.id, recordingStartedAt, queue, set);
 
     const poller = new Poller({
       pids: pidDefs,
@@ -891,6 +902,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   stopRecording: async () => {
     const { poller, currentSession } = get();
     stopWatchingBackgroundGaps();
+    stopVoltagePolling();
     keepScreenAwake(false);
     poller?.stop();
     sensorLogger?.stop();
@@ -1129,6 +1141,50 @@ function stopWatchingBackgroundGaps(): void {
   appStateSub?.remove();
   appStateSub = null;
   backgroundedAt = null;
+}
+
+/**
+ * Akü voltajını adaptörün kendi voltmetresinden okur (`ATRV`).
+ *
+ * Araca sorulmuyor: bu ECU control module voltage PID'ini desteklemiyor ve
+ * desteklemeyen araçlarda o kanal sonsuza kadar boş kalır. Adaptör ise her
+ * araçta ölçebiliyor, çünkü ölçtüğü şey soketin kendi beslemesi.
+ *
+ * 10 saniyede bir soruluyor: voltaj yavaş değişen bir büyüklük ve tur
+ * kapasitesi kıt — bu ritimde PID'lerden çaldığı süre binde birkaç.
+ */
+const VOLTAGE_INTERVAL_MS = 10_000;
+
+function startVoltagePolling(
+  sessionId: number,
+  startedAt: number,
+  queue: CommandQueue,
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+): void {
+  stopVoltagePolling();
+  const read = async () => {
+    try {
+      const raw = await queue.send('ATRV');
+      const volts = parseAdapterVoltage(raw);
+      if (volts === null) return;
+      await flushSensorSamples(
+        sessionId,
+        [{ key: 'battery_v', ts: Date.now() - startedAt, value: volts }],
+        set,
+      );
+    } catch {
+      // Voltaj okunamaması kaydı bozmamalı; sonraki turda tekrar denenir.
+    }
+  };
+  void read();
+  voltageTimer = setInterval(() => void read(), VOLTAGE_INTERVAL_MS);
+}
+
+function stopVoltagePolling(): void {
+  if (voltageTimer) {
+    clearInterval(voltageTimer);
+    voltageTimer = null;
+  }
 }
 
 function appendLog(
