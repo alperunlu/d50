@@ -124,6 +124,18 @@ export function countCrossings(
 }
 
 /** Serinin kapsadığı süre (saniye). */
+/**
+ * Serinin örnekleme hızı (Hz).
+ *
+ * Bir teşhis, ölçtüğü olaydan daha yavaş örneklenmiş bir seriden hüküm
+ * çıkaramaz. Nyquist: saniyede f geçiş görebilmek için en az 2f örnek
+ * gerekir. Altındaki her sonuç, sensörü değil POLLER'I ölçer.
+ */
+function sampleHz(series: readonly TimeSeriesPoint[]): number {
+  const seconds = spanSeconds(series);
+  return seconds > 0 ? (series.length - 1) / seconds : 0;
+}
+
 function spanSeconds(series: readonly TimeSeriesPoint[]): number {
   if (series.length < 2) return 0;
   return (series[series.length - 1].ts - series[0].ts) / 1000;
@@ -255,11 +267,32 @@ export function oxygenSensorResponse(series: SeriesMap): Finding {
     return inconclusive(key, title, [], 'Needs at least 30 seconds of O2 data.');
   }
 
+  /**
+   * ÖNCE örnekleme hızı, sonra hüküm.
+   *
+   * 6 Eylül 2026 kaydı: 28 kanallı turda ön sonda 0.29 Hz sorgulandı,
+   * Nyquist sınırı 0.15 Hz, ekrana düşen sonuç da tam 0.15 Hz oldu — yani
+   * rapor edilen sayı sondanın değil, poller'ın hızıydı. Eşik 0.4 Hz
+   * olduğu için kart o kayıtta ASLA geçemezdi: sapasağlam bir sondaya
+   * "yaşlanmış olabilir" dedi. Ölçüm aletinde kalıcı yanlış alarm, hiç
+   * ölçmemekten kötüdür.
+   */
+  const HEALTHY_HZ = 0.4;
+  const rate = sampleHz(pre);
+  if (rate < HEALTHY_HZ * 2) {
+    return inconclusive(key, title, [],
+      `The pre-cat channel was sampled at only ${round(rate, 2)} Hz, so switching faster than ` +
+      `${round(rate / 2, 2)} Hz is invisible — counting crossings here would measure the polling ` +
+      `rate, not the sensor. Record with just RPM and the O2 channels selected so the sensor is ` +
+      `polled at least twice a second.`);
+  }
+
   const switches = countCrossings(pre, 0.45, 0.05);
   const hz = switches / seconds;
-  const evidence = `${switches} switches in ${Math.round(seconds)} s (${round(hz, 2)} Hz)`;
+  const evidence =
+    `${switches} switches in ${Math.round(seconds)} s (${round(hz, 2)} Hz, sampled at ${round(rate, 2)} Hz)`;
 
-  if (hz < 0.4) {
+  if (hz < HEALTHY_HZ) {
     return {
       key, title, verdict: 'attention',
       headline: 'Sensor is switching slowly',
@@ -402,12 +435,32 @@ export function thermostatCheck(series: SeriesMap, vehicle: VehicleProfile = MIN
       'The engine needs roughly ten minutes of running before a warm-up verdict means anything.');
   }
 
-  // Motor zaten sıcak başladıysa ısınma eğrisi yok; yine de plato bilgisi var.
+  /**
+   * Eşiğin ÜSTÜNDE başlayan bir kayıt o eşiğin geçildiğini kanıtlayamaz.
+   *
+   * 6 Eylül 2026: kayıt 90 °C'de başladı, eşik 88 °C. Kart "Reaches
+   * operating temperature ✓" dedi — oysa özet aynı ekranda "engine was
+   * already warm at the start, record from a cold start" diyordu. Aynı
+   * veriden iki zıt hüküm. Plato bilgisi yine gösteriliyor ama bu bir
+   * geçiş notu değil.
+   */
+  if (start >= vehicle.thermostatOpenC) {
+    return {
+      key, title, verdict: 'inconclusive',
+      headline: 'Engine was already warm',
+      detail:
+        `The recording starts at ${round(start, 0)} °C, above the ${vehicle.thermostatOpenC} °C ` +
+        'the thermostat opens at, so there is no warm-up to judge. Record from a cold start — ' +
+        'the first drive of the day is the useful one.',
+      evidence,
+    };
+  }
+
   if (peak >= vehicle.thermostatOpenC) {
     return {
       key, title, verdict: 'ok',
       headline: 'Reaches operating temperature',
-      detail: `Coolant passed the ${vehicle.thermostatOpenC} °C the thermostat should open at.`,
+      detail: `Coolant climbed past the ${vehicle.thermostatOpenC} °C the thermostat should open at.`,
       evidence,
     };
   }
@@ -544,7 +597,19 @@ export function clutchSlip(series: SeriesMap): Finding {
   const rpm = get(series, '0C');
   const speedObd = get(series, '0D');
   const speed = speedObd.length > 0 ? speedObd : get(series, 'gps_speed');
-  const throttle = get(series, '11').length > 0 ? get(series, '11') : get(series, '04');
+  // Gaz kelebeği yoksa motor yükü vekil olarak kullanılıyor — ama ikisi
+  // farklı büyüklükler ve aynı eşikle karşılaştırılamazlar.
+  const usingThrottle = get(series, '11').length > 0;
+  const throttle = usingThrottle ? get(series, '11') : get(series, '04');
+  /**
+   * "Gaz altında" eşiği.
+   *
+   * Kelebek eşiği %40'tı ve bu araçta neredeyse tam gaz demek: 6 Eylül 2026
+   * kaydında 223 örneğin yalnızca 5'i (%2) o eşiğin üstündeydi, medyan %18.
+   * 0'dan 109 km/h'a çıkılmış bir gezide kart "yeterince hızlanma yok" dedi.
+   * Aranan şey tam gaz değil, motorun çekiyor olması.
+   */
+  const THROTTLE_MIN = usingThrottle ? 25 : 45;
 
   const needs: string[] = [];
   if (!has(series, '0C')) needs.push('Engine RPM');
@@ -556,18 +621,26 @@ export function clutchSlip(series: SeriesMap): Finding {
 
   let slipEvents = 0;
   let compared = 0;
+  let underThrottle = 0;
 
   for (let i = 1; i < rpm.length; i++) {
     const prev = rpm[i - 1];
     const cur = rpm[i];
     const dt = (cur.ts - prev.ts) / 1000;
-    if (dt <= 0 || dt > 2) continue;
+    /**
+     * Üst sınır 2 sn'ydi ve ardışık devir örneklerinin %48'ini eliyordu:
+     * çok kanallı bir turda devir iki kez soruluyor, aralıklar bir kısa
+     * bir uzun geliyor. Kaydın kendi ritmini cezalandırmak yerine sınır
+     * gevşetildi; hızlar zaten saniyeye bölünerek karşılaştırılıyor.
+     */
+    if (dt <= 0 || dt > 4) continue;
 
     const th = sampleAt(throttle, cur.ts, 1500);
     const vPrev = sampleAt(speed, prev.ts, 1500);
     const vCur = sampleAt(speed, cur.ts, 1500);
     if (th === null || vPrev === null || vCur === null) continue;
-    if (th < 40 || vCur < 25) continue; // gaz kapalıysa ya da yavaşsa anlamsız
+    if (th >= THROTTLE_MIN) underThrottle++;
+    if (th < THROTTLE_MIN || vCur < 25) continue; // gaz kapalıysa ya da yavaşsa anlamsız
 
     compared++;
     const rpmRise = (cur.value - prev.value) / dt; // rpm/s
@@ -579,8 +652,12 @@ export function clutchSlip(series: SeriesMap): Finding {
   }
 
   if (compared < 10) {
+    // Neyin eksik kaldığını SAYIYLA söyle: kullanıcı bir dahaki sefere
+    // neyi farklı yapacağını ancak böyle bilir.
     return inconclusive(key, title, [],
-      'Needs some accelerating under throttle above 25 km/h in the recording.');
+      `Only ${compared} usable moments — slip needs the engine pulling (${usingThrottle ? 'throttle' : 'load'} ` +
+      `over ${THROTTLE_MIN} %) above 25 km/h. This recording had ${underThrottle} samples under throttle. ` +
+      'A steady pull in one gear from about 40 to 90 km/h is enough.');
   }
 
   const rate = slipEvents / compared;
@@ -831,6 +908,27 @@ export function misfireOrderSignature(series: SeriesMap): Finding {
   const value = median(half.map((p) => p.value)) as number;
   const evidence = `median half-order ratio ${round(value, 2)} over ${half.length} windows`;
 
+  /**
+   * Kartın kendi metni "yol ve rüzgâr gürültüsü bu sayıyı şişirir, park
+   * hâlinde tekrarla" diyor — o hâlde şişmiş bir sayıdan "dikkat" hükmü de
+   * çıkmamalı. 6 Eylül 2026'da tam bunu yaptı: 109 km/h'a çıkılan bir
+   * gezideki ölçümden silindir dengesi uyarısı üretti.
+   */
+  const speedSeries = get(series, '0D').length > 0 ? get(series, '0D') : get(series, 'gps_speed');
+  if (speedSeries.length > 0) {
+    const moving = half.filter((p) => {
+      const v = sampleAt(speedSeries, p.ts, 3000);
+      return v !== null && v >= 5;
+    }).length;
+    if (moving / half.length > 0.5) {
+      return inconclusive(key, title, [],
+        `Measured while driving (${Math.round((moving / half.length) * 100)} % of windows above ` +
+        `5 km/h), where road and wind noise sit right on top of the engine orders and inflate this ` +
+        `number — ${evidence} here, but it cannot be trusted. Repeat parked in neutral, engine ` +
+        'warm, phone wedged in place.');
+    }
+  }
+
   if (value > 0.45) {
     return {
       key, title, verdict: 'attention',
@@ -924,7 +1022,20 @@ export function orderTrackingQuality(series: SeriesMap): Finding {
   }
 
   const agreement = round((1 - m) * 100, 0);
-  const evidence = `sound and OBD agree within ${round(m * 100)} % (median of ${errors.length} windows)`;
+  /**
+   * Medyan tek başına güven vermiyor.
+   *
+   * 6 Eylül 2026 kaydında bu kart "Sound is locked to engine speed" dedi
+   * (medyan sapma %5.8) ama order oranları yalnızca 1381 pencerede üretildi
+   * — 2501 pencerenin ~%45'i hiç kilitlenmemişti ve canlı log "mikrofon
+   * başka bir şey duyuyor" satırlarıyla doluydu. Medyan iyi olabilirken
+   * pencerelerin yarısı çöp olabilir; kullanıcı bunu görmeli.
+   */
+  const within = errors.filter((e) => e <= 0.12).length;
+  const lockedPct = Math.round((within / errors.length) * 100);
+  const evidence =
+    `sound and OBD agree within ${round(m * 100)} % (median of ${errors.length} windows), ` +
+    `${lockedPct} % of windows locked`;
 
   if (m > 0.1) {
     return {
@@ -1028,6 +1139,35 @@ export function idleManifoldVacuum(series: SeriesMap, vehicle: VehicleProfile = 
  * Uyarı: ölçüm GPS'e dayanıyor ve GPS hızı ±0.5 km/h gürültülü. Bu yüzden
  * 40 km/h altı örnekler atılıyor ve tek ölçüm değil ORTANCA kullanılıyor.
  */
+/**
+ * GPS ile ECU hızını karşılaştırarak ÖLÇÜLEN yuvarlanma çevresi (mm).
+ *
+ * Tek yerde duruyor çünkü iki kart da buna dayanmalı. 6 Eylül 2026'da
+ * dayanmıyorlardı ve aynı ekran kilometre saati için üç ayrı sayı
+ * gösterdi: lastik ebadından %2, ölçülen sapma %1.3, ölçülen çevre %1.
+ * Üçü aslında birbirini doğruluyordu (gerçek çevre nominalin %1 altında
+ * olunca ECU hatası %2 - %1 ≈ %1 kalıyor) ama kullanıcının bunu kafasında
+ * birleştirmesi bekleniyordu. Ölçüm varken tahmin kullanılmaz.
+ */
+function measuredCircumference(
+  series: SeriesMap,
+  vehicle: VehicleProfile,
+): { mm: number; samples: number } | null {
+  const obd = get(series, '0D');
+  const gps = get(series, 'gps_speed');
+  if (obd.length < 10 || gps.length < 10) return null;
+
+  const values: number[] = [];
+  for (const g of gps) {
+    const o = sampleAt(obd, g.ts, 2000);
+    if (o === null) continue;
+    const c = circumferenceFromSpeedPair(o, g.value, vehicle.factoryTyre);
+    if (c !== null) values.push(c);
+  }
+  if (values.length < 10) return null;
+  return { mm: median(values) as number, samples: values.length };
+}
+
 export function tyreCircumferenceCheck(
   series: SeriesMap,
   vehicle: VehicleProfile = MINI_R50,
@@ -1045,20 +1185,14 @@ export function tyreCircumferenceCheck(
       'Needs both ECU speed and GPS speed — the ratio between them is the measurement.');
   }
 
-  const measured: number[] = [];
-  for (const g of gps) {
-    const o = sampleAt(obd, g.ts, 2000);
-    if (o === null) continue;
-    const c = circumferenceFromSpeedPair(o, g.value, vehicle.factoryTyre);
-    if (c !== null) measured.push(c);
-  }
-
-  if (measured.length < 10) {
+  const measurement = measuredCircumference(series, vehicle);
+  if (measurement === null) {
     return inconclusive(key, title, [],
       'Needs a few minutes above 40 km/h — below that GPS speed is too noisy to compare.');
   }
 
-  const actual = median(measured) as number;
+  const actual = measurement.mm;
+  const measured = { length: measurement.samples };
   const nominal = rollingCircumferenceMm(vehicle.fittedTyre);
   const deviation = ((actual - nominal) / nominal) * 100;
   const evidence = `measured ${Math.round(actual)} mm vs ${Math.round(nominal)} mm nominal for ${formatTyreSize(vehicle.fittedTyre)} (${round(deviation)} %), ${measured.length} samples`;
@@ -1190,12 +1324,27 @@ export function driveRatioStability(
  * sistematik hatası. Teşhis değil, KALİBRASYON uyarısı: kullanıcı bilmezse
  * bütün mesafe ve tüketim rakamlarını yanlış okur.
  */
-export function tyreSizeCalibration(vehicle: VehicleProfile = MINI_R50): Finding {
+export function tyreSizeCalibration(
+  series: SeriesMap,
+  vehicle: VehicleProfile = MINI_R50,
+): Finding {
   const key = 'tyre_calibration';
   const title = 'Speed calibration';
-  const factor = speedCorrectionFactor(vehicle.fittedTyre, vehicle.factoryTyre);
+
+  // Ölçüm > tahmin. GPS ile ECU hızı birlikte kaydedildiyse düzeltme
+  // katsayısı girilen ebattan değil, tekerleğin gerçekte kat ettiği
+  // yoldan çıkar; lastik aşınması ve basınç da böyle hesaba girer.
+  const measurement = measuredCircumference(series, vehicle);
+  const factoryMm = rollingCircumferenceMm(vehicle.factoryTyre);
+  const factor =
+    measurement !== null
+      ? measurement.mm / factoryMm
+      : speedCorrectionFactor(vehicle.fittedTyre, vehicle.factoryTyre);
   const errorPct = (factor - 1) * 100;
-  const evidence = `fitted ${formatTyreSize(vehicle.fittedTyre)}, factory ${formatTyreSize(vehicle.factoryTyre)} — ECU speed off by ${round(-errorPct)} %`;
+  const evidence =
+    measurement !== null
+      ? `measured rolling circumference ${Math.round(measurement.mm)} mm vs ${Math.round(factoryMm)} mm factory — ECU speed off by ${round(-errorPct)} % (${measurement.samples} GPS samples)`
+      : `fitted ${formatTyreSize(vehicle.fittedTyre)}, factory ${formatTyreSize(vehicle.factoryTyre)} — ECU speed off by ${round(-errorPct)} % (from the entered size; record GPS to measure it)`;
 
   if (Math.abs(errorPct) < 0.5) {
     return {
@@ -1251,7 +1400,7 @@ export function runDiagnostics(series: SeriesMap, vehicle: VehicleProfile = MINI
    * söyleyecek bir şeyi olmayan bir satırdır — ve veri içermeyen bir
    * kayıtta tek başına "ok" görünüp listeyi yanıltırdı.
    */
-  const calibration = tyreSizeCalibration(vehicle);
+  const calibration = tyreSizeCalibration(series, vehicle);
   if (calibration.verdict !== 'ok') findings.push(calibration);
 
   const rank: Record<Verdict, number> = { attention: 0, ok: 1, inconclusive: 2 };

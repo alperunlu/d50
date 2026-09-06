@@ -605,6 +605,22 @@ export function summarizeTrip(series: SeriesMap, vehicle: VehicleProfile = MINI_
    */
   const circumference = rollingCircumferenceMm(vehicle.fittedTyre);
   let maxEngineTorqueNm: number | null = null;
+  /**
+   * Vites değişimi torku uyduruyordu.
+   *
+   * Oran anlık ölçülüyor (devir / tekerlek devri). Debriyaj ayrıldığı anda
+   * devir yükselir, hız sabit kalır ve oran fırlar; o oranla geri hesaplanan
+   * "motor torku" da fırlar. 6 Eylül 2026 kaydında tepe tork 200 Nm çıktı —
+   * bu motorun fabrika değeri ~150 Nm. Aynı ekrandaki "aktarma oranı tek
+   * viteste %8.9 geziniyor" kartı zaten aynı kararsızlığı gösteriyordu.
+   *
+   * Çözüm: yalnızca oranın SABİT kaldığı anları say. Sabit vitesteki bir
+   * çekişte oran örnekten örneğe neredeyse hiç oynamaz; oynuyorsa ya vites
+   * değişiyor ya tekerlek patinaj yapıyordur — ikisi de tork ölçümü değil.
+   */
+  const RATIO_STABLE_PCT = 0.03;
+  let prevRatio: number | null = null;
+  let prevRatioTs = 0;
   for (const a of accel) {
     if (a.value < 0.5) continue; // belirgin hızlanma yoksa anlamsız
     const v = nearestValue(speed, a.ts);
@@ -613,6 +629,14 @@ export function summarizeTrip(series: SeriesMap, vehicle: VehicleProfile = MINI_
 
     const ratio = totalDriveRatio(r, v, circumference);
     if (ratio === null) continue;
+
+    const steady =
+      prevRatio !== null &&
+      a.ts - prevRatioTs <= 3000 &&
+      Math.abs(ratio - prevRatio) / prevRatio < RATIO_STABLE_PCT;
+    prevRatio = ratio;
+    prevRatioTs = a.ts;
+    if (!steady) continue;
 
     const force = roadLoadForceN({ speedKmh: v, accelMs2: a.value, vehicle });
     const torque = estimatedEngineTorqueNm({
@@ -682,10 +706,17 @@ export function explainSummaryGaps(
   const maxSpeed = maxOf(speed);
 
   if (summary.zeroToHundredSec === null) {
+    /**
+     * 100'ün ÜSTÜNE çıkılmış bir kayıtta "tepe hız 109 km/h'ti, tam bir
+     * 0-100 çekişi gerekiyor" cümlesi kendi kendisiyle çelişiyor: 109 zaten
+     * 100'den büyük. Eksik olan hız değil, duruştan kesintisiz çekiş.
+     */
     out.zeroToHundredSec =
       maxSpeed === null
         ? 'needs vehicle speed'
-        : `top speed here was ${Math.round(maxSpeed)} km/h — a full 0-100 run is required`;
+        : maxSpeed >= 100
+          ? 'the car passed 100 km/h but never in one pull from a standstill — start from rest'
+          : `top speed here was ${Math.round(maxSpeed)} km/h — a full 0-100 run is required`;
   }
 
   if (summary.warmupSec === null) {
