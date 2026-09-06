@@ -94,7 +94,24 @@ export interface OrderFrame {
   readonly locked: boolean;
   /** Kilit yoksa nedeni — kullanıcıya ne yapması gerektiğini söyleyebilmek için. */
   readonly reason?: string;
+  /**
+   * Sebebin DEĞİŞMEYEN kimliği.
+   *
+   * `reason` metni ölçülen devirleri içeriyor, yani her pencerede farklı bir
+   * string. Log'da "aynı sebebi tekrar yazma" filtresi bu yüzden hiç
+   * tutmuyordu ve 55 saniyeye 91 satır sığıyordu (6 Eylül 2026). Tekrar
+   * kontrolü metne değil bu koda bakmalı.
+   */
+  readonly reasonCode?: OrderFrameReasonCode;
 }
+
+/** Kilit reddi sebeplerinin sabit kimlikleri. */
+export type OrderFrameReasonCode =
+  | 'no-reference'
+  | 'rpm-unstable'
+  | 'rpm-mismatch'
+  | 'rpm-too-low'
+  | 'firing-invisible';
 
 /** Devir bu kadar oynadıysa pencere order analizi için kullanılamaz. */
 const MAX_RPM_SPREAD = 100;
@@ -127,7 +144,7 @@ export function analyzeOrderFrame(input: OrderFrameInput): OrderFrame {
   const dominant = dominantHzInBand(spectrum, sampleRate, n, firingBandFrom, firingBandTo);
   const audioRpm = dominant ? (dominant.hz * 60) / fOrder : null;
 
-  const noOrders = (reason: string): OrderFrame => ({
+  const noOrders = (reason: string, reasonCode: OrderFrameReasonCode): OrderFrame => ({
     levelDbfs,
     levelDbfsA,
     audioRpm,
@@ -136,14 +153,15 @@ export function analyzeOrderFrame(input: OrderFrameInput): OrderFrame {
     imbalanceRatio: null,
     locked: false,
     reason,
+    reasonCode,
   });
 
   if (rpm === null && audioRpm === null) {
-    return noOrders('No engine speed reference — neither OBD RPM nor a clear firing peak.');
+    return noOrders('No engine speed reference — neither OBD RPM nor a clear firing peak.', 'no-reference');
   }
 
   if (rpmSpread !== null && rpmSpread !== undefined && rpmSpread > MAX_RPM_SPREAD) {
-    return noOrders('Engine speed moved too much during the window — orders smear together.');
+    return noOrders('Engine speed moved too much during the window — orders smear together.', 'rpm-unstable');
   }
 
   // OBD devri varsa referans odur (ölçüm), ses yalnızca doğrulama.
@@ -154,11 +172,12 @@ export function analyzeOrderFrame(input: OrderFrameInput): OrderFrame {
     if (disagreement > RPM_AGREEMENT_TOLERANCE) {
       return noOrders(
         `Sound and OBD disagree on engine speed (${Math.round(audioRpm)} vs ${Math.round(rpm)} rpm) — the microphone is probably hearing something else.`,
+        'rpm-mismatch',
       );
     }
   }
 
-  if (reference < 400) return noOrders('Engine speed too low to resolve orders.');
+  if (reference < 400) return noOrders('Engine speed too low to resolve orders.', 'rpm-too-low');
 
   const orders: Record<string, number> = {};
   for (const k of TRACKED_ORDERS) {
@@ -169,7 +188,7 @@ export function analyzeOrderFrame(input: OrderFrameInput): OrderFrame {
 
   const firing = orders[String(fOrder)];
   if (!firing || firing <= 0) {
-    return noOrders('The firing frequency itself is not visible — too quiet or too noisy.');
+    return noOrders('The firing frequency itself is not visible — too quiet or too noisy.', 'firing-invisible');
   }
 
   // Yarım order ailesi: 0.5, 1.5, 2.5. Bir silindir iki turda bir farklı

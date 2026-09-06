@@ -20,7 +20,7 @@
  * değil, DB'ye dokunmaz — cihazsız test edilebilir.
  */
 
-import { maxOf } from '../util/agg';
+import { maxOf, minOf } from '../util/agg';
 import type { Channel } from '../data/channels';
 import type { Sample } from './types';
 
@@ -62,8 +62,20 @@ export function suggestStepMs(
 
   if (medians.length === 0) return DEFAULT_STEP_MS;
 
-  // En yavaş hızlı-PID'i baz al ki o da her pencerede bir değer bulsun.
-  const step = maxOf(medians) ?? DEFAULT_STEP_MS;
+  /**
+   * En HIZLI kanalı baz al, en yavaşı değil.
+   *
+   * Önce en yavaş hızlı-PID esas alınıyordu ki her kanal her pencerede bir
+   * değer bulsun. 27 kanallı bir kayıtta bunun bedeli ağır çıktı: adım
+   * 3350 ms oldu ve 10 Hz kaydedilen ivmeölçer örneklerinin ~%97'si CSV'ye
+   * hiç girmedi (6 Eylül 2026). Veritabanında duran ölçümü dışa aktarımda
+   * çöpe atmak, boş hücreden çok daha kötü bir kayıp.
+   *
+   * Artık hiçbir örnek düşmüyor; karşılığında yavaş kanalların hücreleri
+   * çoğu satırda boş kalıyor. Boş hücre dürüsttür: o an o kanal
+   * ölçülmemiştir. (İstenirse `options.stepMs` ile geri alınabilir.)
+   */
+  const step = minOf(medians) ?? DEFAULT_STEP_MS;
   const rounded = Math.round(step / 50) * 50;
   return Math.min(MAX_STEP_MS, Math.max(MIN_STEP_MS, rounded));
 }

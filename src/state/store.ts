@@ -758,7 +758,38 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (!queue) throw new Error('You must connect first');
     if (selectedPids.length === 0) throw new Error('You must select at least one PID');
 
-    const pidDefs = selectedPids
+    /**
+     * ECU'nun DESTEKLEMEDİĞİNİ söylediği kanalları sormuyoruz.
+     *
+     * 6 Eylül 2026 kaydı: 0142, 0143 ve 0146 seçiliydi, 757 saniye boyunca
+     * her turda soruldu, hepsine `NO DATA` geldi ve CSV'ye üç tamamen boş
+     * sütun olarak girdi. Oysa ECU bunu bağlantı anında söylemişti —
+     * 0120 cevabı 80000000, yani 0x40 bloğu hiç desteklenmiyor, dolayısıyla
+     * 0x41-0x60 arası bütün PID'ler yok. Cevap vermeyecek bir PID'i sormak
+     * her turdan birkaç yüz milisaniye çalıyor ve o süre gerçek kanallardan
+     * kesiliyor.
+     *
+     * Maskede bilgi yoksa (tarama yapılmamışsa) hiçbir şey elenmiyor:
+     * susmak, yanlış elemekten iyidir.
+     */
+    const supportMask = get().initResult?.supportedPids ?? null;
+    const unsupported = supportMask
+      ? selectedPids.filter((p) => !isPidSupported(p, supportMask))
+      : [];
+    const pollPids = selectedPids.filter((p) => !unsupported.includes(p));
+
+    if (pollPids.length === 0) {
+      throw new Error('This ECU reports none of the selected channels as supported');
+    }
+    if (unsupported.length > 0) {
+      appendLog(set, {
+        ts: Date.now(),
+        direction: 'info',
+        text: `Not recording ${unsupported.join(', ')} — this ECU does not report them supported`,
+      });
+    }
+
+    const pidDefs = pollPids
       .map((p) => getPidDefinition(p))
       .filter((p): p is PidDefinition => p !== undefined);
 
@@ -767,7 +798,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const selectedSensorChannels = get().selectedSensorChannels;
     const selectedSensors = sensorGroupsForChannels(selectedSensorChannels);
     const recordedKeys = [
-      ...selectedPids,
+      ...pollPids,
       ...recordedKeysForSensorChannels(selectedSensorChannels),
     ];
     // ECU'nun destek bitmask'i oturumla saklanıyor: sonradan analiz
