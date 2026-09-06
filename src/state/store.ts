@@ -10,6 +10,7 @@
  */
 
 import { create } from 'zustand';
+import { breadcrumb } from '../util/crashLog';
 import { BleTransport, type ScannedDevice } from '../ble/bleTransport';
 import type { DiscoveredProfile, ProfileCandidate } from '../ble/profiles';
 import type { ObdConnectionState, ObdTransport } from '../ble/transport';
@@ -757,6 +758,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     loggingSessionId = session.id;
     pendingLogRows = get().rawLog.map((e) => ({ ts: e.ts, direction: e.direction, text: e.text }));
 
+    breadcrumb(`recording started: session ${session.id}, ${recordedKeys.length} channels`);
     set({ currentSession: session, liveSeries: {}, isRecording: true });
 
     const poller = new Poller({
@@ -816,6 +818,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (currentSession) {
       await repo.endSession(currentSession.id);
     }
+    breadcrumb(
+      `recording stopped: session ${currentSession?.id ?? '—'}, ${
+        currentSession ? Math.round((Date.now() - currentSession.startedAt) / 1000) : 0
+      } s`,
+    );
     set({ poller: null, isRecording: false });
   },
 

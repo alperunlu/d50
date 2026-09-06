@@ -17,6 +17,7 @@ import {
 import { isPidSupported } from '../src/obd/pids';
 import { runDiagnostics, type Finding } from '../src/analysis/diagnostics';
 import { useAppStore } from '../src/state/store';
+import { breadcrumb } from '../src/util/crashLog';
 import type { Session } from '../src/db/types';
 import { VehicleChrome } from '../src/ui/VehicleChrome';
 import { SectionRule, Rule } from '../src/ui/primitives';
@@ -55,15 +56,24 @@ export default function TripsScreen() {
   const analyze = useCallback(
     async (session: Session) => {
     setBusyId(session.id);
+    // Uzun bir oturumun analizi tek adımda çöktüğünde hangi adımda olduğunu
+    // bilmek şart; her adım çökme kaydına iz bırakıyor.
+    breadcrumb(`analyze session ${session.id}: read`);
     try {
       const samples = await repo.readSamples(session.id);
+      breadcrumb(`analyze session ${session.id}: ${samples.length} samples read, grouping`);
       const series = groupSeries(samples);
+      breadcrumb(`analyze session ${session.id}: summarize`);
       setSummaries((prev) => ({ ...prev, [session.id]: summarizeTrip(series, vehicle) }));
       // Teşhisler de aynı serilerden, aynı anda: iki kez DB okumaya gerek yok.
+      breadcrumb(`analyze session ${session.id}: diagnostics`);
       setFindings((prev) => ({ ...prev, [session.id]: runDiagnostics(series, vehicle) }));
       setSeriesById((prev) => ({ ...prev, [session.id]: series }));
+      breadcrumb(`analyze session ${session.id}: done`);
     } catch (e) {
-      Alert.alert('Analysis failed', e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      breadcrumb(`analyze session ${session.id} FAILED: ${message}`);
+      Alert.alert('Analysis failed', message);
     } finally {
       setBusyId(null);
     }
@@ -74,8 +84,11 @@ export default function TripsScreen() {
   const exportCsv = useCallback(async (session: Session) => {
     setBusyId(session.id);
     try {
+      breadcrumb(`export csv session ${session.id}: read`);
       const samples = await repo.readSamples(session.id);
+      breadcrumb(`export csv session ${session.id}: ${samples.length} samples, building`);
       const csv = toWideCsv(samples, channelsForKeys(session.pids));
+      breadcrumb(`export csv session ${session.id}: ${csv.length} chars, writing`);
       const { uri, shared } = await writeAndShare(
         `obd_session_${session.id}_${session.startedAt}.csv`,
         csv,

@@ -39,6 +39,7 @@ import {
   rmsToDbfs,
 } from './fft';
 import { aWeightedDbfs } from './spl';
+import { maxOf } from '../util/agg';
 
 /** Analiz penceresi. 8 kHz'de 0.512 s → 1.95 Hz çözünürlük. */
 export const ORDER_FFT_SIZE = 4096;
@@ -176,7 +177,8 @@ export function analyzeOrderFrame(input: OrderFrameInput): OrderFrame {
   const halfFamily = [0.5, 1.5, 2.5]
     .map((k) => orders[String(k)])
     .filter((v): v is number => typeof v === 'number');
-  const halfOrderRatio = halfFamily.length > 0 ? Math.max(...halfFamily) / firing : null;
+  const halfFamilyPeak = maxOf(halfFamily);
+  const halfOrderRatio = halfFamilyPeak !== null ? halfFamilyPeak / firing : null;
   const firstOrder = orders['1'];
   const imbalanceRatio = typeof firstOrder === 'number' ? firstOrder / firing : null;
 

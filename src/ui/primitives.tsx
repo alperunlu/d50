@@ -11,6 +11,7 @@ import React from 'react';
 import { View, Text, Pressable, StyleSheet, type ViewStyle, type StyleProp } from 'react-native';
 import Svg, { Polyline } from 'react-native-svg';
 import { color, type, space, hairlineWidth } from './theme';
+import { extentOf } from '../util/agg';
 
 /**
  * Köşe registration işareti — 11×11 artı, çerçeve köşesine binen.
@@ -233,9 +234,9 @@ export function Sparkline({
     const visible = points.filter((p) => p.ts >= latest - windowMs);
     if (visible.length < 2) return '';
 
-    const values = visible.map((p) => p.value);
-    let min = Math.min(...values);
-    let max = Math.max(...values);
+    const extent = extentOf(visible.map((p) => p.value));
+    if (!extent) return '';
+    let { min, max } = extent;
     if (min === max) {
       min -= 1;
       max += 1;

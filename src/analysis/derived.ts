@@ -13,6 +13,7 @@
  * tahmin ile ölçümü birbirine karıştırmamak önemli.
  */
 
+import { maxOf, extentOf } from '../util/agg';
 import { MINI_R50, PHYSICS, type VehicleProfile } from './vehicle';
 import { rollingCircumferenceMm, totalDriveRatio, estimatedEngineTorqueNm, roadLoadForceN } from './tyre';
 
@@ -428,13 +429,23 @@ export function summarizeTrip(series: SeriesMap, vehicle: VehicleProfile = MINI_
   const maf = series['10'] ?? [];
   const accelMag = series['accel_magnitude'] ?? [];
 
-  const allTs = Object.values(series)
-    .flat()
-    .map((p) => p.ts);
-  const durationSec = allTs.length > 0 ? (Math.max(...allTs) - Math.min(...allTs)) / 1000 : 0;
+  /**
+   * Süre: bütün kanalların uçlarından. Tek bir dev dizi kurup spread etmek
+   * yerine kanal kanal geziliyor — uzun oturumlarda spread'in argüman
+   * tavanına takılıp çökmesinin sebebi buydu (bkz. util/agg.ts).
+   */
+  let tsMin: number | null = null;
+  let tsMax: number | null = null;
+  for (const points of Object.values(series)) {
+    const span = extentOf(points.map((p) => p.ts));
+    if (!span) continue;
+    if (tsMin === null || span.min < tsMin) tsMin = span.min;
+    if (tsMax === null || span.max > tsMax) tsMax = span.max;
+  }
+  const durationSec = tsMin !== null && tsMax !== null ? (tsMax - tsMin) / 1000 : 0;
 
   const speedValues = speed.map((p) => p.value);
-  const maxSpeedKmh = speedValues.length > 0 ? Math.max(...speedValues) : null;
+  const maxSpeedKmh = maxOf(speedValues);
   const avgSpeedKmh =
     speedValues.length > 0 ? speedValues.reduce((a, b) => a + b, 0) / speedValues.length : null;
 
@@ -609,7 +620,7 @@ export function explainSummaryGaps(
   const values = (key: string) => (series[key] ?? []).map((p) => p.value);
 
   const speed = hasChannel('gps_speed') ? values('gps_speed') : values('0D');
-  const maxSpeed = speed.length > 0 ? Math.max(...speed) : null;
+  const maxSpeed = maxOf(speed);
 
   if (summary.zeroToHundredSec === null) {
     out.zeroToHundredSec =

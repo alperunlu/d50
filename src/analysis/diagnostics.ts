@@ -20,6 +20,7 @@
  *    okur — uygulamanın salt-okunur şartıyla aynı hizada.
  */
 
+import { maxOf } from '../util/agg';
 import { type SeriesMap, type TimeSeriesPoint } from './derived';
 import { MINI_R50, type VehicleProfile } from './vehicle';
 import {
@@ -393,7 +394,7 @@ export function thermostatCheck(series: SeriesMap, vehicle: VehicleProfile = MIN
 
   const seconds = spanSeconds(coolant);
   const start = coolant[0].value;
-  const peak = Math.max(...coolant.map((p) => p.value));
+  const peak = maxOf(coolant.map((p) => p.value)) ?? 0;
   const evidence = `start ${round(start, 0)} °C, peak ${round(peak, 0)} °C over ${Math.round(seconds / 60)} min`;
 
   if (seconds < 300) {
@@ -1163,7 +1164,7 @@ export function driveRatioStability(
 
   // Her küme içindeki bağıl yayılım: kaymanın ölçüsü.
   const spreads = solid.map((c) => ((stdDev(c) ?? 0) / (mean(c) as number)) * 100);
-  const worst = Math.max(...spreads);
+  const worst = maxOf(spreads) ?? 0;
   const evidence =
     `${solid.length} gear${solid.length === 1 ? '' : 's'} seen, ratios ` +
     solid.map((c) => round(mean(c) as number, 2)).join(' · ') +

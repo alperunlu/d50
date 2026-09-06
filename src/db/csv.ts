@@ -20,6 +20,7 @@
  * değil, DB'ye dokunmaz — cihazsız test edilebilir.
  */
 
+import { maxOf } from '../util/agg';
 import type { Channel } from '../data/channels';
 import type { Sample } from './types';
 
@@ -62,7 +63,7 @@ export function suggestStepMs(
   if (medians.length === 0) return DEFAULT_STEP_MS;
 
   // En yavaş hızlı-PID'i baz al ki o da her pencerede bir değer bulsun.
-  const step = Math.max(...medians);
+  const step = maxOf(medians) ?? DEFAULT_STEP_MS;
   const rounded = Math.round(step / 50) * 50;
   return Math.min(MAX_STEP_MS, Math.max(MIN_STEP_MS, rounded));
 }
@@ -83,7 +84,9 @@ export function toWideCsv(
   }
 
   const stepMs = options.stepMs ?? suggestStepMs(samples, channels);
-  const maxTs = Math.max(...samples.map((s) => s.ts));
+  // Uzun oturumda `samples` yüz binlerce satır olabiliyor; spread etmek
+  // argüman tavanına takılır (bkz. util/agg.ts).
+  const maxTs = maxOf(samples.map((s) => s.ts)) ?? 0;
   const numWindows = Math.floor(maxTs / stepMs) + 1;
 
   // pid -> pencere index -> son değer

@@ -25,6 +25,7 @@ import {
   type EngineLayout,
 } from '../analysis/orderTracking';
 import { dbfsToSpl } from '../analysis/spl';
+import { extentOf } from '../util/agg';
 
 /** Native modül tembel yükleniyor — bkz. micLevel.ts'teki gerekçe. */
 type AudioModuleType = typeof import('expo-audio');
@@ -206,7 +207,8 @@ export class EngineSoundListener {
 
     const rpms = this.rpmWindow;
     const rpm = rpms.length > 0 ? rpms[rpms.length - 1] : this.opts.getRpm();
-    const spread = rpms.length > 1 ? Math.max(...rpms) - Math.min(...rpms) : null;
+    const rpmExtent = rpms.length > 1 ? extentOf(rpms) : null;
+    const spread = rpmExtent ? rpmExtent.max - rpmExtent.min : null;
     this.rpmWindow = rpm !== null && rpm !== undefined ? [rpm] : [];
 
     const result = analyzeOrderFrame({
