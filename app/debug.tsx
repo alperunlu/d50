@@ -4,7 +4,6 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Updates from 'expo-updates';
 import { useAppStore } from '../src/state/store';
 import { writeAndShare } from '../src/util/exportFile';
-import { ALLOWED_COMMANDS_SUMMARY } from '../src/obd/allowlist';
 import type { RawLogEntry } from '../src/state/store';
 import type { ProfileCandidate } from '../src/ble/profiles';
 import { VehicleChrome } from '../src/ui/VehicleChrome';
@@ -43,7 +42,6 @@ export default function DebugScreen() {
    */
   const [crash, setCrash] = useState<CrashRecord | null>(() => readLastCrash());
   const [manualBusy, setManualBusy] = useState(false);
-  const [showCommands, setShowCommands] = useState(false);
   const [updateBusy, setUpdateBusy] = useState(false);
 
   /**
@@ -246,16 +244,6 @@ export default function DebugScreen() {
             />
           </View>
 
-          <View style={{ marginTop: space(5) }}>
-            <Pressable onPress={() => setShowCommands((v) => !v)}>
-              <SectionRule label="Allowed commands" meta={showCommands ? 'Hide' : 'Show'} />
-            </Pressable>
-            {showCommands && (
-              <Text style={[type.mono, { marginTop: space(2.5), lineHeight: 16 }]}>
-                {ALLOWED_COMMANDS_SUMMARY}
-              </Text>
-            )}
-          </View>
         </ScrollView>
 
         <View style={styles.logSection}>

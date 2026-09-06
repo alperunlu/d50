@@ -126,8 +126,23 @@ export function Measure({
   }
   return (
     <View style={styles.measureRow}>
-      <Text style={hero ? type.heroValue : type.cellValue}>{value}</Text>
-      <Text style={hero ? type.unit : type.unitSmall}>{unit}</Text>
+      {/*
+        Rakam kutuya sığmalı, kutuyu taşırmamalı.
+
+        Ölçü fontu 88 punto; "76.7" + "dB(A)" gürültü kartında çerçeveden
+        taşıyordu (6 Eylül 2026). Satırın kendisi küçülmediği için fazlalık
+        dışarı akıyordu. Artık rakam gerektiği kadar küçülüyor — birim
+        küçülmüyor, çünkü ölçünün NE olduğu okunmaya devam etmeli.
+      */}
+      <Text
+        style={[hero ? type.heroValue : type.cellValue, styles.measureValue]}
+        numberOfLines={1}
+        adjustsFontSizeToFit
+        minimumFontScale={0.5}
+      >
+        {value}
+      </Text>
+      <Text style={[hero ? type.unit : type.unitSmall, styles.measureUnit]}>{unit}</Text>
     </View>
   );
 }
@@ -304,6 +319,9 @@ const styles = StyleSheet.create({
     paddingBottom: space(1.5),
   },
   measureRow: { flexDirection: 'row', alignItems: 'baseline', gap: space(2) },
+  // flexShrink + minWidth:0 olmadan uzun bir rakam satırı taşırır.
+  measureValue: { flexShrink: 1, minWidth: 0 },
+  measureUnit: { flexShrink: 0 },
   tag: {
     borderWidth: hairlineWidth,
     paddingHorizontal: space(2),

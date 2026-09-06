@@ -37,8 +37,6 @@ export default function LinkScreen() {
   const stopScan = useAppStore((s) => s.stopScan);
   const selectDevice = useAppStore((s) => s.selectDevice);
 
-  const selectedSensorChannels = useAppStore((s) => s.selectedSensorChannels);
-  const sensorStatus = useAppStore((s) => s.sensorStatus);
 
   const vehicle = useAppStore((s) => s.vehicle);
   const tyreError = useAppStore((s) => s.tyreError);
@@ -122,26 +120,6 @@ export default function LinkScreen() {
           </View>
         ) : null}
 
-        <View style={{ marginTop: space(6) }}>
-          <SectionRule
-            label="Phone sensors"
-            meta={
-              selectedSensorChannels.length > 0
-                ? `${selectedSensorChannels.length} selected`
-                : 'None selected'
-            }
-            metaColor={selectedSensorChannels.length > 0 ? color.linked : undefined}
-          />
-          <Note>
-            GPS, accelerometer and microphone are logged alongside OBD data — they enable 0-100
-            timing, grade-corrected power, speedometer error and the sound-based checks. Pick them
-            in Live → Choose channels, next to the OBD channels.
-          </Note>
-          {sensorStatus ? (
-            <Text style={[type.metaSmall, { marginTop: space(2) }]}>{sensorStatus}</Text>
-          ) : null}
-        </View>
-
         {/*
           Lastik ebadı bir "tercih" değil ÖLÇÜM PARAMETRESİ: ECU hızı fabrika
           lastiğine göre hesaplıyor, dolayısıyla mesafe ve tüketim dahil ondan
@@ -209,18 +187,9 @@ export default function LinkScreen() {
           </View>
         ) : linked ? (
           <GhostAction label="Disconnect" onPress={() => void disconnect()} style={{ flex: 1 }} />
-        ) : (
-          selectedDeviceId ? (
-            <PrimaryAction label="Connect" onPress={() => void connect()} style={{ flex: 1 }} />
-          ) : (
-            <GhostAction
-              label="Select an adapter"
-              onPress={() => {}}
-              disabled
-                style={{ flex: 1 }}
-            />
-          )
-        )}
+        ) : selectedDeviceId ? (
+          <PrimaryAction label="Connect" onPress={() => void connect()} style={{ flex: 1 }} />
+        ) : null}
       </View>
     </SafeAreaView>
   );
