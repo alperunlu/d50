@@ -93,3 +93,41 @@ jobs:
           EAS_PLATFORM: ${{ github.event.inputs.platform || 'ios' }}
         # --non-interactive artık desteklenmiyor; CI ortamında CI=1 zaten set.
         run: eas update --branch "$EAS_BRANCH" --platform "$EAS_PLATFORM" --message "$EAS_MESSAGE"
+
+  # ---------------------------------------------------------------------------
+  # Native derleme (yalnızca istendiğinde)
+  # ---------------------------------------------------------------------------
+  #
+  # Commit mesajında [build] geçince koşuyor. Neden böyle: workflow_dispatch
+  # dosyanın VARSAYILAN DALDA olmasını şart koşuyor, bu iş ise henüz main'e
+  # birleşmedi ve izinsiz main'e push edilmez. İşaretçi, her push'ta derleme
+  # başlatmadan istendiğinde başlatmanın en basit yolu.
+  #
+  # Derleme EAS sunucularında koşuyor; runner yalnızca işi kuyruğa atıyor,
+  # o yüzden --no-wait ile 30 dakika runner tutulmuyor.
+  build:
+    if: contains(github.event.head_commit.message, '[build]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Tip kontrolu
+        run: npx tsc --noEmit
+
+      - uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      # --auto-submit: derleme bitince App Store Connect'e yükler (TestFlight).
+      # Bu, "inceleme için gönder" DEĞİLDİR — o adım App Store Connect'te
+      # ekran görüntüleri ve inceleme notlarıyla birlikte elle yapılır.
+      - name: iOS derlemesi
+        run: eas build --platform ios --profile production --auto-submit --non-interactive --no-wait
