@@ -67,6 +67,43 @@ async function openAndMigrate(): Promise<SQLite.SQLiteDatabase> {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    -- Rehberli cycle'ın adım sınırları.
+    --
+    -- Trend analizinin ÖN ŞARTI bu tablo: iki rastgele sürüşün rölanti
+    -- sapmasını karşılaştırmak gürültüyü karşılaştırmaktır, aynı cycle
+    -- adımını karşılaştırmak ölçümdür. Hangi örneklerin hangi koşulda
+    -- alındığını yalnızca bu sınırlar söyleyebiliyor.
+    CREATE TABLE IF NOT EXISTS cycle_steps (
+      session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      step_id TEXT NOT NULL,
+      from_ms INTEGER NOT NULL,
+      to_ms INTEGER NOT NULL,
+      skipped INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cycle_steps_session
+      ON cycle_steps(session_id);
+
+    -- Cycle başına çıkarılan skaler ölçümler ("vitals").
+    --
+    -- Ham örnekler zaten duruyor; bunlar onlardan HESAPLANMIŞ, koşulu
+    -- bilinen ve cycle'dan cycle'a karşılaştırılabilir sayılar. Trend
+    -- bunların üstünde kuruluyor: mutlak eşik değil, aracın kendi taban
+    -- çizgisine göre kayma.
+    CREATE TABLE IF NOT EXISTS cycle_vitals (
+      session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      key TEXT NOT NULL,
+      value REAL NOT NULL,
+      unit TEXT NOT NULL,
+      recorded_at INTEGER NOT NULL,
+      -- Ölçümün koşulu (ör. emme havası sıcaklığı): mevsim etkisini
+      -- ayıklayabilmek için. Onsuz kışın kötüleşen her şey kış olabilir.
+      context TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cycle_vitals_key
+      ON cycle_vitals(key, recorded_at);
   `);
 
   await migrateSupportedPids(db);

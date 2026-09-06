@@ -1,0 +1,78 @@
+# Native derleme — YALNIZCA elle tetiklenir.
+#
+# Ayrı bir dosya, çünkü derleme ile OTA yayını farklı ritimlerde: OTA her
+# push'ta gidiyor ve dakikalar sürüyor, derleme ise istendiğinde alınıyor,
+# yarım saat sürüyor ve App Store Connect'e yükleniyor. Aynı workflow'da
+# durduklarında "her push bir derleme mi başlatıyor?" sorusu sürekli
+# sorulur; ayrı durduklarında cevap dosyanın adında yazıyor.
+#
+# Tetikleme: GitHub > Actions > EAS Build > Run workflow.
+name: EAS Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'eas.json build profili'
+        required: false
+        default: production
+        type: choice
+        options:
+          - production
+          - preview
+      submit:
+        description: 'Derleme bitince App Store Connect e yukle'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: eas-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Token var mi
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+        run: |
+          if [ -z "$EXPO_TOKEN" ]; then
+            echo "EXPO_TOKEN secret'i tanimli degil."
+            exit 1
+          fi
+
+      - run: npm ci
+
+      # Derleme uzun ve pahalı; kırık kod derlemeye gitmesin.
+      - name: Tip kontrolu
+        run: npx tsc --noEmit
+
+      - name: Testler
+        run: npm test -- --passWithNoTests
+
+      - uses: expo/expo-github-action@v8
+        with:
+          eas-version: latest
+          token: ${{ secrets.EXPO_TOKEN }}
+
+      # --no-wait: derleme EAS sunucularında koşuyor, runner'ı yarım saat
+      # tutmanın anlamı yok. --auto-submit yüklemeyi derlemeye zincirler;
+      # bu TestFlight'a düşürür, "inceleme için gönder" demek değildir.
+      - name: iOS derlemesi
+        env:
+          EAS_PROFILE: ${{ github.event.inputs.profile || 'production' }}
+        run: |
+          if [ "${{ github.event.inputs.submit }}" = "false" ]; then
+            eas build --platform ios --profile "$EAS_PROFILE" --non-interactive --no-wait
+          else
+            eas build --platform ios --profile "$EAS_PROFILE" --auto-submit --non-interactive --no-wait
+          fi

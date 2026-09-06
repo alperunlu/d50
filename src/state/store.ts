@@ -9,11 +9,19 @@
  * arayüzü üzerinden konuşur.
  */
 
+import { AppState as RNAppState, type NativeEventSubscription } from 'react-native';
 import { create } from 'zustand';
+import { breadcrumb } from '../util/crashLog';
 import { BleTransport, type ScannedDevice } from '../ble/bleTransport';
+import { isScanResultVisible } from '../ble/scanFilter';
 import type { DiscoveredProfile, ProfileCandidate } from '../ble/profiles';
 import type { ObdConnectionState, ObdTransport } from '../ble/transport';
-import { CommandQueue, initElm327, type InitResult } from '../obd/elm327';
+import {
+  CommandQueue,
+  initElm327,
+  parseAdapterVoltage,
+  type InitResult,
+} from '../obd/elm327';
 import { Poller, type PollSample } from '../obd/poller';
 import { PIDS, getPidDefinition, isPidSupported, type PidDefinition } from '../obd/pids';
 import { scanPids, formatScanReport, type PidScanProgress, type PidScanRow } from '../obd/pidScan';
@@ -40,6 +48,10 @@ import {
   type SensorPermission,
 } from '../sensors/sensorLogger';
 import { orderedCards, moveInOrder } from '../data/cardOrder';
+import { CYCLE_STEPS, channelKeysForStep } from '../cycle/steps';
+import { evaluateStep, nextHeldSince, type StepProgress } from '../cycle/engine';
+import { extractVitals, cycleContext } from '../analysis/vitals';
+import { groupSeries } from '../analysis/derived';
 import {
   sensorGroupsForChannels,
   recordedKeysForSensorChannels,
@@ -113,6 +125,24 @@ interface AppState {
   // --- canlı kayıt ---
   poller: Poller | null;
   isRecording: boolean;
+  /**
+   * Kayıt sırasında uygulamanın arka plana düştüğü ve HİÇBİR ŞEYİN
+   * kaydedilmediği aralıklar. Boş bir liste "delik yok" demektir.
+   */
+  recordingGaps: readonly { at: number; seconds: number }[];
+
+  // --- rehberli test cycle'ı ---
+  /** Cycle çalışmıyorsa `null`. */
+  cycle: {
+    readonly stepIndex: number;
+    readonly progress: StepProgress;
+    /** Kullanıcının atladığı adımların id'leri — raporda "ölçülmedi" der. */
+    readonly skipped: readonly string[];
+  } | null;
+  startCycle: () => Promise<void>;
+  /** Sıradaki adıma geç. Koşul sağlanmasa da geçer (kullanıcı "Atla" derse). */
+  advanceCycle: (skipped: boolean) => void;
+  stopCycle: () => Promise<void>;
   currentSession: Session | null;
   liveSeries: LiveSeries;
   sampleRate: number;
@@ -192,7 +222,14 @@ interface AppState {
   disconnect: () => Promise<void>;
   togglePid: (pid: string) => void;
   isPidSupported: (pid: string) => boolean;
-  startRecording: () => Promise<void>;
+  /**
+   * Kaydı başlatır. `channels` verilirse kullanıcının seçimi yerine o set
+   * kaydedilir — cycle adımları kanal setini böyle daraltıyor.
+   */
+  startRecording: (channels?: {
+    readonly pids: readonly string[];
+    readonly sensors: readonly string[];
+  }) => Promise<void>;
   stopRecording: () => Promise<void>;
   clearLog: () => void;
 }
@@ -213,6 +250,52 @@ let pendingLogRows: { ts: number; direction: string; text: string }[] = [];
 /** BleTransport tekil olduğu için log aboneliği de yalnızca bir kez kurulmalı. */
 let bleLogHooked = false;
 
+/**
+ * Arka plan takibi.
+ *
+ * iOS uygulamayı arka planda ASKIYA ALIR: zamanlayıcılar donar, BLE
+ * bildirimi gelmez, hiçbir örnek kaydedilmez. Bunun için arka plan modu
+ * kapalı (app.json, react-native-ble-plx `isBackgroundEnabled: false`).
+ *
+ * 6 Eylül 2026 kaydında bu 7 dakika 39 saniyelik sessiz bir delik açtı ve
+ * deliği fark etmenin tek yolu log zaman damgalarına bakmaktı: gezi 521
+ * saniye görünüyordu, gerçek veri 62 saniyeydi. Bir ölçüm aletinde sessiz
+ * boşluk, yanlış değer kadar kötüdür — artık hem oturum loguna yazılıyor
+ * hem de ekranda söyleniyor.
+ */
+let appStateSub: NativeEventSubscription | null = null;
+let backgroundedAt: number | null = null;
+/**
+ * En son DİSKE örnek yazılan an (epoch ms).
+ *
+ * Delik ölçüsü budur, "arka plana düşüldü" değil. Arka plan modları
+ * açıkken (bluetooth-central + location) kayıt arka planda sürüyor;
+ * uygulamadan çıkıp haritaya bakmak artık veri kaybı değil ve öyle
+ * raporlanmamalı. Veri gerçekten kesildiyse bunu örneklerin kendisi
+ * söyler, uygulamanın hangi ekranda olduğu değil.
+ */
+let lastSampleAt = 0;
+/**
+ * Süren kaydın kimliği: oturum, zaman tabanı ve komut kuyruğu.
+ *
+ * Cycle adım değiştirdiğinde poller'ı bu üçlüyle yeniden kuruyor — oturum
+ * bölünmüyor, zaman ekseni kaymıyor, yalnızca sorulan kanallar değişiyor.
+ */
+let recordingContext: { sessionId: number; startedAt: number; queue: CommandQueue } | null = null;
+/**
+ * Tamamlanan cycle adımlarının zaman pencereleri.
+ *
+ * Trendin ön şartı: hangi örneğin hangi koşulda alındığı. Cycle bitince
+ * vitals bu pencerelerden çıkarılıyor ve pencerelerle birlikte saklanıyor.
+ */
+let cycleWindows: { stepId: string; fromMs: number; toMs: number; skipped: boolean }[] = [];
+/** Şu anki adımın kayıt içindeki başlangıcı (ms, oturum başına göre). */
+let cycleStepFromMs = 0;
+/** Cycle adımlarını ilerleten sayaç. */
+let cycleTimer: ReturnType<typeof setInterval> | null = null;
+/** Akü voltajı ATRV ile ayrı ritimde okunuyor (bkz. pollAdapterVoltage). */
+let voltageTimer: ReturnType<typeof setInterval> | null = null;
+
 export const useAppStore = create<AppState>((set, get) => ({
   scanning: false,
   scanResults: [],
@@ -225,6 +308,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     const ble = getBleTransport();
     stopScanFn = ble.scan(
       (device) => {
+        // Gürültü listeye hiç girmiyor: sayaç da ("N found") böylece
+        // gerçekten bakmaya değer cihaz sayısını gösteriyor.
+        if (!isScanResultVisible(device)) return;
         set((s) => {
           if (s.scanResults.some((d) => d.id === device.id)) return s;
           return { scanResults: [...s.scanResults, device] };
@@ -264,6 +350,8 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   poller: null,
   isRecording: false,
+  recordingGaps: [],
+  cycle: null,
   currentSession: null,
   liveSeries: {},
   sampleRate: 0,
@@ -729,21 +817,52 @@ export const useAppStore = create<AppState>((set, get) => ({
     return isPidSupported(pid, mask);
   },
 
-  startRecording: async () => {
-    const { queue, selectedPids } = get();
+  startRecording: async (channels) => {
+    const { queue } = get();
+    const selectedPids = channels?.pids ?? get().selectedPids;
     if (!queue) throw new Error('You must connect first');
     if (selectedPids.length === 0) throw new Error('You must select at least one PID');
 
-    const pidDefs = selectedPids
-      .map((p) => getPidDefinition(p))
-      .filter((p): p is PidDefinition => p !== undefined);
+    /**
+     * ECU'nun DESTEKLEMEDİĞİNİ söylediği kanalları sormuyoruz.
+     *
+     * 6 Eylül 2026 kaydı: 0142, 0143 ve 0146 seçiliydi, 757 saniye boyunca
+     * her turda soruldu, hepsine `NO DATA` geldi ve CSV'ye üç tamamen boş
+     * sütun olarak girdi. Oysa ECU bunu bağlantı anında söylemişti —
+     * 0120 cevabı 80000000, yani 0x40 bloğu hiç desteklenmiyor, dolayısıyla
+     * 0x41-0x60 arası bütün PID'ler yok. Cevap vermeyecek bir PID'i sormak
+     * her turdan birkaç yüz milisaniye çalıyor ve o süre gerçek kanallardan
+     * kesiliyor.
+     *
+     * Maskede bilgi yoksa (tarama yapılmamışsa) hiçbir şey elenmiyor:
+     * susmak, yanlış elemekten iyidir.
+     */
+    const supportMask = get().initResult?.supportedPids ?? null;
+    const unsupported = supportMask
+      ? selectedPids.filter((p) => !isPidSupported(p, supportMask))
+      : [];
+    const pollPids = selectedPids.filter((p) => !unsupported.includes(p));
+
+    if (pollPids.length === 0) {
+      throw new Error('This ECU reports none of the selected channels as supported');
+    }
+    if (unsupported.length > 0) {
+      appendLog(set, {
+        ts: Date.now(),
+        direction: 'info',
+        text: `Not recording ${unsupported.join(', ')} — this ECU does not report them supported`,
+      });
+    }
 
     // Seçili sensörlerin kanal anahtarları da oturuma yazılır ki CSV export
     // onları da sütun olarak çıkarsın.
-    const selectedSensorChannels = get().selectedSensorChannels;
+    const selectedSensorChannels = channels?.sensors ?? get().selectedSensorChannels;
     const selectedSensors = sensorGroupsForChannels(selectedSensorChannels);
     const recordedKeys = [
-      ...selectedPids,
+      ...pollPids,
+      // Adaptörün voltmetresi her araçta çalışıyor ve seçim gerektirmiyor:
+      // bedeli 10 saniyede bir komut, karşılığı şarj sisteminin durumu.
+      'battery_v',
       ...recordedKeysForSensorChannels(selectedSensorChannels),
     ];
     // ECU'nun destek bitmask'i oturumla saklanıyor: sonradan analiz
@@ -757,46 +876,34 @@ export const useAppStore = create<AppState>((set, get) => ({
     loggingSessionId = session.id;
     pendingLogRows = get().rawLog.map((e) => ({ ts: e.ts, direction: e.direction, text: e.text }));
 
-    set({ currentSession: session, liveSeries: {}, isRecording: true });
+    /**
+     * OBD ve sensör örnekleri TEK bir sıfır noktasını paylaşır.
+     *
+     * Yorum baştan beri bunu söylüyordu ama kod iki ayrı `Date.now()`
+     * çağırıyordu: poller kurulurken bir tane, sensör logger kurulurken
+     * bir tane daha. Aradaki fark küçük ama gerçek, ve iki zaman ekseni
+     * arasında sabit bir kayma bırakıyordu — hız ile ivmeyi eşleştiren
+     * her metrik o kaymayı taşıyordu. Ayrıca cycle adımları arasında
+     * poller yeniden kurulduğunda referansın değişmemesi buna bağlı.
+     */
+    const recordingStartedAt = Date.now();
 
-    const poller = new Poller({
-      pids: pidDefs,
-      queue,
-      onFlush: (samples: PollSample[]) => {
-        void flushSamples(session.id, samples, set, get);
-      },
-      // Cevap vermeyen bir kanal seyreltildiğinde kullanıcı bunu debug
-      // log'unda görsün — sessizce yavaşlayan bir kanal kafa karıştırır.
-      onBackoff: (pid, failures) =>
-        appendLog(set, {
-          ts: Date.now(),
-          direction: 'info',
-          text: `PID ${pid} did not answer ${failures}x — polling it less often`,
-        }),
-    });
+    breadcrumb(`recording started: session ${session.id}, ${recordedKeys.length} channels`);
+    set({ currentSession: session, liveSeries: {}, isRecording: true, recordingGaps: [] });
+
+    keepScreenAwake(true);
+    watchBackgroundGaps(set);
+    startVoltagePolling(session.id, recordingStartedAt, queue, set);
+
+    const poller = buildPoller(session.id, recordingStartedAt, queue, pollPids, set, get);
     poller.start();
     set({ poller });
 
     // Sensörler açıksa OBD ile AYNI zaman referansını paylaşarak başlar —
     // CSV'de aynı satıra düşmeleri ve birleşik metriklerin çalışması buna bağlı.
-    if (selectedSensors.length > 0) {
-      sensorLogger = new SensorLogger({
-        startedAt: Date.now(),
-        groups: selectedSensors,
-        // Order analizi için canlı devir. Poller'ın en son yazdığı 0C
-        // örneği; sensör tarafı OBD tarafını böyle okuyor.
-        getRpm: () => {
-          const rpmSeries = get().liveSeries['0C'];
-          if (!rpmSeries || rpmSeries.length === 0) return null;
-          return rpmSeries[rpmSeries.length - 1].value;
-        },
-        getCalibrationDb: () => get().splCalibrationDb,
-        onSamples: (sensorSamples: SensorSample[]) => {
-          void flushSensorSamples(session.id, sensorSamples, set);
-        },
-        onError: (message) =>
-          appendLog(set, { ts: Date.now(), direction: 'error', text: `Sensor: ${message}` }),
-      });
+    sensorLogger = buildSensorLogger(session.id, recordingStartedAt, selectedSensors, set, get);
+    activeSensorGroups = selectedSensors;
+    if (sensorLogger) {
       void sensorLogger.start();
       appendLog(set, {
         ts: Date.now(),
@@ -804,10 +911,133 @@ export const useAppStore = create<AppState>((set, get) => ({
         text: `Phone sensors started: ${selectedSensors.join(', ')}`,
       });
     }
+
+    // Cycle bu bilgiyi adım geçişlerinde kullanıyor: aynı oturuma, aynı
+    // zaman tabanıyla yeni bir kanal seti kurabilmek için.
+    recordingContext = { sessionId: session.id, startedAt: recordingStartedAt, queue };
+  },
+
+  /**
+   * Rehberli test cycle'ını başlatır.
+   *
+   * Cycle bir kayıttır: tek oturum, tek zaman ekseni. Adım değiştikçe
+   * yalnızca sorulan kanal seti değişiyor — asıl kazanç bu. 28 kanallık
+   * bir turda lambda sondası 0.29 Hz sorulabiliyordu ve Nyquist yüzünden
+   * salınımı görünmüyordu; üç kanallık bir adımda dört kat hızlı sorulur.
+   */
+  startCycle: async () => {
+    if (get().isRecording) throw new Error('Stop the current recording first');
+    const first = CYCLE_STEPS[0];
+    await get().startRecording({
+      pids: first.channels.pids,
+      sensors: first.channels.sensors,
+    });
+    set({
+      cycle: {
+        stepIndex: 0,
+        progress: evaluateStep(first, {}, null, Date.now()),
+        skipped: [],
+      },
+    });
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'info',
+      text: `Guided test cycle started — step 1/${CYCLE_STEPS.length}: ${first.title}`,
+    });
+    cycleWindows = [];
+    cycleStepFromMs = 0;
+    startCycleTicker(set, get);
+  },
+
+  advanceCycle: (skipped: boolean) => {
+    const state = get().cycle;
+    if (!state) return;
+    const current = CYCLE_STEPS[state.stepIndex];
+    const nextIndex = state.stepIndex + 1;
+
+    // Biten adımın penceresini kapat. Zaman ekseni oturumun sıfır
+    // noktasına göre, çünkü örneklerin ts'i de öyle.
+    const nowMs = recordingContext ? Date.now() - recordingContext.startedAt : 0;
+    cycleWindows.push({
+      stepId: current.id,
+      fromMs: cycleStepFromMs,
+      toMs: nowMs,
+      skipped,
+    });
+    cycleStepFromMs = nowMs;
+
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'info',
+      text: skipped
+        ? `Cycle step skipped: ${current.title}`
+        : `Cycle step complete: ${current.title}`,
+    });
+
+    if (nextIndex >= CYCLE_STEPS.length) {
+      void get().stopCycle();
+      return;
+    }
+
+    const next = CYCLE_STEPS[nextIndex];
+    applyStepChannels(next, set, get);
+    set({
+      cycle: {
+        stepIndex: nextIndex,
+        progress: evaluateStep(next, {}, null, Date.now()),
+        skipped: skipped ? [...state.skipped, current.id] : state.skipped,
+      },
+    });
+    cycleHeldSince = null;
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'info',
+      text: `Cycle step ${nextIndex + 1}/${CYCLE_STEPS.length}: ${next.title}`,
+    });
+  },
+
+  stopCycle: async () => {
+    stopCycleTicker();
+    const sessionId = get().currentSession?.id ?? null;
+    const windows = [...cycleWindows];
+    set({ cycle: null });
+    await get().stopRecording();
+
+    /**
+     * Vitals kayıt BİTTİKTEN sonra çıkarılıyor: son adımın örnekleri de
+     * diske yazılmış olsun. Çıkarım başarısız olursa kayıt yine de
+     * duruyor — ham örnekler DB'de, trend sonradan hesaplanabilir.
+     */
+    if (sessionId === null || windows.length === 0) return;
+    try {
+      const samples = await repo.readSamples(sessionId);
+      const series = groupSeries(samples);
+      const vitals = extractVitals(series, windows, get().vehicle);
+      await repo.saveCycleResult(sessionId, windows, vitals, cycleContext(series, windows));
+      appendLog(set, {
+        ts: Date.now(),
+        direction: 'info',
+        text: `Cycle finished — ${vitals.length} vitals recorded for trending`,
+      });
+    } catch (e) {
+      appendLog(set, {
+        ts: Date.now(),
+        direction: 'error',
+        text: `Could not extract cycle vitals: ${e instanceof Error ? e.message : String(e)}`,
+      });
+    } finally {
+      cycleWindows = [];
+    }
   },
 
   stopRecording: async () => {
     const { poller, currentSession } = get();
+    stopWatchingBackgroundGaps();
+    stopVoltagePolling();
+    stopCycleTicker();
+    recordingContext = null;
+    activeSensorGroups = [];
+    keepScreenAwake(false);
     poller?.stop();
     sensorLogger?.stop();
     sensorLogger = null;
@@ -816,7 +1046,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (currentSession) {
       await repo.endSession(currentSession.id);
     }
-    set({ poller: null, isRecording: false });
+    breadcrumb(
+      `recording stopped: session ${currentSession?.id ?? '—'}, ${
+        currentSession ? Math.round((Date.now() - currentSession.startedAt) / 1000) : 0
+      } s`,
+    );
+    set({ poller: null, isRecording: false, cycle: null });
   },
 
   clearLog: () => set({ rawLog: [] }),
@@ -849,6 +1084,7 @@ async function flushSamples(
     value: s.value,
   }));
 
+  lastSampleAt = Date.now();
   try {
     await repo.insertSamples(dbSamples);
   } catch (e) {
@@ -901,6 +1137,7 @@ async function flushSensorSamples(
   set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
 ): Promise<void> {
   if (samples.length === 0) return;
+  lastSampleAt = Date.now();
   try {
     await repo.insertSamples(
       samples.map((s) => ({ sessionId, ts: s.ts, pid: s.key, value: s.value })),
@@ -945,6 +1182,283 @@ async function flushSessionLogs(): Promise<void> {
   } catch {
     // Log yazımı kaydın kendisini bozmamalı.
   }
+}
+
+/**
+ * Kayıt sürerken ekranın kilitlenmesini engeller.
+ *
+ * Ekran kilidi = uygulama arka planda = kayıt durur. Kullanıcının bunu
+ * bilerek yapması ayrı, telefonu cebe koyup 40 dakikalık bir sürüşün
+ * yarısını kaybetmesi ayrı şeydir.
+ *
+ * `expo-keep-awake` doğrudan bağımlılık değil, `expo` paketiyle geliyor:
+ * native tarafı mevcut derlemede yoksa require patlar ve HİÇBİR ŞEY
+ * yapılmaz — kayıt bundan etkilenmemeli, bu yalnızca bir kolaylık.
+ */
+function keepScreenAwake(on: boolean): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod = require('expo-keep-awake') as {
+      activateKeepAwakeAsync?: (tag?: string) => Promise<void>;
+      deactivateKeepAwake?: (tag?: string) => void;
+    };
+    if (on) void mod.activateKeepAwakeAsync?.('d50-recording');
+    else mod.deactivateKeepAwake?.('d50-recording');
+  } catch {
+    /* native modül yoksa sessizce vazgeç */
+  }
+}
+
+/**
+ * Uygulama arka plana düştüğünde/döndüğünde oturum loguna iz bırakır ve
+ * kayıp süreyi `recordingGaps`'e ekler.
+ *
+ * Yalnızca 'background' sayılıyor: iOS bildirim merkezi ya da gelen arama
+ * bandı 'inactive' üretir, uygulama askıya alınmaz ve kayıt sürer. Onu da
+ * delik saymak her denetim merkezi açılışında yanlış uyarı verirdi.
+ */
+function watchBackgroundGaps(
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+): void {
+  stopWatchingBackgroundGaps();
+  backgroundedAt = null;
+
+  appStateSub = RNAppState.addEventListener('change', (next) => {
+    if (next === 'background') {
+      backgroundedAt = Date.now();
+      appendLog(set, {
+        ts: Date.now(),
+        direction: 'info',
+        text: 'App left the foreground',
+      });
+      return;
+    }
+
+    if (next === 'active' && backgroundedAt !== null) {
+      const now = Date.now();
+      const seconds = Math.round((now - backgroundedAt) / 1000);
+      const at = backgroundedAt;
+      backgroundedAt = null;
+      // Bir saniyenin altındaki geçişler (uygulama değiştirici) delik değil.
+      if (seconds < 1) return;
+
+      /**
+       * Arka planda örnek yazılmaya devam ettiyse delik YOKTUR.
+       *
+       * Arka plan modları açık bir derlemede kayıt sürüyor ve kullanıcı
+       * haritaya bakabiliyor. "Arka plana düştün" ile "veri kaybettin"
+       * aynı şey değil; ikincisini yalnızca örneklerin kesilmesi söyler.
+       */
+      const silentSeconds = Math.round((now - lastSampleAt) / 1000);
+      if (lastSampleAt > 0 && silentSeconds <= 10) {
+        appendLog(set, {
+          ts: now,
+          direction: 'info',
+          text: `Back in the foreground — recording continued in the background for ${seconds} s`,
+        });
+        return;
+      }
+
+      appendLog(set, {
+        ts: now,
+        direction: 'error',
+        text: `Back in the foreground — ${silentSeconds} s with no data recorded`,
+      });
+      set((state) => ({
+        recordingGaps: [...state.recordingGaps, { at, seconds: silentSeconds }],
+      }));
+    }
+  });
+}
+
+function stopWatchingBackgroundGaps(): void {
+  appStateSub?.remove();
+  appStateSub = null;
+  backgroundedAt = null;
+}
+
+/**
+ * Akü voltajını adaptörün kendi voltmetresinden okur (`ATRV`).
+ *
+ * Araca sorulmuyor: bu ECU control module voltage PID'ini desteklemiyor ve
+ * desteklemeyen araçlarda o kanal sonsuza kadar boş kalır. Adaptör ise her
+ * araçta ölçebiliyor, çünkü ölçtüğü şey soketin kendi beslemesi.
+ *
+ * 10 saniyede bir soruluyor: voltaj yavaş değişen bir büyüklük ve tur
+ * kapasitesi kıt — bu ritimde PID'lerden çaldığı süre binde birkaç.
+ */
+const VOLTAGE_INTERVAL_MS = 10_000;
+
+function startVoltagePolling(
+  sessionId: number,
+  startedAt: number,
+  queue: CommandQueue,
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+): void {
+  stopVoltagePolling();
+  const read = async () => {
+    try {
+      const raw = await queue.send('ATRV');
+      const volts = parseAdapterVoltage(raw);
+      if (volts === null) return;
+      await flushSensorSamples(
+        sessionId,
+        [{ key: 'battery_v', ts: Date.now() - startedAt, value: volts }],
+        set,
+      );
+    } catch {
+      // Voltaj okunamaması kaydı bozmamalı; sonraki turda tekrar denenir.
+    }
+  };
+  void read();
+  voltageTimer = setInterval(() => void read(), VOLTAGE_INTERVAL_MS);
+}
+
+function stopVoltagePolling(): void {
+  if (voltageTimer) {
+    clearInterval(voltageTimer);
+    voltageTimer = null;
+  }
+}
+
+/**
+ * Verilen kanal setiyle bir poller kurar.
+ *
+ * Ayrı bir fonksiyon çünkü cycle her adımda kanal setini değiştiriyor ve
+ * poller'ı YENİDEN kuruyor. Oturum, zaman tabanı ve akış hedefi aynı
+ * kalıyor; değişen tek şey sorulan PID listesi.
+ */
+/**
+ * Cycle sayacı: saniyede bir adımı canlı seriye karşı değerlendirir.
+ *
+ * Koşullar KESİNTİSİZ sağlanmalı; `cycleHeldSince` bunun için tutuluyor.
+ * Bir saniyeliğine 80 km/h'a değip geçmek "bir dakika sabit sürdüm"
+ * değildir ve ölçüm o farkı görür.
+ */
+let cycleHeldSince: number | null = null;
+
+function startCycleTicker(
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): void {
+  stopCycleTicker();
+  cycleHeldSince = null;
+  cycleTimer = setInterval(() => {
+    const state = get().cycle;
+    if (!state) return;
+    const step = CYCLE_STEPS[state.stepIndex];
+    const now = Date.now();
+    const progress = evaluateStep(step, get().liveSeries, cycleHeldSince, now);
+    cycleHeldSince = nextHeldSince(progress, cycleHeldSince, now);
+
+    set((s) => (s.cycle ? { cycle: { ...s.cycle, progress } } : {}));
+
+    // Elle ilerleyen adımlar (kontak açma gibi) dokunuş bekler.
+    if (progress.complete && !step.manualAdvance) get().advanceCycle(false);
+  }, 1000);
+}
+
+function stopCycleTicker(): void {
+  if (cycleTimer) {
+    clearInterval(cycleTimer);
+    cycleTimer = null;
+  }
+  cycleHeldSince = null;
+}
+
+/**
+ * Adımın kanal setini uygular: poller yeniden kurulur, sensör grupları
+ * değiştiyse logger da. Oturum ve zaman tabanı korunur.
+ */
+function applyStepChannels(
+  step: (typeof CYCLE_STEPS)[number],
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): void {
+  const context = recordingContext;
+  if (!context) return;
+
+  get().poller?.stop();
+  const poller = buildPoller(
+    context.sessionId,
+    context.startedAt,
+    context.queue,
+    step.channels.pids,
+    set,
+    get,
+  );
+  poller.start();
+  set({ poller });
+
+  const groups = sensorGroupsForChannels(step.channels.sensors);
+  const currentGroups = sensorLogger ? [...activeSensorGroups].sort().join(',') : '';
+  if (currentGroups !== [...groups].sort().join(',')) {
+    sensorLogger?.stop();
+    sensorLogger = buildSensorLogger(context.sessionId, context.startedAt, groups, set, get);
+    activeSensorGroups = groups;
+    if (sensorLogger) void sensorLogger.start();
+  }
+}
+
+/** Şu an açık olan sensör grupları — gereksiz yeniden kurulumu önlemek için. */
+let activeSensorGroups: readonly SensorGroupKey[] = [];
+
+function buildPoller(
+  sessionId: number,
+  startedAt: number,
+  queue: CommandQueue,
+  pidCodes: readonly string[],
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): Poller {
+  const pidDefs = pidCodes
+    .map((p) => getPidDefinition(p))
+    .filter((p): p is PidDefinition => p !== undefined);
+
+  return new Poller({
+    pids: pidDefs,
+    queue,
+    startedAt,
+    onFlush: (samples: PollSample[]) => {
+      void flushSamples(sessionId, samples, set, get);
+    },
+    // Cevap vermeyen bir kanal seyreltildiğinde kullanıcı bunu debug
+    // log'unda görsün — sessizce yavaşlayan bir kanal kafa karıştırır.
+    onBackoff: (pid, failures) =>
+      appendLog(set, {
+        ts: Date.now(),
+        direction: 'info',
+        text: `PID ${pid} did not answer ${failures}x — polling it less often`,
+      }),
+  });
+}
+
+/** Verilen sensör gruplarıyla bir logger kurar. Grup yoksa `null`. */
+function buildSensorLogger(
+  sessionId: number,
+  startedAt: number,
+  groups: readonly SensorGroupKey[],
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): SensorLogger | null {
+  if (groups.length === 0) return null;
+  return new SensorLogger({
+    startedAt,
+    groups: [...groups],
+    // Order analizi için canlı devir. Poller'ın en son yazdığı 0C
+    // örneği; sensör tarafı OBD tarafını böyle okuyor.
+    getRpm: () => {
+      const rpmSeries = get().liveSeries['0C'];
+      if (!rpmSeries || rpmSeries.length === 0) return null;
+      return rpmSeries[rpmSeries.length - 1].value;
+    },
+    getCalibrationDb: () => get().splCalibrationDb,
+    onSamples: (sensorSamples: SensorSample[]) => {
+      void flushSensorSamples(sessionId, sensorSamples, set);
+    },
+    onError: (message) =>
+      appendLog(set, { ts: Date.now(), direction: 'error', text: `Sensor: ${message}` }),
+  });
 }
 
 function appendLog(

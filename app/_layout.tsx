@@ -9,6 +9,7 @@ import {
 } from '@expo-google-fonts/barlow-condensed';
 import { Barlow_400Regular } from '@expo-google-fonts/barlow';
 import { useAppStore } from '../src/state/store';
+import { installCrashLogger, breadcrumb } from '../src/util/crashLog';
 import { color, type, space, hairlineWidth } from '../src/ui/theme';
 
 /**
@@ -68,6 +69,13 @@ function TabLabel({ label, focused }: { label: string; focused: boolean }) {
     </Text>
   );
 }
+
+/**
+ * Kanca ekran ağacından ÖNCE, modül yüklenirken kuruluyor: render sırasında
+ * atılan bir hata da yakalansın diye.
+ */
+installCrashLogger();
+breadcrumb('app launched');
 
 export default function RootLayout() {
   const [fontsLoaded] = useFonts({
