@@ -19,6 +19,15 @@ on:
       message:
         description: 'Yayın notu'
         required: false
+      platform:
+        description: 'Yayınlanacak platform(lar)'
+        required: false
+        default: ios
+        type: choice
+        options:
+          - ios
+          - android
+          - all
   push:
     # Düzeltme henüz main'de değil; OTA'nın bu daldan çıkması bilinçli.
     # main'e birleştikten sonra bu tetikleyici kaldırılmalı, yayın yalnızca
@@ -75,4 +84,12 @@ jobs:
           # komutu bozamasın.
           EAS_BRANCH: ${{ github.event.inputs.branch || 'production' }}
           EAS_MESSAGE: ${{ github.event.inputs.message || format('{0} @ {1}', github.ref_name, github.sha) }}
-        run: eas update --branch "$EAS_BRANCH" --message "$EAS_MESSAGE" --non-interactive
+          # Yalnızca iOS. `eas update` varsayılanı "all" ve web bundle'ı bu
+          # projede DERLENMİYOR: expo-sqlite'ın web tarafı
+          # ./wa-sqlite/wa-sqlite.wasm dosyasını import ediyor, dosya
+          # pakette yok (yerelde de aynı hata). Dağıtılan tek hedef iOS
+          # olduğu için web'i export etmeye çalışmak yayını boşuna
+          # düşürüyordu.
+          EAS_PLATFORM: ${{ github.event.inputs.platform || 'ios' }}
+        # --non-interactive artık desteklenmiyor; CI ortamında CI=1 zaten set.
+        run: eas update --branch "$EAS_BRANCH" --platform "$EAS_PLATFORM" --message "$EAS_MESSAGE"
