@@ -235,6 +235,16 @@ let bleLogHooked = false;
  */
 let appStateSub: NativeEventSubscription | null = null;
 let backgroundedAt: number | null = null;
+/**
+ * En son DİSKE örnek yazılan an (epoch ms).
+ *
+ * Delik ölçüsü budur, "arka plana düşüldü" değil. Arka plan modları
+ * açıkken (bluetooth-central + location) kayıt arka planda sürüyor;
+ * uygulamadan çıkıp haritaya bakmak artık veri kaybı değil ve öyle
+ * raporlanmamalı. Veri gerçekten kesildiyse bunu örneklerin kendisi
+ * söyler, uygulamanın hangi ekranda olduğu değil.
+ */
+let lastSampleAt = 0;
 
 export const useAppStore = create<AppState>((set, get) => ({
   scanning: false,
@@ -928,6 +938,7 @@ async function flushSamples(
     value: s.value,
   }));
 
+  lastSampleAt = Date.now();
   try {
     await repo.insertSamples(dbSamples);
   } catch (e) {
@@ -980,6 +991,7 @@ async function flushSensorSamples(
   set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
 ): Promise<void> {
   if (samples.length === 0) return;
+  lastSampleAt = Date.now();
   try {
     await repo.insertSamples(
       samples.map((s) => ({ sessionId, ts: s.ts, pid: s.key, value: s.value })),
@@ -1071,23 +1083,44 @@ function watchBackgroundGaps(
       appendLog(set, {
         ts: Date.now(),
         direction: 'info',
-        text: 'App left the foreground — recording is paused until it returns',
+        text: 'App left the foreground',
       });
       return;
     }
 
     if (next === 'active' && backgroundedAt !== null) {
-      const seconds = Math.round((Date.now() - backgroundedAt) / 1000);
+      const now = Date.now();
+      const seconds = Math.round((now - backgroundedAt) / 1000);
       const at = backgroundedAt;
       backgroundedAt = null;
       // Bir saniyenin altındaki geçişler (uygulama değiştirici) delik değil.
       if (seconds < 1) return;
+
+      /**
+       * Arka planda örnek yazılmaya devam ettiyse delik YOKTUR.
+       *
+       * Arka plan modları açık bir derlemede kayıt sürüyor ve kullanıcı
+       * haritaya bakabiliyor. "Arka plana düştün" ile "veri kaybettin"
+       * aynı şey değil; ikincisini yalnızca örneklerin kesilmesi söyler.
+       */
+      const silentSeconds = Math.round((now - lastSampleAt) / 1000);
+      if (lastSampleAt > 0 && silentSeconds <= 10) {
+        appendLog(set, {
+          ts: now,
+          direction: 'info',
+          text: `Back in the foreground — recording continued in the background for ${seconds} s`,
+        });
+        return;
+      }
+
       appendLog(set, {
-        ts: Date.now(),
+        ts: now,
         direction: 'error',
-        text: `Back in the foreground — ${seconds} s with no data recorded`,
+        text: `Back in the foreground — ${silentSeconds} s with no data recorded`,
       });
-      set((state) => ({ recordingGaps: [...state.recordingGaps, { at, seconds }] }));
+      set((state) => ({
+        recordingGaps: [...state.recordingGaps, { at, seconds: silentSeconds }],
+      }));
     }
   });
 }

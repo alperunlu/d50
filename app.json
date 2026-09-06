@@ -40,16 +40,16 @@
       [
         "react-native-ble-plx",
         {
-          "isBackgroundEnabled": false,
+          "isBackgroundEnabled": true,
           "bluetoothAlwaysPermission": "Bu uygulama OBD2 adaptörünüzden (Vgate iCar Pro) motor verilerini SADECE OKUMAK için Bluetooth kullanır. Araca hiçbir zaman yazma/komut göndermez."
         }
       ],
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "Konum, kaydettiğin sürüşe hız/rakım/eğim bilgisini eklemek için kullanılır. 0-100 ölçümü, yokuş düzeltmeli güç tahmini ve kilometre saati sapması bu veriye dayanır. Konum verisi telefonundan hiçbir yere gönderilmez.",
+          "locationAlwaysAndWhenInUsePermission": "Konum, kaydettiğin sürüşe hız/rakım/eğim bilgisini eklemek için kullanılır ve KAYIT SÜRERKEN uygulama arka plandayken de devam eder — böylece sürerken haritaya bakabilir, kaydı kaybetmezsin. 0-100 ölçümü, yokuş düzeltmeli güç tahmini ve kilometre saati sapması bu veriye dayanır. Konum verisi telefonundan hiçbir yere gönderilmez.",
           "locationWhenInUsePermission": "Konum, kaydettiğin sürüşe hız/rakım/eğim bilgisini eklemek için kullanılır. Veri telefonundan hiçbir yere gönderilmez.",
-          "isIosBackgroundLocationEnabled": false,
+          "isIosBackgroundLocationEnabled": true,
           "isAndroidBackgroundLocationEnabled": false
         }
       ],
