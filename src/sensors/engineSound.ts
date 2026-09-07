@@ -255,9 +255,18 @@ export class EngineSoundListener {
        * Sebep sürüyorsa dakikada bir hatırlatılıyor, sussun diye değil,
        * kullanıcı hâlâ devam ettiğini görebilsin diye.
        */
+      /**
+       * Tekilleştirme SEBEBE değil ZAMANA bakıyor.
+       *
+       * Önce sebep koduna bakıyordu ve iki sebep dönüşümlü geldiğinde
+       * filtre hiç tutmuyordu: 7 Eylül 2026 kaydında 48 satırın 35'inde
+       * ardışık sebep değişiyordu (`rpm-mismatch` ↔ `rpm-unstable`), yani
+       * neredeyse her pencere loglanıyordu. Kullanıcı için bilgi "order
+       * takibi tutmuyor" cümlesidir; hangi sırayla tutmadığı değil.
+       */
       const code = result.reasonCode ?? result.reason;
       const now = Date.now();
-      if (code !== this.lastReasonCode || now - this.lastReasonAt > REASON_REPEAT_MS) {
+      if (now - this.lastReasonAt > REASON_REPEAT_MS) {
         this.lastReasonCode = code;
         this.lastReasonAt = now;
         this.opts.onNote?.(result.reason);

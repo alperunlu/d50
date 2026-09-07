@@ -50,7 +50,8 @@ import {
 import { orderedCards, moveInOrder } from '../data/cardOrder';
 import { CYCLE_STEPS, channelKeysForStep } from '../cycle/steps';
 import { evaluateStep, nextHeldSince, type StepProgress } from '../cycle/engine';
-import { extractVitals, cycleContext } from '../analysis/vitals';
+import { extractVitals, detectWindows, cycleContext, VITAL_META } from '../analysis/vitals';
+import { analyseTrend, type Trend } from '../analysis/trend';
 import { groupSeries } from '../analysis/derived';
 import {
   sensorGroupsForChannels,
@@ -139,6 +140,21 @@ interface AppState {
     /** Kullanıcının atladığı adımların id'leri — raporda "ölçülmedi" der. */
     readonly skipped: readonly string[];
   } | null;
+  /**
+   * Vital trendleri — cycle'lar biriktikçe dolan tablo.
+   *
+   * Uygulama açılışında ve her cycle bitiminde yükleniyor; DB'den okuma
+   * ekranda değil burada yapılıyor ki Faults ekranı saf kalsın.
+   */
+  vitalTrends: readonly {
+    readonly key: string;
+    readonly label: string;
+    readonly unit: string;
+    readonly value: number;
+    readonly trend: Trend;
+  }[];
+  loadVitalTrends: () => Promise<void>;
+
   startCycle: () => Promise<void>;
   /** Sıradaki adıma geç. Koşul sağlanmasa da geçer (kullanıcı "Atla" derse). */
   advanceCycle: (skipped: boolean) => void;
@@ -291,6 +307,15 @@ let recordingContext: { sessionId: number; startedAt: number; queue: CommandQueu
 let cycleWindows: { stepId: string; fromMs: number; toMs: number; skipped: boolean }[] = [];
 /** Şu anki adımın kayıt içindeki başlangıcı (ms, oturum başına göre). */
 let cycleStepFromMs = 0;
+/**
+ * `stopCycle` vitals'ı kendisi çıkaracak — `stopRecording` karışmasın.
+ *
+ * `stopCycle` kaydı durdurmak için `stopRecording`'i çağırıyor, ve
+ * `stopRecording` artık cycle olmayan kayıtlardan fırsatçı pencere
+ * çıkarıyor. Bayrak olmadan bir cycle'ın sonunda aynı oturum iki kez
+ * işlenir ve aynı ölçüm trende iki nokta olarak girerdi.
+ */
+let cycleExtractionPending = false;
 /** Cycle adımlarını ilerleten sayaç. */
 let cycleTimer: ReturnType<typeof setInterval> | null = null;
 /** Akü voltajı ATRV ile ayrı ritimde okunuyor (bkz. pollAdapterVoltage). */
@@ -352,6 +377,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   isRecording: false,
   recordingGaps: [],
   cycle: null,
+  vitalTrends: [],
   currentSession: null,
   liveSeries: {},
   sampleRate: 0,
@@ -925,17 +951,53 @@ export const useAppStore = create<AppState>((set, get) => ({
    * bir turda lambda sondası 0.29 Hz sorulabiliyordu ve Nyquist yüzünden
    * salınımı görünmüyordu; üç kanallık bir adımda dört kat hızlı sorulur.
    */
+  loadVitalTrends: async () => {
+    try {
+      const latest = await repo.readLatestVitals();
+      const trends = await Promise.all(
+        latest.map(async (v) => {
+          const history = await repo.readVitalHistory(v.key);
+          const meta = VITAL_META[v.key];
+          return {
+            key: v.key,
+            label: meta?.label ?? v.key,
+            unit: v.unit,
+            value: v.value,
+            trend: analyseTrend(history, meta?.betterWhen ?? 'stable'),
+          };
+        }),
+      );
+      // Önce dikkat isteyenler: ekranı yukarıdan okuyan önce onları görsün.
+      const rank = { drifting: 0, improving: 1, stable: 2, baseline: 3 } as const;
+      set({ vitalTrends: trends.sort((a, b) => rank[a.trend.verdict] - rank[b.trend.verdict]) });
+    } catch {
+      // Trend gösterememek uygulamayı durdurmamalı.
+    }
+  },
+
   startCycle: async () => {
     if (get().isRecording) throw new Error('Stop the current recording first');
+    /**
+     * Oturum BÜTÜN adımların kanallarını kaydediyor, poller ise yalnızca
+     * o anki adımınkini soruyor.
+     *
+     * İkisi karıştırılmıştı: oturumun kanal listesi ilk adımdan alınıyordu
+     * ve o adım yalnızca devir soruyor. 7 Eylül 2026 kaydında CSV üç sütuna
+     * indi (zaman, devir, voltaj) — oysa soğutma suyu, MAP, lambda, GPS ve
+     * mikrofon verisi veritabanında duruyordu ve rapor onları kullanıyordu.
+     * Sütun listesi neyin ÖLÇÜLDÜĞÜNÜ anlatmalı, ilk adımda ne sorulduğunu
+     * değil.
+     */
+    const allPids = [...new Set(CYCLE_STEPS.flatMap((s) => s.channels.pids))];
+    const allSensors = [...new Set(CYCLE_STEPS.flatMap((s) => s.channels.sensors))];
     const first = CYCLE_STEPS[0];
-    await get().startRecording({
-      pids: first.channels.pids,
-      sensors: first.channels.sensors,
-    });
+    await get().startRecording({ pids: allPids, sensors: allSensors });
+    // Kayıt geniş başladı; poller hemen ilk adımın dar setine iniyor.
+    applyStepChannels(first, set, get);
     set({
       cycle: {
         stepIndex: 0,
-        progress: evaluateStep(first, {}, null, Date.now()),
+        progress: evaluateStep(first, {}, null, Date.now(), 0),
         skipped: [],
       },
     });
@@ -984,7 +1046,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({
       cycle: {
         stepIndex: nextIndex,
-        progress: evaluateStep(next, {}, null, Date.now()),
+        progress: evaluateStep(next, {}, null, Date.now(), 0),
         skipped: skipped ? [...state.skipped, current.id] : state.skipped,
       },
     });
@@ -1001,6 +1063,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const sessionId = get().currentSession?.id ?? null;
     const windows = [...cycleWindows];
     set({ cycle: null });
+    cycleExtractionPending = true;
     await get().stopRecording();
 
     /**
@@ -1008,7 +1071,10 @@ export const useAppStore = create<AppState>((set, get) => ({
      * diske yazılmış olsun. Çıkarım başarısız olursa kayıt yine de
      * duruyor — ham örnekler DB'de, trend sonradan hesaplanabilir.
      */
-    if (sessionId === null || windows.length === 0) return;
+    if (sessionId === null || windows.length === 0) {
+      cycleExtractionPending = false;
+      return;
+    }
     try {
       const samples = await repo.readSamples(sessionId);
       const series = groupSeries(samples);
@@ -1019,6 +1085,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         direction: 'info',
         text: `Cycle finished — ${vitals.length} vitals recorded for trending`,
       });
+      await get().loadVitalTrends();
     } catch (e) {
       appendLog(set, {
         ts: Date.now(),
@@ -1027,6 +1094,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
     } finally {
       cycleWindows = [];
+      cycleExtractionPending = false;
     }
   },
 
@@ -1052,6 +1120,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       } s`,
     );
     set({ poller: null, isRecording: false, cycle: null });
+
+    // Cycle'ın kendi çıkarımı varsa ona dokunma; yoksa sıradan kayıttan
+    // ne çıkıyorsa onu al. Yarıda kesilen bir cycle da buraya düşer —
+    // adım pencereleri kaydedilmemiş olur ama koşullar veride durur, ve
+    // kurtarılabilen ölçümü atmanın bir gerekçesi yok.
+    if (!cycleExtractionPending && currentSession) {
+      await extractDriveVitals(currentSession.id, set, get);
+    }
   },
 
   clearLog: () => set({ rawLog: [] }),
@@ -1348,7 +1424,8 @@ function startCycleTicker(
     if (!state) return;
     const step = CYCLE_STEPS[state.stepIndex];
     const now = Date.now();
-    const progress = evaluateStep(step, get().liveSeries, cycleHeldSince, now);
+    const elapsedMs = recordingContext ? now - recordingContext.startedAt : 0;
+    const progress = evaluateStep(step, get().liveSeries, cycleHeldSince, now, elapsedMs);
     cycleHeldSince = nextHeldSince(progress, cycleHeldSince, now);
 
     set((s) => (s.cycle ? { cycle: { ...s.cycle, progress } } : {}));
@@ -1370,6 +1447,55 @@ function stopCycleTicker(): void {
  * Adımın kanal setini uygular: poller yeniden kurulur, sensör grupları
  * değiştiyse logger da. Oturum ve zaman tabanı korunur.
  */
+/**
+ * Sıradan bir kayıttan vitals çıkarır.
+ *
+ * NEDEN: trendin ihtiyacı cycle değil, koşulun aynı olması. Sekiz vital'in
+ * altısının koşulu her sürüşte kendiliğinden oluşuyor — sıcak rölanti her
+ * kırmızı ışıkta, soğuk rölanti günün ilk çalıştırmasında. `detectWindows`
+ * bu anları veriden buluyor, `extractVitals` değişmeden onların üstünde
+ * çalışıyor. Böylece taban çizgisi ayda bir yapılan cycle'lardan değil,
+ * her günkü sürüşten birikiyor.
+ *
+ * Kalan iki vital (lambda sondası) buradan çıkmıyor ve çıkmamalı: normal
+ * bir turda sonda Nyquist sınırının altında örnekleniyor, ölçüm sondayı
+ * değil poller'ı ölçerdi. Kapı `extractVitals` içinde, burada değil.
+ *
+ * Hata hâlinde SESSİZ değil ama engelleyici de değil: kayıt zaten diskte,
+ * ham örnekler duruyor, çıkarım sonradan tekrarlanabilir.
+ */
+async function extractDriveVitals(
+  sessionId: number,
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): Promise<void> {
+  try {
+    const samples = await repo.readSamples(sessionId);
+    const series = groupSeries(samples);
+    const windows = detectWindows(series, get().vehicle);
+    if (windows.length === 0) return;
+
+    const vitals = extractVitals(series, windows, get().vehicle);
+    if (vitals.length === 0) return;
+
+    await repo.saveCycleResult(sessionId, windows, vitals, cycleContext(series, windows), 'drive');
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'info',
+      text: `Drive recorded ${vitals.length} vitals for trending (${windows
+        .map((w) => w.stepId)
+        .join(', ')})`,
+    });
+    await get().loadVitalTrends();
+  } catch (e) {
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'error',
+      text: `Could not extract drive vitals: ${e instanceof Error ? e.message : String(e)}`,
+    });
+  }
+}
+
 function applyStepChannels(
   step: (typeof CYCLE_STEPS)[number],
   set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
@@ -1430,7 +1556,61 @@ function buildPoller(
         direction: 'info',
         text: `PID ${pid} did not answer ${failures}x — polling it less often`,
       }),
+    onSilence: (seconds) => void recoverProtocol(seconds, queue, set, get),
   });
+}
+
+/** Aynı anda iki kurtarma çalışmasın. */
+let recovering = false;
+
+/**
+ * ECU sustuğunda protokolü yeniden kurar.
+ *
+ * 7 Eylül 2026 saha testi: kayıt 563. saniyede sessizleşti, 782 kez
+ * `NO DATA` geldi ve kalan 12 dakika boşa gitti. O sırada `ATRV` cevap
+ * veriyordu — yani BLE de adaptör de sağlamdı, kopan yalnızca ELM327'nin
+ * araçla kurduğu protokoldü. Bunun ilacı bağlantıyı komple kurmak değil,
+ * init dizisini tekrarlamak: ATZ, protokol seçimi ve 0100.
+ *
+ * Kayıt BÖLÜNMÜYOR: aynı oturum, aynı zaman ekseni, aynı poller. Yalnızca
+ * araya birkaç saniyelik bir init giriyor ve o boşluk log'a yazılıyor.
+ */
+async function recoverProtocol(
+  seconds: number,
+  queue: CommandQueue,
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): Promise<void> {
+  if (recovering) return;
+  recovering = true;
+  appendLog(set, {
+    ts: Date.now(),
+    direction: 'error',
+    text: `No channel answered for ${seconds} s — reinitialising the adapter protocol`,
+  });
+  breadcrumb(`ecu silent ${seconds}s — reinit`);
+  try {
+    const initResult = await initElm327(queue);
+    set({ initResult });
+    get().poller?.resetAfterRecovery();
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'info',
+      text: `Protocol re-established: ${initResult.protocolNumber}, ${initResult.adapterInfo}`,
+    });
+  } catch (e) {
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'error',
+      text:
+        `Could not re-establish the protocol: ${e instanceof Error ? e.message : String(e)}. ` +
+        'Recording continues; unplug and replug the adapter if this persists.',
+    });
+    // Bir sonraki sessizlik eşiğinde yeniden denensin.
+    get().poller?.resetAfterRecovery();
+  } finally {
+    recovering = false;
+  }
 }
 
 /** Verilen sensör gruplarıyla bir logger kurar. Grup yoksa `null`. */

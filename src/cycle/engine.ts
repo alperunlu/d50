@@ -34,11 +34,28 @@ export interface StepProgress {
   readonly blocker: string | null;
 }
 
-/** Bir kanalın son değeri. Seri boşsa `null`. */
-function lastValue(series: LiveSeries, channel: string): number | null {
+/**
+ * Bir kanalın GÜNCEL son değeri. Seri boşsa ya da değer bayatsa `null`.
+ *
+ * Tazelik kontrolü isteğe bağlı bir titizlik değil. 7 Eylül 2026 saha
+ * testinde ECU sustu ve `liveSeries` son gördüğü değerlerde dondu; kimse
+ * onları temizlemedi çünkü temizleme yalnızca YENİ örnek geldiğinde
+ * çalışıyor. Sonuç:
+ *
+ *   - "80 km/h'de sabit sür" adımı, donmuş bir `hız = 0` üstünde 8 dakika
+ *     boyunca yeşillenmedi; sürücü gerçekten 80'de gidiyordu.
+ *   - "Isınma sürüşü" adımı, veri kesildikten ÜÇ DAKİKA sonra donmuş bir
+ *     soğutma suyu değeri üstünde sayaç işleterek "tamamlandı".
+ *
+ * Ölçmediğini bilmek, yanlış ölçmekten iyidir.
+ */
+const MAX_SAMPLE_AGE_MS = 5_000;
+
+function freshValue(series: LiveSeries, channel: string, elapsedMs: number): number | null {
   const points = series[channel];
   if (!points || points.length === 0) return null;
-  return points[points.length - 1].value;
+  const last = points[points.length - 1];
+  return elapsedMs - last.ts <= MAX_SAMPLE_AGE_MS ? last.value : null;
 }
 
 function conditionMet(condition: StepCondition, value: number | null): boolean {
@@ -60,9 +77,14 @@ export function evaluateStep(
   series: LiveSeries,
   heldSince: number | null,
   now: number,
+  /**
+   * Kaydın başlangıcından beri geçen süre (ms) — örneklerin `ts` alanıyla
+   * AYNI saat. Tazelik ancak aynı saatle ölçülebilir.
+   */
+  elapsedMs: number,
 ): StepProgress {
   const conditions: ConditionState[] = step.conditions.map((c) => {
-    const value = lastValue(series, c.channel);
+    const value = freshValue(series, c.channel, elapsedMs);
     return { label: c.label, met: conditionMet(c, value), value };
   });
 
@@ -84,7 +106,7 @@ export function evaluateStep(
     missing.length === 0
       ? null
       : missing
-          .map((c) => (c.value === null ? `no data yet for ${c.label}` : `needs ${c.label}`))
+          .map((c) => (c.value === null ? `no fresh data for ${c.label}` : `needs ${c.label}`))
           .join(', ');
 
   return { conditions, heldSeconds, fraction, complete, blocker };

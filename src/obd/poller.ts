@@ -39,6 +39,21 @@ export interface PollerOptions {
   /** Cevap vermeyen bir PID geri çekildiğinde haber verir (debug log'u için). */
   readonly onBackoff?: (pid: string, failures: number) => void;
   /**
+   * HİÇBİR PID bu kadar süredir cevap vermiyorsa çağrılır.
+   *
+   * Tek bir PID'in susması normaldir (araç o sensöre sahip olmayabilir);
+   * HEPSİNİN birden susması başka bir şeydir. 7 Eylül 2026 saha testinde
+   * ECU 563. saniyede sustu, 782 kez `NO DATA` döndü ve uygulama 12 dakika
+   * boyunca hiçbir şey fark etmeden sormaya devam etti — üstelik geri
+   * çekilme mantığı yüzünden gitgide daha seyrek. O sırada `ATRV` cevap
+   * veriyordu, yani BLE ve adaptör sağlamdı; kopan şey ECU protokolüydü ve
+   * çözümü yeniden başlatmaktı. Poller bunu kendi başına yapmıyor; haber
+   * veriyor, kararı store veriyor.
+   */
+  readonly onSilence?: (seconds: number) => void;
+  /** Sessizlik eşiği (ms). Varsayılan 10 sn. */
+  readonly silenceTimeoutMs?: number;
+  /**
    * Örnek zaman damgalarının sıfır noktası (epoch ms).
    *
    * Verilmezse poller'ın kendi başlangıcı kullanılır. Rehberli test
@@ -149,6 +164,8 @@ const DEFAULT_FLUSH_MS = 1000;
 const DEFAULT_TIMEOUT_MS = 3000;
 /** Yavaş kanalların hedef örnekleme aralığı. Soğutma suyu için fazlasıyla yeterli. */
 const DEFAULT_SLOW_INTERVAL_MS = 10_000;
+/** Bu kadar süre HİÇBİR PID cevap vermezse bağlantı kopmuş sayılır. */
+const DEFAULT_SILENCE_MS = 10_000;
 
 export class Poller {
   private running = false;
@@ -200,6 +217,10 @@ export class Poller {
   private lastPolledMs: Record<string, number> = {};
   /** PID -> üst üste cevapsız kalma sayısı; geri çekilme buna dayanıyor. */
   private failures: Record<string, number> = {};
+  /** Son GEÇERLİ cevabın alındığı an. Sessizlik bunun üstünden ölçülüyor. */
+  private lastAnswerAt = Date.now();
+  /** Sessizlik bir kez bildirildi mi — her turda tekrar bildirmemek için. */
+  private silenceReported = false;
 
   private async loop(): Promise<void> {
     let cycleIndex = 0;
@@ -222,10 +243,36 @@ export class Poller {
       for (const pid of cycle) {
         if (!this.running) break;
         await this.pollOne(pid);
+        this.checkSilence();
         // Her sorgudan sonra makro göreve dön (aşağıdaki nota bak).
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
       }
     }
+  }
+
+  /**
+   * Bütün kanalların sustuğu durumu bildirir. Bir kez bildirir; kurtarma
+   * denendikten sonra ilk geçerli cevap sayacı sıfırlar.
+   */
+  private checkSilence(): void {
+    if (this.silenceReported) return;
+    const silentMs = Date.now() - this.lastAnswerAt;
+    if (silentMs < (this.opts.silenceTimeoutMs ?? DEFAULT_SILENCE_MS)) return;
+    this.silenceReported = true;
+    this.opts.onSilence?.(Math.round(silentMs / 1000));
+  }
+
+  /**
+   * Kurtarma sonrası çağrılır: geri çekilme cezaları silinir.
+   *
+   * Sessizlik boyunca her PID defalarca cevapsız kaldı ve seyreltildi.
+   * Protokol geri geldiğinde o cezalarla devam etmek, sağlam bir bağlantıyı
+   * dakikalarca yavaş tutmak demek olurdu.
+   */
+  resetAfterRecovery(): void {
+    this.failures = {};
+    this.lastAnswerAt = Date.now();
+    this.silenceReported = false;
   }
 
   private async pollOne(pid: PidDefinition): Promise<void> {
@@ -242,6 +289,8 @@ export class Poller {
         // Tek bir başarılı cevap cezayı siler: geçici bir aksaklık yüzünden
         // bir kanalı kalıcı olarak seyreltmek istemiyoruz.
         this.failures[pid.pid] = 0;
+        this.lastAnswerAt = Date.now();
+        this.silenceReported = false;
       } else {
         this.registerFailure(pid);
       }

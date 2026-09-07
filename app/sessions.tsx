@@ -109,8 +109,8 @@ export default function TripsScreen() {
 
   /**
    * HTML rapor: bu gezinin ölçümleri + her vital'in kendi geçmişine göre
-   * trendi. Paylaşım sayfasından "Print → Save as PDF" ile PDF'e çevrilir;
-   * gerçek PDF `expo-print` ister ve o native modül henüz derlemede yok.
+   * trendi. PDF isteyen, paylaşım sayfasından "Print → Save as PDF"
+   * diyor; uygulamanın PDF üretmesine gerek görülmedi (bkz. report/html.ts).
    */
   const exportReport = useCallback(
     async (session: Session) => {
@@ -132,6 +132,7 @@ export default function TripsScreen() {
               label: meta?.label ?? v.key,
               value: v.value,
               unit: v.unit,
+              source: v.source,
               trend: analyseTrend(history, meta?.betterWhen ?? 'stable'),
             };
           }),

@@ -274,7 +274,7 @@ export function idleSamples(
  * ölçümü uydurmak olurdu. İkili arama; uzun kayıtlarda kareli maliyet
  * bırakmamak için (bkz. nearestValue'daki not).
  */
-function valueAtOrBefore(
+export function valueAtOrBefore(
   series: readonly TimeSeriesPoint[],
   ts: number,
   maxAgeMs: number,
@@ -298,6 +298,40 @@ function valueAtOrBefore(
  * Sağlıklı bir motorda sapma tipik olarak 20-30 RPM altındadır; 60+ RPM
  * bir şeylerin yolunda olmadığının kaba ama kullanışlı bir işaretidir.
  */
+/**
+ * Rölanti kararlılığının TEK istatistiği: kayan pencerelerin standart
+ * sapmalarının ortancası.
+ *
+ * Yavaş sürüklenmeyi ölçüme sokmadan kısa süreli değişkenliği verir. Dışa
+ * açık, çünkü özet de teşhis de vital de AYNI sayıyı üretmek zorunda —
+ * örnek seçimini (idleSamples) tekilleştirmek yetmiyor, istatistiğin
+ * kendisi de tek yerde olmalı. Bu ayrım daha önce iki kez ayrı sayı
+ * ürettiği için testle sabitlendi.
+ */
+export function idleStabilityRpm(
+  points: readonly TimeSeriesPoint[],
+  windowMs = 10_000,
+  minSamples = 5,
+): number | null {
+  const deviations: number[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const from = points[i].ts;
+    const segment: number[] = [];
+    for (let j = i; j < points.length && points[j].ts < from + windowMs; j++) {
+      segment.push(points[j].value);
+    }
+    if (segment.length < minSamples) continue;
+    const m = segment.reduce((a, b) => a + b, 0) / segment.length;
+    deviations.push(
+      Math.sqrt(segment.reduce((a, v) => a + (v - m) ** 2, 0) / (segment.length - 1)),
+    );
+  }
+  if (deviations.length === 0) return null;
+  const sorted = [...deviations].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
 export function idleRpmStability(
   rpmSeries: readonly TimeSeriesPoint[],
   speedSeries: readonly TimeSeriesPoint[],
@@ -310,6 +344,21 @@ export function idleRpmStability(
   const values = idleBand.map((p) => p.value);
   const mean = values.reduce((a, b) => a + b, 0) / values.length;
   /**
+   * Sapma KISA PENCERELERDE ölçülüyor, tüm kayıt boyunca değil.
+   *
+   * Aranan şey rölantinin DALGALANMASI; ama tüm pencerenin sapması,
+   * rölantinin yavaş SÜRÜKLENMESİNİ de içine alıyor. Soğuk motor tasarım
+   * gereği yüksek başlayıp iner: 7 Eylül 2026 kaydında 90 saniyede 1767'den
+   * 1071 rpm'e düştü. Tüm pencerenin sapması 88.6 rpm çıktı ve kart
+   * "rölanti dalgalanıyor, araç titriyor" dedi. Oysa 10 saniyelik
+   * pencerelerin sapması 26.5 rpm — yani sağlıklı bir motorun bandında.
+   * Ölçülen şey arıza değil, ısınmaydı.
+   *
+   * Ortanca alınıyor: tek bir gaz vuruşu ya da vitese takma anı bütün
+   * ölçümü sürüklemesin.
+   */
+  const windowSd = idleStabilityRpm(idleBand);
+  /**
    * n-1 (örneklem standart sapması), n değil.
    *
    * Teşhis kartı baştan beri n-1 kullanıyordu; özet n kullanıyordu. Aynı
@@ -318,7 +367,12 @@ export function idleRpmStability(
    * bir örneklem; doğru tahminci de n-1 olan.
    */
   const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / (values.length - 1);
-  return { stdDev: Math.sqrt(variance), meanRpm: mean, sampleCount: values.length };
+  // Kısa pencere hesaplanamadıysa (örnek az) tüm pencereye düşülüyor.
+  return {
+    stdDev: windowSd ?? Math.sqrt(variance),
+    meanRpm: mean,
+    sampleCount: values.length,
+  };
 }
 
 /**

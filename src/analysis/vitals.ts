@@ -16,7 +16,7 @@
  */
 
 import type { SeriesMap, TimeSeriesPoint } from './derived';
-import { idleSamples } from './derived';
+import { idleSamples, idleStabilityRpm, valueAtOrBefore } from './derived';
 import { MINI_R50, type VehicleProfile } from './vehicle';
 
 /** Bir cycle adımının kayıt içindeki zaman aralığı (ms, oturum başına göre). */
@@ -147,8 +147,8 @@ export function extractVitals(
   if (coldIdle) {
     const rpm = within(series['0C'] ?? [], coldIdle);
     const speed = within(series['0D'] ?? [], coldIdle);
-    const idle = idleSamples(rpm, speed, vehicle).map((p) => p.value);
-    const sd = stdDev(idle);
+    const idle = idleSamples(rpm, speed, vehicle);
+    const sd = idleStabilityRpm(idle);
     if (sd !== null && idle.length >= 10) {
       push(vital('cold_idle_rpm_sd', sd, 'cold-idle'));
     }
@@ -159,8 +159,8 @@ export function extractVitals(
   if (warmIdle) {
     const rpm = within(series['0C'] ?? [], warmIdle);
     const speed = within(series['0D'] ?? [], warmIdle);
-    const idle = idleSamples(rpm, speed, vehicle).map((p) => p.value);
-    const sd = stdDev(idle);
+    const idle = idleSamples(rpm, speed, vehicle);
+    const sd = idleStabilityRpm(idle);
     if (sd !== null && idle.length >= 10) {
       push(vital('warm_idle_rpm_sd', sd, 'warm-idle'));
     }
@@ -206,6 +206,191 @@ export function extractVitals(
     const cruiseV = median(within(series['battery_v'] ?? [], cruise).map((p) => p.value));
     if (idleV !== null && cruiseV !== null) {
       push(vital('charge_idle_drop_v', cruiseV - idleV, 'cruise'));
+    }
+  }
+
+  return out;
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * Sıradan sürüşten koşul penceresi çıkarma
+ * ---------------------------------------------------------------------------
+ *
+ * NEDEN: yukarıdaki her şey cycle adımlarına bağlıydı, ve cycle ayda bir
+ * yapılıyor. Oysa trendin ihtiyaç duyduğu şey cycle DEĞİL, koşulun aynı
+ * olması. Sıcak rölanti her kırmızı ışıkta oluyor; soğuk rölanti günün ilk
+ * çalıştırmasında; kontak-açık-motor-kapalı, kayda motoru çalıştırmadan
+ * başlandığı her seferde. Bunlar cycle'ın kurduğu koşullar değil, cycle'ın
+ * BEKLEDİĞİ koşullar — ve verinin içinde zaten varlar.
+ *
+ * Bu yüzden burada adım sınırlarını kullanıcıdan değil VERİDEN çıkarıyoruz.
+ * Çıkan pencereler `extractVitals`'a aynı `StepWindow` olarak giriyor; o
+ * fonksiyon değişmiyor, çünkü pencerenin nasıl bulunduğu onu ilgilendirmez.
+ *
+ * DÜRÜSTLÜK NOTU — bunun bedeli var: cycle adımında klima kapalı, yol düz ve
+ * sürücü gaza dokunmuyor; kırmızı ışıkta bunların hiçbiri garanti değil.
+ * Yani fırsatçı pencereler cycle adımlarından DAHA GÜRÜLTÜLÜDÜR. Buna
+ * rağmen değer: trend.ts'in gürültü tabanı (taban çizgisinin kendi
+ * saçılımı) saçılmayı zaten soğuruyor ve beş nokta alt sınırı erken hüküm
+ * vermeyi engelliyor, ama nokta sayısı ayda birden haftada beşe çıkıyor.
+ * Gürültü artışı sabit, veri artışı çarpan.
+ *
+ * Lambda vitalleri buradan ÇIKMAZ ve bu bir eksik değil: `extractVitals`
+ * içindeki Nyquist kapısı sondanın en az 0.8 Hz örneklenmesini istiyor,
+ * 28 kanallık normal bir turda bu asla sağlanmaz. Kapı kendiliğinden
+ * kapanıyor — burada ayrıca engellemeye gerek yok, ve engellememek daha
+ * doğru: kanal seti bir gün daralırsa ölçüm kendiliğinden mümkün olur.
+ */
+
+/** İki örnek arası bu kadar boşluk varsa koşu KESİLMİŞ sayılır. */
+const RUN_GAP_MS = 5_000;
+/** Başka bir kanalın değeri bu kadar eskiyse "bilinmiyor" sayılır. */
+const FILL_AGE_MS = 5_000;
+/**
+ * Kendi ritmi olan kanalların tazelik payı.
+ *
+ * `battery_v` OBD turunun içinde değil: ATRV ile 10 saniyede bir ayrı
+ * okunuyor. Ona 5 saniyelik pay vermek, kanalı hiç okunmamış saymak
+ * demekti — kontak penceresi 5 saniyelik parçalara bölünüyor ve 20
+ * saniyelik alt sınırı hiçbir zaman geçemiyordu. Tazelik payı kanalın
+ * ÖRNEKLEME ARALIĞINA göre belirlenmeli, tek bir sabite göre değil.
+ */
+const SLOW_FILL_AGE_MS: Readonly<Record<string, number>> = {
+  battery_v: 15_000,
+};
+
+/** Bir zamandaki kanal değerini veren okuyucu (forward-fill, bayatsa null). */
+type ChannelReader = (channel: string) => number | null;
+
+interface WindowSpec {
+  readonly stepId: string;
+  /** Koşu bu kadar saniye KESİNTİSİZ sürmeliyse pencere sayılır. */
+  readonly minSeconds: number;
+  readonly test: (at: ChannelReader) => boolean;
+  /**
+   * Yalnızca kaydın EN BAŞINDAKİ koşuyu kabul et.
+   *
+   * `battery_rest_v` için şart: motor durduktan sonra akü uçlarında yüzey
+   * şarjı kalır ve voltaj bir süre yüksek okunur. Sürüş sonundaki bir
+   * "motor kapalı" penceresini dinlenme voltajı diye seriye sokmak, aküyü
+   * her seferinde olduğundan iyi göstermek olurdu — trendi tam da
+   * gözlemek istediğimiz yönde bozar.
+   */
+  readonly onlyAtStart?: boolean;
+}
+
+function driveWindowSpecs(vehicle: VehicleProfile): readonly WindowSpec[] {
+  // idleSamples ile AYNI tanım: alt sınır motorun çalıştığını, üst sınır
+  // rölantiden çıkılmadığını söyler. Tek yerde tutulamıyor çünkü orası
+  // örnek süzüyor, burası zaman aralığı arıyor; ama sayılar aynı kalmalı.
+  const idling = (at: ChannelReader): boolean => {
+    const rpm = at('0C');
+    if (rpm === null || rpm <= 300 || rpm >= vehicle.idleRpm * 1.6) return false;
+    const speed = at('0D');
+    return speed === null || speed < 2;
+  };
+
+  return [
+    {
+      stepId: 'ignition',
+      minSeconds: 20, // ATRV 10 sn'de bir okunuyor; medyan için en az iki örnek.
+      onlyAtStart: true,
+      test: (at) => {
+        const rpm = at('0C');
+        return rpm !== null && rpm <= 300 && at('battery_v') !== null;
+      },
+    },
+    {
+      stepId: 'cold-idle',
+      minSeconds: 30,
+      test: (at) => {
+        const coolant = at('05');
+        // Soğutma suyu OKUNAMIYORSA pencere üretilmiyor: soğuk ile sıcak
+        // rölantiyi ayıramadan ikisini aynı seriye yazmak trendi bozar.
+        return coolant !== null && coolant < 60 && idling(at);
+      },
+    },
+    {
+      stepId: 'warm-idle',
+      minSeconds: 30,
+      test: (at) => {
+        const coolant = at('05');
+        return coolant !== null && coolant >= 80 && idling(at);
+      },
+    },
+    {
+      stepId: 'cruise',
+      minSeconds: 30,
+      // Vites ya da yokuş kontrolü YOK, çünkü bu pencereden çıkan tek vital
+      // şarj voltajı ve o vitesle değil alternatör devriyle ilgili. Vitesin
+      // önemli olduğu ölçümler (tekerlek çevresi, hız sapması) cycle'ın
+      // cruise adımına bağlı kalıyor.
+      test: (at) => {
+        const speed = at('0D');
+        return speed !== null && speed >= 60 && speed <= 100;
+      },
+    },
+  ];
+}
+
+/**
+ * Kaydın içinden koşul pencerelerini bulur.
+ *
+ * Saat olarak devir serisi kullanılıyor: her kanal setinde var, ve aranan
+ * koşulların hepsi motorun durumuyla tanımlı. Diğer kanallar o anlara
+ * forward-fill ile taşınıyor.
+ *
+ * Her koşul için EN UZUN koşu seçiliyor — en çok örnek, en az kenar etkisi.
+ */
+export function detectWindows(
+  series: SeriesMap,
+  vehicle: VehicleProfile = MINI_R50,
+): StepWindow[] {
+  const clock = series['0C'] ?? [];
+  if (clock.length < 2) return [];
+
+  const readerAt = (ts: number): ChannelReader => (channel) => {
+    const s = series[channel];
+    if (!s || s.length === 0) return null;
+    return valueAtOrBefore(s, ts, SLOW_FILL_AGE_MS[channel] ?? FILL_AGE_MS);
+  };
+
+  const out: StepWindow[] = [];
+
+  for (const spec of driveWindowSpecs(vehicle)) {
+    const runs: { fromMs: number; toMs: number }[] = [];
+    let runStart: number | null = null;
+    let prevTs = clock[0].ts;
+
+    const consider = (fromMs: number, toMs: number) => {
+      if ((toMs - fromMs) / 1000 < spec.minSeconds) return;
+      if (spec.onlyAtStart && fromMs > clock[0].ts + RUN_GAP_MS) return;
+      runs.push({ fromMs, toMs });
+    };
+
+    for (const p of clock) {
+      const ok = spec.test(readerAt(p.ts));
+      // Veri boşluğu koşuyu keser: ölçmediğimiz süreyi "koşul sürüyordu"
+      // diye saymak, 7 Eylül sahasında donmuş değerlerle yaptığımız hatanın
+      // aynısı olur.
+      const broken = p.ts - prevTs > RUN_GAP_MS;
+      if (!ok || broken) {
+        if (runStart !== null) consider(runStart, prevTs);
+        runStart = ok ? p.ts : null;
+      } else if (runStart === null) {
+        runStart = p.ts;
+      }
+      prevTs = p.ts;
+    }
+    if (runStart !== null) consider(runStart, prevTs);
+
+    const best = runs.reduce<{ fromMs: number; toMs: number } | null>(
+      (a, b) => (a === null || b.toMs - b.fromMs > a.toMs - a.fromMs ? b : a),
+      null,
+    );
+    if (best !== null) {
+      out.push({ stepId: spec.stepId, fromMs: best.fromMs, toMs: best.toMs, skipped: false });
     }
   }
 

@@ -21,7 +21,7 @@
  */
 
 import { maxOf } from '../util/agg';
-import { idleSamples, type SeriesMap, type TimeSeriesPoint } from './derived';
+import { idleSamples, idleStabilityRpm, type SeriesMap, type TimeSeriesPoint } from './derived';
 import { MINI_R50, type VehicleProfile } from './vehicle';
 import {
   rollingCircumferenceMm,
@@ -711,7 +711,8 @@ export function idleQuality(series: SeriesMap, vehicle: VehicleProfile = MINI_R5
       'No stationary idling found in this recording. Leave it idling for a minute while recording.');
   }
 
-  const sd = stdDev(idleRpm) as number;
+  // Aynı istatistik, aynı yerden: kayan pencere sapması (bkz. derived.ts).
+  const sd = (idleStabilityRpm(idlePoints) ?? stdDev(idleRpm)) as number;
   const avg = mean(idleRpm) as number;
 
   // Aynı zaman aralığındaki titreşim ve ses — varsa tabloyu tamamlıyorlar.
@@ -1382,8 +1383,16 @@ export function tyreSizeCalibration(
  * alternatörlerde bu bantlar geçerli olmazdı, o yüzden araç profiline
  * bağlı bir kontrol.
  */
-const CHARGING_MIN_V = 13.6;
-const CHARGING_MAX_V = 15.0;
+/**
+ * Ölçüm AKÜ UÇLARINDA değil, OBD soketinin 16. pininde yapılıyor.
+ *
+ * Aradaki kablo ve sigorta üzerinde bir düşüş var; soket tipik olarak
+ * aküden 0.1-0.3 V daha düşük okur. Araç profilindeki bant akü uçları
+ * içindir, o yüzden eşikler bu kadar aşağı kaydırılıyor. Bu yapılmadığında
+ * 7 Eylül 2026 kaydındaki 13.4 V "düşük şarj" diye işaretlendi; oysa akü
+ * uçlarında ~13.6 V eder ve bandın içindedir.
+ */
+const SOCKET_DROP_V = 0.2;
 
 /** Motor çalışırken (devir > 400) ölçülen voltaj örnekleri. */
 function voltsWhileRunning(series: SeriesMap): number[] {
@@ -1437,6 +1446,9 @@ export function chargingSystem(series: SeriesMap, vehicle: VehicleProfile = MINI
   }
 
   const level = median(running) as number;
+  // Profil bandı akü uçları için; ölçüm soketten geldiği için kaydırılıyor.
+  const minV = vehicle.chargingVoltageV.min - SOCKET_DROP_V;
+  const maxV = vehicle.chargingVoltageV.max + SOCKET_DROP_V;
 
   // Rölanti / seyir farkı: ikisi de varsa anlamlı.
   const volts = get(series, 'battery_v');
@@ -1470,17 +1482,17 @@ export function chargingSystem(series: SeriesMap, vehicle: VehicleProfile = MINI
     };
   }
 
-  if (level < CHARGING_MIN_V) {
+  if (level < minV) {
     return {
       key, title, verdict: 'attention',
       headline: 'Charging voltage is low',
       detail:
-        `A healthy system holds ${CHARGING_MIN_V}-14.6 V with the engine running; this one sits at ${round(level, 2)} V. A slipping belt, worn brushes or a tired regulator all look like this, and the battery will slowly fall behind.`,
+        `This car should hold ${vehicle.chargingVoltageV.min}-${vehicle.chargingVoltageV.max} V at the battery with the engine running, which is ${round(minV, 2)} V or more at the OBD socket where this is measured; it sits at ${round(level, 2)} V. A slipping belt, worn brushes or a tired regulator all look like this, and the battery will slowly fall behind.`,
       evidence,
     };
   }
 
-  if (level > CHARGING_MAX_V) {
+  if (level > maxV) {
     return {
       key, title, verdict: 'attention',
       headline: 'Charging voltage is too high',
@@ -1504,7 +1516,8 @@ export function chargingSystem(series: SeriesMap, vehicle: VehicleProfile = MINI
   return {
     key, title, verdict: 'ok',
     headline: 'Charging voltage is healthy',
-    detail: `The alternator holds the system in the normal band with the engine running.`,
+    detail:
+      `The alternator holds the system in the normal band with the engine running. Measured at the OBD socket, which reads roughly ${SOCKET_DROP_V} V below the battery terminals.`,
     evidence,
   };
 }
