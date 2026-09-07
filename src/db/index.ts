@@ -115,6 +115,7 @@ async function openAndMigrate(): Promise<SQLite.SQLiteDatabase> {
 
   await migrateSupportedPids(db);
   await migrateVitalSource(db);
+  await migrateSessionVin(db);
 
   return db;
 }
@@ -152,4 +153,21 @@ async function migrateVitalSource(db: SQLite.SQLiteDatabase): Promise<void> {
   const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(cycle_vitals)');
   if (columns.some((c) => c.name === 'source')) return;
   await db.execAsync("ALTER TABLE cycle_vitals ADD COLUMN source TEXT NOT NULL DEFAULT 'cycle'");
+}
+
+/**
+ * `sessions.vin` sütunu — oturumun HANGİ ARABADAN alındığı.
+ *
+ * Trendin sessiz düşmanı: iki farklı arabanın aynı ölçümü tek seriye
+ * girerse seri anlamını kaybeder ve bunu kimse fark etmez, çünkü sayılar
+ * makul görünmeye devam eder.
+ *
+ * NULL "başka araba" demek değil, "o sırada bilmiyorduk" demek — VIN
+ * okuması eklenmeden önceki her oturum ve Mode 09'u desteklemeyen her ECU
+ * NULL kalır. Bu ayrım `readVitalHistory` içinde kullanılıyor.
+ */
+async function migrateSessionVin(db: SQLite.SQLiteDatabase): Promise<void> {
+  const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(sessions)');
+  if (columns.some((c) => c.name === 'vin')) return;
+  await db.execAsync('ALTER TABLE sessions ADD COLUMN vin TEXT');
 }

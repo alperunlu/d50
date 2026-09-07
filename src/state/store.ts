@@ -894,7 +894,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     // ECU'nun destek bitmask'i oturumla saklanıyor: sonradan analiz
     // ederken "araç bunu desteklemiyor" ile "kanalı seçmemişim" ayrımı
     // ancak bununla yapılabiliyor.
-    const session = await repo.startSession(recordedKeys, get().initResult?.supportedPids ?? null);
+    const session = await repo.startSession(
+      recordedKeys,
+      get().initResult?.supportedPids ?? null,
+      // VIN oturuma yazılıyor: trend verisini araca bağlayan tek şey bu.
+      get().initResult?.vin ?? null,
+    );
 
     // Bağlantı/init sırasındaki satırlar kayıttan ÖNCE oluştu ama oturuma
     // ait bağlamın en değerli kısmı (protokol, GATT profili, desteklenen
@@ -953,10 +958,29 @@ export const useAppStore = create<AppState>((set, get) => ({
    */
   loadVitalTrends: async () => {
     try {
-      const latest = await repo.readLatestVitals();
+      /**
+       * Hangi arabanın trendi: bağlıysa şu an okunan VIN, değilse en son
+       * sürülen araba. Faults ekranı araca takılı olmadan da açılıyor ve o
+       * sırada canlı bir VIN yok — ama "en son sürdüğüm araba" sorunun
+       * doğru cevabı.
+       */
+      const vins = await repo.knownVins();
+      const vin = get().initResult?.vin ?? vins.latest;
+
+      if (vins.all.length > 1) {
+        appendLog(set, {
+          ts: Date.now(),
+          direction: 'info',
+          text: vin
+            ? `Trends scoped to VIN ${vin}; ${vins.all.length - 1} other vehicle(s) in the database are excluded.`
+            : `${vins.all.length} vehicles in the database and no VIN for this one — trends cannot be attributed.`,
+        });
+      }
+
+      const latest = await repo.readLatestVitals(vin);
       const trends = await Promise.all(
         latest.map(async (v) => {
-          const history = await repo.readVitalHistory(v.key);
+          const history = await repo.readVitalHistory(v.key, vin);
           const meta = VITAL_META[v.key];
           return {
             key: v.key,
@@ -1590,7 +1614,9 @@ async function recoverProtocol(
   });
   breadcrumb(`ecu silent ${seconds}s — reinit`);
   try {
-    const initResult = await initElm327(queue);
+    // VIN yeniden okunmuyor: araba değişmedi ve sorunlu bir bus'a
+    // gereksiz komut sormak kurtarmayı uzatır.
+    const initResult = await initElm327(queue, undefined, get().initResult?.vin ?? null);
     set({ initResult });
     get().poller?.resetAfterRecovery();
     appendLog(set, {

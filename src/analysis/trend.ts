@@ -22,6 +22,46 @@ export interface VitalPoint {
   /** Ölçümün alındığı an (epoch ms). */
   readonly at: number;
   readonly value: number;
+  /**
+   * Ölçümün alındığı aracın VIN'i. `null` = o sırada bilinmiyordu
+   * (VIN okuması eklenmeden önceki oturumlar, ya da Mode 09'u
+   * desteklemeyen ECU'lar).
+   */
+  readonly vin?: string | null;
+}
+
+/**
+ * Geçmişi TEK ARACA daraltır.
+ *
+ * Trendin sessiz düşmanı iki arabanın karışması: sayılar makul görünmeye
+ * devam eder, taban çizgisi ikisinin ortasına oturur, ve gerçek bir kayma
+ * artık gürültüye benzer. Kimse fark etmez.
+ *
+ * Kural, bilinmeyeni nasıl saydığında:
+ *
+ *   - Veritabanı tek bir VIN görmüşse (ya da hiç görmemişse), VIN'i
+ *     bilinmeyen noktalar O ARACA aittir. Uygulama bugüne kadar tek
+ *     arabaya takıldı; bu noktaları atmak, biriken bütün taban çizgisini
+ *     sırf sütun sonradan eklendi diye çöpe atmak olurdu.
+ *   - İkinci bir VIN göründüğü an bu varsayım çöker. O noktadan sonra
+ *     yalnızca VIN'i eşleşen noktalar kullanılır; bilinmeyenler HİÇBİR
+ *     araca sayılmaz, çünkü artık gerçekten bilinmiyorlar.
+ *
+ * İkinci kural bir miktar veri kaybettirir. Kaybettirmesi gerekiyor:
+ * yanlış arabanın ölçümünü seriye koymak, ölçümü hiç koymamaktan kötüdür.
+ */
+export function scopeToVehicle<T extends { vin?: string | null }>(
+  points: readonly T[],
+  currentVin: string | null,
+): T[] {
+  const seen = new Set<string>();
+  for (const p of points) {
+    if (p.vin) seen.add(p.vin);
+  }
+  if (currentVin) seen.add(currentVin);
+
+  if (seen.size <= 1) return [...points];
+  return points.filter((p) => p.vin != null && p.vin === currentVin);
 }
 
 export type TrendVerdict = 'baseline' | 'stable' | 'improving' | 'drifting';

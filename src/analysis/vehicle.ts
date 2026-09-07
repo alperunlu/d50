@@ -99,3 +99,23 @@ export const PHYSICS = {
   /** Benzin yoğunluğu (g/L). */
   gasolineDensityGPerL: 745,
 } as const;
+
+/**
+ * Profilin getirdiği ve türetilmiş sonuçları DOĞRUDAN belirleyen sayılar.
+ *
+ * Raporda yazıyor çünkü bu değerler ölçüm değil varsayım, ve rapordaki
+ * güç/tork/tüketim/yol yükü rakamlarının hepsi bunlara bağlı. Kütle 100 kg
+ * yanlışsa tork tahmini de o oranda yanlış — okuyan kişinin bunu görmesi,
+ * sonra keşfetmesinden iyi.
+ */
+export function profileAssumptions(v: VehicleProfile): string[] {
+  const t = v.fittedTyre;
+  return [
+    `mass ${v.massKg} kg`,
+    `displacement ${v.displacementL.toFixed(3)} L`,
+    `Cd ${v.dragCoefficient} over ${v.frontalAreaM2} m²`,
+    `rolling resistance ${v.rollingResistance}`,
+    `idle ${v.idleRpm} rpm`,
+    `tyres ${t.widthMm}/${t.aspectRatio} R${t.rimInch}`,
+  ];
+}

@@ -12,6 +12,7 @@ import {
   TYRE_OPTIONS,
 } from '../src/analysis/tyre';
 import type { TyreSize } from '../src/analysis/vehicle';
+import { decodeVin } from '../src/obd/vin';
 import { color, type, space, hairlineWidth } from '../src/ui/theme';
 
 /**
@@ -111,6 +112,23 @@ export default function LinkScreen() {
             <Fact label="Adapter" value={initResult.adapterInfo} />
             {bleProfileLabel ? <Fact label="GATT profile" value={bleProfileLabel} /> : null}
             <Fact label="Device" value={selectedDeviceName ?? selectedDeviceId ?? '—'} />
+            {/*
+              VIN burada duruyor çünkü bu ekranın işi "neye bağlıyım"
+              sorusunu cevaplamak, ve VIN o cevabın en kesin parçası:
+              adaptör markası değişebilir, araba değişmez.
+
+              Okunamadığında satır GİZLENMİYOR, "not available" yazıyor.
+              Boş bırakmak "bir sorun var" hissi verir; oysa 2003 model bir
+              aracın Mode 09'u desteklememesi normal ve bilinmesi gereken
+              bir şey — raporun neden varsayıma dayandığını o açıklıyor.
+            */}
+            <Fact
+              label="VIN"
+              value={initResult.vin ?? 'not available from this ECU'}
+            />
+            {initResult.vin ? (
+              <Fact label="From the VIN" value={vinSummary(initResult.vin)} />
+            ) : null}
           </View>
         )}
 
@@ -239,6 +257,22 @@ function TyreOption({
       </Text>
     </Pressable>
   );
+}
+
+/**
+ * VIN'den okunabilen kadarını tek satıra sıkıştırır.
+ *
+ * Kasıtlı olarak az: model yılı ve üretici VIN'in yapısından gelir ve
+ * doğrudur. Model, motor, donanım gelmez — onlar üreticinin çözüm
+ * tablosunda ve elimizde o tablo yok. Bilmediğini yazmayan bir satır,
+ * tahmin eden bir satırdan iyidir.
+ */
+function vinSummary(vin: string): string {
+  const info = decodeVin(vin);
+  if (!info) return '—';
+  const parts = [info.manufacturer, info.modelYear ? `model year ${info.modelYear}` : null];
+  const known = parts.filter((p): p is string => p !== null);
+  return known.length > 0 ? known.join(' · ') : `WMI ${info.wmi}`;
 }
 
 function Fact({ label, value }: { label: string; value: string }) {

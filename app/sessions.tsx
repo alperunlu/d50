@@ -19,6 +19,8 @@ import { runDiagnostics, type Finding } from '../src/analysis/diagnostics';
 import { buildReportHtml } from '../src/report/html';
 import { analyseTrend } from '../src/analysis/trend';
 import { VITAL_META } from '../src/analysis/vitals';
+import { profileAssumptions } from '../src/analysis/vehicle';
+import { decodeVin } from '../src/obd/vin';
 import { JS_BUILD_TAG } from '../src/ui/buildTag';
 import { useAppStore } from '../src/state/store';
 import { breadcrumb } from '../src/util/crashLog';
@@ -125,7 +127,9 @@ export default function TripsScreen() {
         // dahil, çünkü trend "bugün nerede" sorusunu da cevaplamalı.
         const vitals = await Promise.all(
           stored.map(async (v) => {
-            const history = await repo.readVitalHistory(v.key);
+            // Geçmiş bu oturumun ARACINA daraltılıyor: rapor o arabanın
+            // raporu, veritabanındaki her arabanın değil.
+            const history = await repo.readVitalHistory(v.key, session.vin);
             const meta = VITAL_META[v.key];
             return {
               key: v.key,
@@ -142,7 +146,15 @@ export default function TripsScreen() {
           sessionId: session.id,
           startedAt: session.startedAt,
           durationSec: session.endedAt ? (session.endedAt - session.startedAt) / 1000 : 0,
-          vehicle: vehicle.name,
+          vehicle: {
+            profileName: vehicle.name,
+            vin: session.vin,
+            // VIN'den yalnızca yapısının garanti ettiği kadarı çıkarılıyor;
+            // model ve motor üretici tablosu ister, elimizde yok.
+            manufacturer: session.vin ? (decodeVin(session.vin)?.manufacturer ?? null) : null,
+            modelYear: session.vin ? (decodeVin(session.vin)?.modelYear ?? null) : null,
+            assumptions: profileAssumptions(vehicle),
+          },
           buildTag: JS_BUILD_TAG,
           summary: summarizeTrip(series, vehicle),
           findings: runDiagnostics(series, vehicle),
