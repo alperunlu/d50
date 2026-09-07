@@ -1,12 +1,15 @@
 /**
  * Tek dosyalık HTML rapor.
  *
- * NEDEN HTML: gerçek PDF `expo-print` ister, o da native modül — mevcut
- * derlemede yok ve OTA ile gelemez. HTML bugün çalışıyor ve iOS paylaşım
- * sayfasındaki "Print → Save as PDF" ile kullanıcı zaten PDF alabiliyor.
- * Yapı, `expo-print` bir sonraki derlemeye girdiğinde aynı HTML'in tek
- * satırla PDF'e verilebileceği şekilde: içeride hiçbir dış kaynak yok,
- * stil gömülü, sayfa kırılmaları CSS'te tanımlı.
+ * NEDEN HTML — ve neden öyle KALIYOR: PDF üretmek `expo-print` isterdi,
+ * yani bir native modül ve yeni bir derleme. Denendi ve gerek olmadığına
+ * karar verildi (6 Eylül 2026): iOS paylaşım sayfasındaki "Print → Save as
+ * PDF" aynı işi zaten yapıyor, üstelik HTML telefonda, tarayıcıda ve
+ * e-postada doğrudan açılıyor — PDF'in olmadığı bir esneklik.
+ *
+ * Yani burası eksik bir adım değil, verilmiş bir karar. Dosya buna göre
+ * yazıldı: dış kaynak yok, stil gömülü, sayfa kırılmaları CSS'te tanımlı,
+ * tek dosya kendi kendine yetiyor.
  *
  * Rapor iki soruyu cevaplıyor:
  *   1. Bu cycle'da ne ölçüldü, hangi koşulda? (kanıtla birlikte)
