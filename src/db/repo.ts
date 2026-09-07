@@ -302,3 +302,20 @@ export async function readSkippedSteps(sessionId: number): Promise<string[]> {
   );
   return rows.map((r) => r.step_id);
 }
+
+/**
+ * Her vital'in EN SON ölçümü.
+ *
+ * Trend geçmişin tamamına bakıyor ama ekranda gösterilecek "şu anki değer"
+ * sonuncusu. Tek sorguda alınıyor: cycle sayısı arttıkça ekran açılışı
+ * yavaşlamasın.
+ */
+export async function readLatestVitals(): Promise<{ key: string; value: number; unit: string }[]> {
+  const db = await getDb();
+  return db.getAllAsync<{ key: string; value: number; unit: string }>(
+    `SELECT v.key, v.value, v.unit
+       FROM cycle_vitals v
+       JOIN (SELECT key, MAX(recorded_at) AS latest FROM cycle_vitals GROUP BY key) m
+         ON m.key = v.key AND m.latest = v.recorded_at`,
+  );
+}

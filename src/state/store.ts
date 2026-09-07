@@ -50,7 +50,8 @@ import {
 import { orderedCards, moveInOrder } from '../data/cardOrder';
 import { CYCLE_STEPS, channelKeysForStep } from '../cycle/steps';
 import { evaluateStep, nextHeldSince, type StepProgress } from '../cycle/engine';
-import { extractVitals, cycleContext } from '../analysis/vitals';
+import { extractVitals, cycleContext, VITAL_META } from '../analysis/vitals';
+import { analyseTrend, type Trend } from '../analysis/trend';
 import { groupSeries } from '../analysis/derived';
 import {
   sensorGroupsForChannels,
@@ -139,6 +140,21 @@ interface AppState {
     /** Kullanıcının atladığı adımların id'leri — raporda "ölçülmedi" der. */
     readonly skipped: readonly string[];
   } | null;
+  /**
+   * Vital trendleri — cycle'lar biriktikçe dolan tablo.
+   *
+   * Uygulama açılışında ve her cycle bitiminde yükleniyor; DB'den okuma
+   * ekranda değil burada yapılıyor ki Faults ekranı saf kalsın.
+   */
+  vitalTrends: readonly {
+    readonly key: string;
+    readonly label: string;
+    readonly unit: string;
+    readonly value: number;
+    readonly trend: Trend;
+  }[];
+  loadVitalTrends: () => Promise<void>;
+
   startCycle: () => Promise<void>;
   /** Sıradaki adıma geç. Koşul sağlanmasa da geçer (kullanıcı "Atla" derse). */
   advanceCycle: (skipped: boolean) => void;
@@ -352,6 +368,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   isRecording: false,
   recordingGaps: [],
   cycle: null,
+  vitalTrends: [],
   currentSession: null,
   liveSeries: {},
   sampleRate: 0,
@@ -925,6 +942,30 @@ export const useAppStore = create<AppState>((set, get) => ({
    * bir turda lambda sondası 0.29 Hz sorulabiliyordu ve Nyquist yüzünden
    * salınımı görünmüyordu; üç kanallık bir adımda dört kat hızlı sorulur.
    */
+  loadVitalTrends: async () => {
+    try {
+      const latest = await repo.readLatestVitals();
+      const trends = await Promise.all(
+        latest.map(async (v) => {
+          const history = await repo.readVitalHistory(v.key);
+          const meta = VITAL_META[v.key];
+          return {
+            key: v.key,
+            label: meta?.label ?? v.key,
+            unit: v.unit,
+            value: v.value,
+            trend: analyseTrend(history, meta?.betterWhen ?? 'stable'),
+          };
+        }),
+      );
+      // Önce dikkat isteyenler: ekranı yukarıdan okuyan önce onları görsün.
+      const rank = { drifting: 0, improving: 1, stable: 2, baseline: 3 } as const;
+      set({ vitalTrends: trends.sort((a, b) => rank[a.trend.verdict] - rank[b.trend.verdict]) });
+    } catch {
+      // Trend gösterememek uygulamayı durdurmamalı.
+    }
+  },
+
   startCycle: async () => {
     if (get().isRecording) throw new Error('Stop the current recording first');
     /**
@@ -1031,6 +1072,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         direction: 'info',
         text: `Cycle finished — ${vitals.length} vitals recorded for trending`,
       });
+      await get().loadVitalTrends();
     } catch (e) {
       appendLog(set, {
         ts: Date.now(),
