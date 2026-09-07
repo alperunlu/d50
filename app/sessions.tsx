@@ -132,6 +132,7 @@ export default function TripsScreen() {
               label: meta?.label ?? v.key,
               value: v.value,
               unit: v.unit,
+              source: v.source,
               trend: analyseTrend(history, meta?.betterWhen ?? 'stable'),
             };
           }),

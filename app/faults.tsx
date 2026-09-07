@@ -31,8 +31,8 @@ export default function FaultsScreen() {
   const loadVitalTrends = useAppStore((s) => s.loadVitalTrends);
 
   /**
-   * Trendler bağlantı gerektirmiyor — geçmiş cycle'lardan geliyorlar.
-   * Ekran her açıldığında tazeleniyor ki yeni biten bir cycle hemen görünsün.
+   * Trendler bağlantı gerektirmiyor — geçmiş kayıtlardan geliyorlar.
+   * Ekran her açıldığında tazeleniyor ki yeni biten bir kayıt hemen görünsün.
    */
   useFocusEffect(
     useCallback(() => {
@@ -266,7 +266,7 @@ function Readiness({ readiness }: { readiness: ReadinessStatus }) {
  *
  * Faults ekranında duruyor çünkü bu ekranın sorusu "arabamda bir sorun var
  * mı?". Arıza kodu o sorunun geç cevabı; kayan bir vital erken cevabı.
- * Bağlantı da gerekmiyor: veriler geçmiş cycle'lardan geliyor, araca
+ * Bağlantı da gerekmiyor: veriler geçmiş kayıtlardan geliyor, araca
  * takılı olmasan da okunuyor.
  *
  * Kasıtlı olarak SESSİZ: taban çizgisi kurulmamış ölçümler ve sabit
@@ -281,11 +281,12 @@ function TrendSection({
   if (trends.length === 0) {
     return (
       <View style={{ marginBottom: space(5) }}>
-        <SectionRule label="Trends" meta="No cycles yet" />
+        <SectionRule label="Trends" meta="Nothing recorded yet" />
         <Note>
-          Run the guided test cycle from Live. Each one records the same measurements under the
-          same conditions, and after a few of them this section starts showing which of them are
-          moving.
+          Most of these readings come out of ordinary recordings on their own — a cold start, a
+          wait at a red light, a steady stretch of road are all the app needs. The guided cycle
+          from Live sets those conditions deliberately and is the only way to reach the oxygen
+          sensor ones. After a few recordings this section starts showing which are moving.
         </Note>
       </View>
     );
@@ -328,8 +329,8 @@ function TrendSection({
       ) : null}
 
       <Note>
-        Trends compare this car against its own earlier cycles, not against other cars, and they
-        do not predict when something will fail.
+        Trends compare this car against its own earlier readings taken under the same conditions,
+        not against other cars, and they do not predict when something will fail.
       </Note>
     </View>
   );

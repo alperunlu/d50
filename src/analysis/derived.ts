@@ -274,7 +274,7 @@ export function idleSamples(
  * ölçümü uydurmak olurdu. İkili arama; uzun kayıtlarda kareli maliyet
  * bırakmamak için (bkz. nearestValue'daki not).
  */
-function valueAtOrBefore(
+export function valueAtOrBefore(
   series: readonly TimeSeriesPoint[],
   ts: number,
   maxAgeMs: number,

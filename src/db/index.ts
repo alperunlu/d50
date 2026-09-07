@@ -99,7 +99,14 @@ async function openAndMigrate(): Promise<SQLite.SQLiteDatabase> {
       recorded_at INTEGER NOT NULL,
       -- Ölçümün koşulu (ör. emme havası sıcaklığı): mevsim etkisini
       -- ayıklayabilmek için. Onsuz kışın kötüleşen her şey kış olabilir.
-      context TEXT
+      context TEXT,
+      -- Koşulu KİM kurdu: 'cycle' rehberli adım, 'drive' sıradan bir
+      -- sürüşten veriye bakarak bulunmuş pencere. İkisi aynı seriye
+      -- giriyor çünkü ölçtükleri koşul aynı, ama ayırt edilebilir
+      -- kalmaları gerekiyor: fırsatçı pencere daha gürültülü, ve ileride
+      -- "yalnızca cycle noktalarına bak" demek istenirse veri kaybolmuş
+      -- olmasın.
+      source TEXT NOT NULL DEFAULT 'cycle'
     );
 
     CREATE INDEX IF NOT EXISTS idx_cycle_vitals_key
@@ -107,6 +114,7 @@ async function openAndMigrate(): Promise<SQLite.SQLiteDatabase> {
   `);
 
   await migrateSupportedPids(db);
+  await migrateVitalSource(db);
 
   return db;
 }
@@ -129,4 +137,19 @@ async function migrateSupportedPids(db: SQLite.SQLiteDatabase): Promise<void> {
   const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(sessions)');
   if (columns.some((c) => c.name === 'supported_pids')) return;
   await db.execAsync('ALTER TABLE sessions ADD COLUMN supported_pids TEXT');
+}
+
+/**
+ * `cycle_vitals.source` sütunu — ölçümün cycle adımından mı yoksa sıradan
+ * bir sürüşten çıkarılmış pencereden mi geldiği.
+ *
+ * `supported_pids` ile aynı gerekçe ve aynı yöntem: SQLite'ta
+ * "ADD COLUMN IF NOT EXISTS" yok. Eski satırlar DEFAULT 'cycle' alır ve bu
+ * doğrudur — sütun eklenmeden önce yazılmış her vital gerçekten bir
+ * cycle'dan gelmişti.
+ */
+async function migrateVitalSource(db: SQLite.SQLiteDatabase): Promise<void> {
+  const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(cycle_vitals)');
+  if (columns.some((c) => c.name === 'source')) return;
+  await db.execAsync("ALTER TABLE cycle_vitals ADD COLUMN source TEXT NOT NULL DEFAULT 'cycle'");
 }

@@ -50,7 +50,7 @@ import {
 import { orderedCards, moveInOrder } from '../data/cardOrder';
 import { CYCLE_STEPS, channelKeysForStep } from '../cycle/steps';
 import { evaluateStep, nextHeldSince, type StepProgress } from '../cycle/engine';
-import { extractVitals, cycleContext, VITAL_META } from '../analysis/vitals';
+import { extractVitals, detectWindows, cycleContext, VITAL_META } from '../analysis/vitals';
 import { analyseTrend, type Trend } from '../analysis/trend';
 import { groupSeries } from '../analysis/derived';
 import {
@@ -307,6 +307,15 @@ let recordingContext: { sessionId: number; startedAt: number; queue: CommandQueu
 let cycleWindows: { stepId: string; fromMs: number; toMs: number; skipped: boolean }[] = [];
 /** Şu anki adımın kayıt içindeki başlangıcı (ms, oturum başına göre). */
 let cycleStepFromMs = 0;
+/**
+ * `stopCycle` vitals'ı kendisi çıkaracak — `stopRecording` karışmasın.
+ *
+ * `stopCycle` kaydı durdurmak için `stopRecording`'i çağırıyor, ve
+ * `stopRecording` artık cycle olmayan kayıtlardan fırsatçı pencere
+ * çıkarıyor. Bayrak olmadan bir cycle'ın sonunda aynı oturum iki kez
+ * işlenir ve aynı ölçüm trende iki nokta olarak girerdi.
+ */
+let cycleExtractionPending = false;
 /** Cycle adımlarını ilerleten sayaç. */
 let cycleTimer: ReturnType<typeof setInterval> | null = null;
 /** Akü voltajı ATRV ile ayrı ritimde okunuyor (bkz. pollAdapterVoltage). */
@@ -1054,6 +1063,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const sessionId = get().currentSession?.id ?? null;
     const windows = [...cycleWindows];
     set({ cycle: null });
+    cycleExtractionPending = true;
     await get().stopRecording();
 
     /**
@@ -1061,7 +1071,10 @@ export const useAppStore = create<AppState>((set, get) => ({
      * diske yazılmış olsun. Çıkarım başarısız olursa kayıt yine de
      * duruyor — ham örnekler DB'de, trend sonradan hesaplanabilir.
      */
-    if (sessionId === null || windows.length === 0) return;
+    if (sessionId === null || windows.length === 0) {
+      cycleExtractionPending = false;
+      return;
+    }
     try {
       const samples = await repo.readSamples(sessionId);
       const series = groupSeries(samples);
@@ -1081,6 +1094,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       });
     } finally {
       cycleWindows = [];
+      cycleExtractionPending = false;
     }
   },
 
@@ -1106,6 +1120,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       } s`,
     );
     set({ poller: null, isRecording: false, cycle: null });
+
+    // Cycle'ın kendi çıkarımı varsa ona dokunma; yoksa sıradan kayıttan
+    // ne çıkıyorsa onu al. Yarıda kesilen bir cycle da buraya düşer —
+    // adım pencereleri kaydedilmemiş olur ama koşullar veride durur, ve
+    // kurtarılabilen ölçümü atmanın bir gerekçesi yok.
+    if (!cycleExtractionPending && currentSession) {
+      await extractDriveVitals(currentSession.id, set, get);
+    }
   },
 
   clearLog: () => set({ rawLog: [] }),
@@ -1425,6 +1447,55 @@ function stopCycleTicker(): void {
  * Adımın kanal setini uygular: poller yeniden kurulur, sensör grupları
  * değiştiyse logger da. Oturum ve zaman tabanı korunur.
  */
+/**
+ * Sıradan bir kayıttan vitals çıkarır.
+ *
+ * NEDEN: trendin ihtiyacı cycle değil, koşulun aynı olması. Sekiz vital'in
+ * altısının koşulu her sürüşte kendiliğinden oluşuyor — sıcak rölanti her
+ * kırmızı ışıkta, soğuk rölanti günün ilk çalıştırmasında. `detectWindows`
+ * bu anları veriden buluyor, `extractVitals` değişmeden onların üstünde
+ * çalışıyor. Böylece taban çizgisi ayda bir yapılan cycle'lardan değil,
+ * her günkü sürüşten birikiyor.
+ *
+ * Kalan iki vital (lambda sondası) buradan çıkmıyor ve çıkmamalı: normal
+ * bir turda sonda Nyquist sınırının altında örnekleniyor, ölçüm sondayı
+ * değil poller'ı ölçerdi. Kapı `extractVitals` içinde, burada değil.
+ *
+ * Hata hâlinde SESSİZ değil ama engelleyici de değil: kayıt zaten diskte,
+ * ham örnekler duruyor, çıkarım sonradan tekrarlanabilir.
+ */
+async function extractDriveVitals(
+  sessionId: number,
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): Promise<void> {
+  try {
+    const samples = await repo.readSamples(sessionId);
+    const series = groupSeries(samples);
+    const windows = detectWindows(series, get().vehicle);
+    if (windows.length === 0) return;
+
+    const vitals = extractVitals(series, windows, get().vehicle);
+    if (vitals.length === 0) return;
+
+    await repo.saveCycleResult(sessionId, windows, vitals, cycleContext(series, windows), 'drive');
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'info',
+      text: `Drive recorded ${vitals.length} vitals for trending (${windows
+        .map((w) => w.stepId)
+        .join(', ')})`,
+    });
+    await get().loadVitalTrends();
+  } catch (e) {
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'error',
+      text: `Could not extract drive vitals: ${e instanceof Error ? e.message : String(e)}`,
+    });
+  }
+}
+
 function applyStepChannels(
   step: (typeof CYCLE_STEPS)[number],
   set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,

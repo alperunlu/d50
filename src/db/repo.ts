@@ -249,6 +249,11 @@ export async function saveCycleResult(
   windows: readonly { stepId: string; fromMs: number; toMs: number; skipped: boolean }[],
   vitals: readonly { key: string; value: number; unit: string }[],
   context: string | null,
+  /**
+   * Koşulu kimin kurduğu. 'cycle' rehberli adımlar, 'drive' sıradan bir
+   * kayıttan veriye bakarak bulunmuş pencereler (bkz. `detectWindows`).
+   */
+  source: VitalSource = 'cycle',
 ): Promise<void> {
   return serialize(async () => {
     const db = await getDb();
@@ -262,35 +267,57 @@ export async function saveCycleResult(
       }
       for (const v of vitals) {
         await db.runAsync(
-          'INSERT INTO cycle_vitals (session_id, key, value, unit, recorded_at, context) VALUES (?, ?, ?, ?, ?, ?)',
-          sessionId, v.key, v.value, v.unit, recordedAt, context,
+          'INSERT INTO cycle_vitals (session_id, key, value, unit, recorded_at, context, source) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          sessionId, v.key, v.value, v.unit, recordedAt, context, source,
         );
       }
     });
   });
 }
 
-/** Bir vital'in bütün geçmişi, eskiden yeniye. Trend bunun üstüne kuruluyor. */
+/** Ölçümün koşulunu kimin kurduğu. */
+export type VitalSource = 'cycle' | 'drive';
+
+/**
+ * Bir vital'in bütün geçmişi, eskiden yeniye. Trend bunun üstüne kuruluyor.
+ *
+ * Cycle ve sürüş noktaları BİRLİKTE dönüyor: ikisi de aynı koşulu ölçüyor
+ * ve trendin gücü nokta sayısından geliyor. `source` yine de taşınıyor —
+ * bir noktanın nereden geldiği, sonradan sorulacak ilk sorudur.
+ */
 export async function readVitalHistory(
   key: string,
-): Promise<{ at: number; value: number; sessionId: number }[]> {
+): Promise<{ at: number; value: number; sessionId: number; source: VitalSource }[]> {
   const db = await getDb();
-  const rows = await db.getAllAsync<{ recorded_at: number; value: number; session_id: number }>(
-    'SELECT recorded_at, value, session_id FROM cycle_vitals WHERE key = ? ORDER BY recorded_at ASC',
+  const rows = await db.getAllAsync<{
+    recorded_at: number;
+    value: number;
+    session_id: number;
+    source: string | null;
+  }>(
+    'SELECT recorded_at, value, session_id, source FROM cycle_vitals WHERE key = ? ORDER BY recorded_at ASC',
     key,
   );
-  return rows.map((r) => ({ at: r.recorded_at, value: r.value, sessionId: r.session_id }));
+  return rows.map((r) => ({
+    at: r.recorded_at,
+    value: r.value,
+    sessionId: r.session_id,
+    source: r.source === 'drive' ? 'drive' : 'cycle',
+  }));
 }
 
 /** Bir oturumun vitals'ı — raporda o cycle'ın kendi tablosu için. */
 export async function readSessionVitals(
   sessionId: number,
-): Promise<{ key: string; value: number; unit: string }[]> {
+): Promise<{ key: string; value: number; unit: string; source: VitalSource }[]> {
   const db = await getDb();
-  return db.getAllAsync<{ key: string; value: number; unit: string }>(
-    'SELECT key, value, unit FROM cycle_vitals WHERE session_id = ?',
-    sessionId,
-  );
+  const rows = await db.getAllAsync<{
+    key: string;
+    value: number;
+    unit: string;
+    source: string | null;
+  }>('SELECT key, value, unit, source FROM cycle_vitals WHERE session_id = ?', sessionId);
+  return rows.map((r) => ({ ...r, source: r.source === 'drive' ? 'drive' : 'cycle' }));
 }
 
 /** Bir oturumda atlanan cycle adımlarının id'leri. */
