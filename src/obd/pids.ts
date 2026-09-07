@@ -41,17 +41,33 @@ export interface PidDefinition {
   readonly decode: (b: readonly number[]) => number;
   /** CSV sütun adı (ASCII, boşluksuz). */
   readonly csvKey: string;
-  /** Poller önceliği. Belirtilmezse 'fast' sayılır. */
+  /**
+   * Değerin hızlı mı yavaş mı değiştiği.
+   *
+   * ARTIK SIRALAMA İÇİN KULLANILMIYOR (bkz. `targetIntervalMs`). Yalnızca
+   * CSV dışa aktarımında kalıyor: yavaş bir kanalın boşluğu "ölçülmedi"
+   * değil "değer hâlâ geçerli" demek ve forward-fill ediliyor.
+   */
   readonly refresh: RefreshClass;
   /**
-   * Bir turda kaç kez sorulacağı. Varsayılan 1.
+   * Bu kanalın İHTİYAÇ DUYDUĞU örnekleme aralığı (ms).
    *
-   * Bütün "hızlı" PID'ler eşit hızlı değil: devir ve hız saniyede birkaç
-   * kez değişirken gaz kelebeği ve yakıt düzeltmesi çok daha yavaş hareket
-   * eder. Kıt K-line kapasitesini eşit bölmek, en çok ihtiyaç duyulan iki
-   * kanalı gereğinden seyrek örneklemek demekti.
+   * NEDEN AĞIRLIK DEĞİL DE ARALIK: `weight: 2` tartışılamaz bir sayıdır —
+   * neye göre 2? Aralık ise fizikten gelir ve yanlışsa yanlışlığı
+   * gösterilebilir: "MAP 500 ms, çünkü rölanti vakumu ~1 Hz dalgalanıyor
+   * ve Nyquist iki katını istiyor".
+   *
+   * Poller her adımda hedefine göre EN ÇOK GECİKMİŞ kanalı sorar. Bunun
+   * ağırlıklı sıraya göre iki üstünlüğü var, ikisi de 7 Eylül 2026
+   * kaydında pahalıya mal olan şeyler:
+   *
+   *   1. Açlık yapısal olarak imkânsız. Sorulmayan kanalın gecikmesi
+   *      sınırsız büyür, er geç birinci olur. O kayıtta MAP 25 saniyede
+   *      bir okundu ve kendi başına geri çıkamadı.
+   *   2. Bütçe yetmediğinde herkes ORANTILI yavaşlar. Ağırlıklı sırada
+   *      ise sıranın sonundaki kanal tek başına çöküyordu.
    */
-  readonly weight?: number;
+  readonly targetIntervalMs: number;
 }
 
 export const PIDS: readonly PidDefinition[] = [
@@ -64,9 +80,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 2,
     csvKey: 'rpm',
     refresh: 'fast',
-    // Devir her şeyin referansı: 0-100 ölçümü, rölanti kararlılığı ve
-    // order takibi hep buna dayanıyor. Turda iki kez soruluyor.
-    weight: 2,
+    // devir her şeyin referansı: rölanti σ, 0-100 ve order takibi
+    targetIntervalMs: 250,
     decode: ([a, b]) => (a * 256 + b) / 4,
   },
   {
@@ -77,9 +92,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'speed_kmh',
     refresh: 'fast',
-    // Hızın türevi ivme, ivmenin türevi güç/tork tahmini: seyrek
-    // örneklenirse üçü birden bozuluyor.
-    weight: 2,
+    // hızın türevi ivme, ivmeninki güç tahmini — seyrek örnek üçünü de bozar
+    targetIntervalMs: 250,
     decode: ([a]) => a,
   },
   {
@@ -90,6 +104,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'throttle_pct',
     refresh: 'fast',
+    // sürücü girdisi; debriyaj kaçırma tespiti gaz sıçramasını yakalamalı
+    targetIntervalMs: 500,
     decode: ([a]) => (a * 100) / 255,
   },
   {
@@ -100,6 +116,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'engine_load_pct',
     refresh: 'fast',
+    // yük gaz kelebeği kadar hızlı sıçramaz
+    targetIntervalMs: 1000,
     decode: ([a]) => (a * 100) / 255,
   },
   {
@@ -110,6 +128,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 2,
     csvKey: 'maf_gs',
     refresh: 'fast',
+    // hava kütlesi yükle birlikte hareket eder (bu araçta desteklenmiyor)
+    targetIntervalMs: 500,
     decode: ([a, b]) => (a * 256 + b) / 100,
   },
   {
@@ -120,6 +140,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'map_kpa',
     refresh: 'fast',
+    // rölanti vakumu ~1 Hz dalgalanır; Nyquist iki katını ister
+    targetIntervalMs: 500,
     decode: ([a]) => a,
   },
   {
@@ -130,6 +152,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'timing_advance_deg',
     refresh: 'fast',
+    // avans haritadan gelir, kademeli değişir
+    targetIntervalMs: 1000,
     decode: ([a]) => a / 2 - 64,
   },
   {
@@ -140,6 +164,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'stft_pct',
     refresh: 'fast',
+    // kapalı çevrim düzeltmesi saniye mertebesinde hareket eder
+    targetIntervalMs: 1000,
     decode: ([a]) => (a * 100) / 128 - 100,
   },
   {
@@ -150,6 +176,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 2,
     csvKey: 'abs_load_pct',
     refresh: 'fast',
+    // mutlak yük, yükle aynı bantta
+    targetIntervalMs: 1000,
     decode: ([a, b]) => ((a * 256 + b) * 100) / 255,
   },
 
@@ -162,6 +190,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'coolant_c',
     refresh: 'slow',
+    // soğutma suyu termal kütle: dakikalar içinde değişir
+    targetIntervalMs: 10000,
     decode: ([a]) => a - 40,
   },
   {
@@ -172,6 +202,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'intake_air_c',
     refresh: 'slow',
+    // emme havası da termal, ama motor ısındıkça kayar
+    targetIntervalMs: 10000,
     decode: ([a]) => a - 40,
   },
   {
@@ -182,6 +214,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'fuel_level_pct',
     refresh: 'slow',
+    // yakıt seviyesi bir depoluk sürüşte yavaşça düşer
+    targetIntervalMs: 30000,
     decode: ([a]) => (a * 100) / 255,
   },
   {
@@ -192,6 +226,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'ltft_pct',
     refresh: 'slow',
+    // uzun dönem düzeltme dakikalar içinde öğrenir
+    targetIntervalMs: 10000,
     decode: ([a]) => (a * 100) / 128 - 100,
   },
   {
@@ -202,6 +238,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'baro_kpa',
     refresh: 'slow',
+    // barometre yalnızca rakımla değişir
+    targetIntervalMs: 30000,
     decode: ([a]) => a,
   },
   {
@@ -212,6 +250,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 2,
     csvKey: 'module_voltage_v',
     refresh: 'slow',
+    // modül gerilimi yükle salınır ama trend için 0.2 Hz yeter
+    targetIntervalMs: 5000,
     decode: ([a, b]) => (a * 256 + b) / 1000,
   },
   {
@@ -222,6 +262,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 1,
     csvKey: 'ambient_air_c',
     refresh: 'slow',
+    // dış hava sıcaklığı
+    targetIntervalMs: 30000,
     decode: ([a]) => a - 40,
   },
   {
@@ -232,6 +274,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 2,
     csvKey: 'run_time_s',
     refresh: 'slow',
+    // çalışma süresi zaten monoton artıyor
+    targetIntervalMs: 10000,
     decode: ([a, b]) => a * 256 + b,
   },
   {
@@ -242,6 +286,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 2,
     csvKey: 'distance_mil_km',
     refresh: 'slow',
+    // MIL mesafesi km mertebesinde değişir
+    targetIntervalMs: 30000,
     decode: ([a, b]) => a * 256 + b,
   },
   /**
@@ -262,6 +308,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 2,
     csvKey: 'o2_b1s1_v',
     refresh: 'fast',
+    // sonda 0.5-2 Hz salınır; Nyquist en az 4 Hz ister — cycle dar adımı bunun için
+    targetIntervalMs: 250,
     decode: ([a]) => a / 200,
   },
   {
@@ -272,6 +320,8 @@ export const PIDS: readonly PidDefinition[] = [
     bytes: 2,
     csvKey: 'o2_b1s2_v',
     refresh: 'fast',
+    // katalizör sonrası sonda tanım gereği yavaş salınır
+    targetIntervalMs: 500,
     decode: ([a]) => a / 200,
   },
 ];
@@ -282,9 +332,19 @@ export function getPidDefinition(pid: string): PidDefinition | undefined {
   return BY_PID.get(pid.toUpperCase());
 }
 
-/** `01XX` biçimindeki tam komutu üretir. */
-export function commandFor(pid: PidDefinition): string {
-  return `01${pid.pid}`;
+/**
+ * `01XX` biçimindeki tam komutu üretir.
+ *
+ * `expectedReplies` verilirse sonuna eklenir (`010C1`): ELM327 o kadar
+ * cevap gelince beklemeyi keser. Bu araçta tek ECU var, o yüzden 1 doğru
+ * sayı — ve zaten çok cevap gelse de ilk eşleşen satır kullanılıyordu
+ * (bkz. extractDataHex), yani veri kaybı yok, yalnızca bekleme kalkıyor.
+ *
+ * Adaptörün son eki desteklediği bağlantı başında SINANIYOR; desteklemeyen
+ * bir klonda `undefined` geçilir ve komut eski biçiminde gider.
+ */
+export function commandFor(pid: PidDefinition, expectedReplies?: number): string {
+  return `01${pid.pid}${expectedReplies ?? ''}`;
 }
 
 /**
