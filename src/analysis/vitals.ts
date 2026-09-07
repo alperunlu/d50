@@ -16,7 +16,7 @@
  */
 
 import type { SeriesMap, TimeSeriesPoint } from './derived';
-import { idleSamples } from './derived';
+import { idleSamples, idleStabilityRpm } from './derived';
 import { MINI_R50, type VehicleProfile } from './vehicle';
 
 /** Bir cycle adımının kayıt içindeki zaman aralığı (ms, oturum başına göre). */
@@ -147,8 +147,8 @@ export function extractVitals(
   if (coldIdle) {
     const rpm = within(series['0C'] ?? [], coldIdle);
     const speed = within(series['0D'] ?? [], coldIdle);
-    const idle = idleSamples(rpm, speed, vehicle).map((p) => p.value);
-    const sd = stdDev(idle);
+    const idle = idleSamples(rpm, speed, vehicle);
+    const sd = idleStabilityRpm(idle);
     if (sd !== null && idle.length >= 10) {
       push(vital('cold_idle_rpm_sd', sd, 'cold-idle'));
     }
@@ -159,8 +159,8 @@ export function extractVitals(
   if (warmIdle) {
     const rpm = within(series['0C'] ?? [], warmIdle);
     const speed = within(series['0D'] ?? [], warmIdle);
-    const idle = idleSamples(rpm, speed, vehicle).map((p) => p.value);
-    const sd = stdDev(idle);
+    const idle = idleSamples(rpm, speed, vehicle);
+    const sd = idleStabilityRpm(idle);
     if (sd !== null && idle.length >= 10) {
       push(vital('warm_idle_rpm_sd', sd, 'warm-idle'));
     }

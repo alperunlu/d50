@@ -927,15 +927,27 @@ export const useAppStore = create<AppState>((set, get) => ({
    */
   startCycle: async () => {
     if (get().isRecording) throw new Error('Stop the current recording first');
+    /**
+     * Oturum BÜTÜN adımların kanallarını kaydediyor, poller ise yalnızca
+     * o anki adımınkini soruyor.
+     *
+     * İkisi karıştırılmıştı: oturumun kanal listesi ilk adımdan alınıyordu
+     * ve o adım yalnızca devir soruyor. 7 Eylül 2026 kaydında CSV üç sütuna
+     * indi (zaman, devir, voltaj) — oysa soğutma suyu, MAP, lambda, GPS ve
+     * mikrofon verisi veritabanında duruyordu ve rapor onları kullanıyordu.
+     * Sütun listesi neyin ÖLÇÜLDÜĞÜNÜ anlatmalı, ilk adımda ne sorulduğunu
+     * değil.
+     */
+    const allPids = [...new Set(CYCLE_STEPS.flatMap((s) => s.channels.pids))];
+    const allSensors = [...new Set(CYCLE_STEPS.flatMap((s) => s.channels.sensors))];
     const first = CYCLE_STEPS[0];
-    await get().startRecording({
-      pids: first.channels.pids,
-      sensors: first.channels.sensors,
-    });
+    await get().startRecording({ pids: allPids, sensors: allSensors });
+    // Kayıt geniş başladı; poller hemen ilk adımın dar setine iniyor.
+    applyStepChannels(first, set, get);
     set({
       cycle: {
         stepIndex: 0,
-        progress: evaluateStep(first, {}, null, Date.now()),
+        progress: evaluateStep(first, {}, null, Date.now(), 0),
         skipped: [],
       },
     });
@@ -984,7 +996,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({
       cycle: {
         stepIndex: nextIndex,
-        progress: evaluateStep(next, {}, null, Date.now()),
+        progress: evaluateStep(next, {}, null, Date.now(), 0),
         skipped: skipped ? [...state.skipped, current.id] : state.skipped,
       },
     });
@@ -1348,7 +1360,8 @@ function startCycleTicker(
     if (!state) return;
     const step = CYCLE_STEPS[state.stepIndex];
     const now = Date.now();
-    const progress = evaluateStep(step, get().liveSeries, cycleHeldSince, now);
+    const elapsedMs = recordingContext ? now - recordingContext.startedAt : 0;
+    const progress = evaluateStep(step, get().liveSeries, cycleHeldSince, now, elapsedMs);
     cycleHeldSince = nextHeldSince(progress, cycleHeldSince, now);
 
     set((s) => (s.cycle ? { cycle: { ...s.cycle, progress } } : {}));
@@ -1430,7 +1443,61 @@ function buildPoller(
         direction: 'info',
         text: `PID ${pid} did not answer ${failures}x — polling it less often`,
       }),
+    onSilence: (seconds) => void recoverProtocol(seconds, queue, set, get),
   });
+}
+
+/** Aynı anda iki kurtarma çalışmasın. */
+let recovering = false;
+
+/**
+ * ECU sustuğunda protokolü yeniden kurar.
+ *
+ * 7 Eylül 2026 saha testi: kayıt 563. saniyede sessizleşti, 782 kez
+ * `NO DATA` geldi ve kalan 12 dakika boşa gitti. O sırada `ATRV` cevap
+ * veriyordu — yani BLE de adaptör de sağlamdı, kopan yalnızca ELM327'nin
+ * araçla kurduğu protokoldü. Bunun ilacı bağlantıyı komple kurmak değil,
+ * init dizisini tekrarlamak: ATZ, protokol seçimi ve 0100.
+ *
+ * Kayıt BÖLÜNMÜYOR: aynı oturum, aynı zaman ekseni, aynı poller. Yalnızca
+ * araya birkaç saniyelik bir init giriyor ve o boşluk log'a yazılıyor.
+ */
+async function recoverProtocol(
+  seconds: number,
+  queue: CommandQueue,
+  set: (partial: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void,
+  get: () => AppState,
+): Promise<void> {
+  if (recovering) return;
+  recovering = true;
+  appendLog(set, {
+    ts: Date.now(),
+    direction: 'error',
+    text: `No channel answered for ${seconds} s — reinitialising the adapter protocol`,
+  });
+  breadcrumb(`ecu silent ${seconds}s — reinit`);
+  try {
+    const initResult = await initElm327(queue);
+    set({ initResult });
+    get().poller?.resetAfterRecovery();
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'info',
+      text: `Protocol re-established: ${initResult.protocolNumber}, ${initResult.adapterInfo}`,
+    });
+  } catch (e) {
+    appendLog(set, {
+      ts: Date.now(),
+      direction: 'error',
+      text:
+        `Could not re-establish the protocol: ${e instanceof Error ? e.message : String(e)}. ` +
+        'Recording continues; unplug and replug the adapter if this persists.',
+    });
+    // Bir sonraki sessizlik eşiğinde yeniden denensin.
+    get().poller?.resetAfterRecovery();
+  } finally {
+    recovering = false;
+  }
 }
 
 /** Verilen sensör gruplarıyla bir logger kurar. Grup yoksa `null`. */

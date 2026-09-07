@@ -159,7 +159,14 @@ export default function LiveScreen() {
             <Text style={[type.meta, styles.hint]}>No channels selected.</Text>
           )}
 
-          {cycle && <CyclePanel state={cycle} onSkip={() => advanceCycle(true)} onStop={() => void stopCycle()} />}
+          {cycle && (
+            <CyclePanel
+              state={cycle}
+              onDone={() => advanceCycle(false)}
+              onSkip={() => advanceCycle(true)}
+              onStop={() => void stopCycle()}
+            />
+          )}
 
           {/*
             Arka planda geçen süre kaydedilmiyor. Sessizce eksik bir gezi
@@ -238,10 +245,12 @@ export default function LiveScreen() {
  */
 function CyclePanel({
   state,
+  onDone,
   onSkip,
   onStop,
 }: {
   state: NonNullable<ReturnType<typeof useAppStore.getState>['cycle']>;
+  onDone: () => void;
   onSkip: () => void;
   onStop: () => void;
 }) {
@@ -291,12 +300,19 @@ function CyclePanel({
         Keep this screen open — the step timer stops if the app is suspended.
       </Text>
 
+      {/*
+        "Done, next" ile "Skip step" AYNI ŞEY DEĞİL.
+        7 Eylül 2026 saha testinde ikisi de aynı çağrıyı yapıyordu: kontak
+        adımı kurallara uygun tamamlandı (motor kapalı, 11.4 V veride
+        duruyor) ama "atlandı" diye kaydedildi, akü vital'i hiç üretilmedi
+        ve rapor "yeterli veri yok" dedi. Ölçüm elde, kayıt çöpte.
+      */}
       <View style={styles.cycleActions}>
-        <GhostAction
-          label={step.manualAdvance ? 'Done, next' : 'Skip step'}
-          onPress={onSkip}
-          style={{ flex: 1 }}
-        />
+        {step.manualAdvance ? (
+          <GhostAction label="Done, next" onPress={onDone} style={{ flex: 1 }} />
+        ) : (
+          <GhostAction label="Skip step" onPress={onSkip} style={{ flex: 1 }} />
+        )}
         <GhostAction label="End cycle" onPress={onStop} tint={color.alert} style={{ flex: 1 }} />
       </View>
     </View>

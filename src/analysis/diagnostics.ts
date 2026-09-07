@@ -21,7 +21,7 @@
  */
 
 import { maxOf } from '../util/agg';
-import { idleSamples, type SeriesMap, type TimeSeriesPoint } from './derived';
+import { idleSamples, idleStabilityRpm, type SeriesMap, type TimeSeriesPoint } from './derived';
 import { MINI_R50, type VehicleProfile } from './vehicle';
 import {
   rollingCircumferenceMm,
@@ -711,7 +711,8 @@ export function idleQuality(series: SeriesMap, vehicle: VehicleProfile = MINI_R5
       'No stationary idling found in this recording. Leave it idling for a minute while recording.');
   }
 
-  const sd = stdDev(idleRpm) as number;
+  // Aynı istatistik, aynı yerden: kayan pencere sapması (bkz. derived.ts).
+  const sd = (idleStabilityRpm(idlePoints) ?? stdDev(idleRpm)) as number;
   const avg = mean(idleRpm) as number;
 
   // Aynı zaman aralığındaki titreşim ve ses — varsa tabloyu tamamlıyorlar.
