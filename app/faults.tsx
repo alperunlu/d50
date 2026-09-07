@@ -63,6 +63,19 @@ export default function FaultsScreen() {
   const permanent = dtcGroups?.permanent ?? [];
   const anyRead = dtcGroups !== null;
 
+  /**
+   * Butonların NEDEN öyle davrandığını anlatan tek satır.
+   *
+   * Üçü de aynı soruya cevap verdiği ve birbirini dışladığı için tek yerde
+   * toplandı; ayrı ayrı dururken ekranın ortasında birbirinden kopuk
+   * duruyorlardı. Yeri de eylem çubuğunun dibi: açıkladığı şey orada.
+   */
+  const statusLine = notConnected
+    ? 'Not linked. Open Link and connect to the adapter.'
+    : !anyRead
+      ? 'No codes read yet.'
+      : null;
+
   return (
     <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
       <VehicleChrome subtitle="readonly" />
@@ -91,16 +104,6 @@ export default function FaultsScreen() {
             </View>
           )}
 
-          {notConnected && (
-            <Text style={[type.meta, styles.hint]}>
-              Not linked. Open Link and connect to the adapter.
-            </Text>
-          )}
-
-          {!anyRead && !notConnected && (
-            <Text style={[type.meta, styles.hint]}>No codes read yet.</Text>
-          )}
-
           {stored.length > 0 && (
             <CodeGroup label="Stored" meta="Mode 03 · turns the light on" codes={stored} primary />
           )}
@@ -118,6 +121,20 @@ export default function FaultsScreen() {
           )}
 
           {readiness && <Readiness readiness={readiness} />}
+
+          {/*
+            Esneyen boşluk. Ekran boşken aşağıdaki iki blok dibe, eylem
+            çubuğunun hemen üstüne iner; kod listesi uzunken boşluk sıfıra
+            iner ve bloklar listenin sonunda kalır.
+
+            Alternatif, ikisini de çubuğun üstüne SABİTLEMEKTİ. Öyle
+            yapılmadı: uyarı üç satır ve her zaman görünse kod listesinden
+            kalıcı olarak yer çalardı, oysa okunması gereken tek an
+            başlangıçtaki boş ekran.
+          */}
+          <View style={{ flex: 1, minHeight: space(4) }} />
+
+          {statusLine ? <Text style={[type.meta, styles.hint]}>{statusLine}</Text> : null}
 
           <Note>
             {`${MINI_R50_DTC_COUNT} R50 service codes loaded, including P1xxx manufacturer codes. This app only reads — Mode 04 is blocked at the command allowlist, so no clear command can reach the car.`}
@@ -341,10 +358,12 @@ const styles = StyleSheet.create({
   trendBar: { width: 2, alignSelf: 'stretch' },
   safe: { flex: 1, backgroundColor: color.ground },
   body: { flex: 1, paddingHorizontal: space(5), paddingTop: space(4) },
-  scroll: { paddingBottom: space(5) },
+  // flexGrow: içerik kısa olsa bile kaydırma alanı ekranı doldursun —
+  // yukarıdaki esneyen boşluğun çalışması buna bağlı.
+  scroll: { flexGrow: 1, paddingBottom: space(5) },
   headlineRow: { flexDirection: 'row', gap: space(3.5), alignItems: 'stretch' },
   headlineBar: { width: 3 },
-  hint: { textAlign: 'center', marginTop: space(6) },
+  hint: { textAlign: 'center', marginBottom: space(1) },
   codeRow: {
     paddingVertical: space(2.75),
     borderBottomWidth: hairlineWidth,
