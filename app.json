@@ -41,6 +41,7 @@
         "react-native-ble-plx",
         {
           "isBackgroundEnabled": true,
+      "modes": ["central"],
           "bluetoothAlwaysPermission": "Bu uygulama OBD2 adaptörünüzden (Vgate iCar Pro) motor verilerini SADECE OKUMAK için Bluetooth kullanır. Araca hiçbir zaman yazma/komut göndermez."
         }
       ],

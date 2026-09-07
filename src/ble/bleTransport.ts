@@ -17,6 +17,7 @@ import { BleManager, type Device, type Subscription } from 'react-native-ble-plx
 import type { ObdConnectionState, ObdTransport } from './transport';
 import { assertReadOnly } from '../obd/allowlist';
 import { ResponseFramer } from '../obd/elm327';
+import { StaleResponseGuard } from './staleResponses';
 import { discoverProfiles, type DiscoveredProfile, type ProfileCandidate } from './profiles';
 import { decodeBase64ToAscii, encodeAsciiToBase64 } from '../util/base64';
 
@@ -27,9 +28,39 @@ export interface ScannedDevice {
 }
 
 interface PendingRequest {
+  readonly command: string;
   readonly resolve: (response: string) => void;
   readonly reject: (err: Error) => void;
   readonly timer: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * Zaman aşımına uğramış bir komutun cevabı bu kadar süre içinde gelirse
+ * GEÇ CEVAP sayılır ve atılır.
+ *
+ * NEDEN VAR (7 Eylül 2026 saha kaydı): `send()` zaman aşımında yalnızca
+ * `pending`'i boşaltıyordu. Adaptörün geç gelen cevabı, o sırada bekleyen
+ * BİR SONRAKİ komutu çözüyordu. Log'daki çıplak hâli:
+ *
+ *     [tx] ATZ
+ *     [rx] 010D⏎ATZ⏎⏎⏎ELM327 v2.3      ← 010D'nin geç echo'su ATZ'ye yapışmış
+ *     [info] Protocol re-established: 010BSEARCHING...STOPPED, 0111SEARCH...
+ *
+ * Yani uygulama kendi çöpünü protokol numarası sanıp "kurtarma başarılı"
+ * dedi. Bir ölçüm aletinde bundan kötüsü yok: yanlış veri, veri
+ * yokluğundan tehlikelidir.
+ *
+ * Sayaç yerine ZAMAN penceresi kullanılıyor. Sayaç, adaptör gerçekten
+ * ölmüşse geri sayılamaz ve sonsuza kadar iyi cevapları düşürürdü; zaman
+ * penceresi kendini iyileştirir. Sahada geç cevaplar 200-600 ms içinde
+ * geldi, 4 saniye fazlasıyla yeterli.
+ */
+const STALE_RESPONSE_WINDOW_MS = 4000;
+
+/** Log satırını şişirmemek için: kontrol karakterleri görünür, uzunluk kırpık. */
+function summarise(raw: string): string {
+  const flat = raw.replace(/\r/g, '⏎').replace(/\n/g, '⏎').trim();
+  return flat.length > 60 ? `${flat.slice(0, 60)}…` : flat;
 }
 
 const DEFAULT_TIMEOUT_MS = 5000;
@@ -52,6 +83,8 @@ export class BleTransport implements ObdTransport {
 
   private readonly framer = new ResponseFramer();
   private pending: PendingRequest | null = null;
+  /** Geç gelen cevapları ayıklar — bkz. staleResponses.ts. */
+  private readonly stale = new StaleResponseGuard(STALE_RESPONSE_WINDOW_MS);
 
   /** Son keşifte bulunan ham servis/karakteristik listesi (profil eşleşmediyse UI'ye sunulur). */
   lastCandidates: readonly ProfileCandidate[] = [];
@@ -289,6 +322,10 @@ export class BleTransport implements ObdTransport {
         const chunk = decodeBase64ToAscii(characteristic.value);
         const complete = this.framer.push(chunk);
         if (complete !== null) {
+          if (this.stale.shouldDrop(Date.now())) {
+            this.log(`Dropped a late response from a timed-out command: ${summarise(complete)}`);
+            return;
+          }
           this.resolvePending(complete);
         }
       },
@@ -300,6 +337,7 @@ export class BleTransport implements ObdTransport {
     this.notifySub = null;
     this.profile = null;
     this.framer.reset();
+    this.stale.reset();
   }
 
   async disconnect(): Promise<void> {
@@ -341,10 +379,17 @@ export class BleTransport implements ObdTransport {
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending = null;
+        /**
+         * Adaptör bu komuta hâlâ cevap verebilir. İki şey birden şart:
+         * yarım kalmış baytları at (yoksa sonraki cevaba yapışır) ve geç
+         * cevabın atılacağını kaydet.
+         */
+        this.framer.reset();
+        this.stale.recordTimeout(Date.now());
         reject(new Error(`Command "${cmd}" was not answered within ${timeoutMs}ms`));
       }, timeoutMs);
 
-      this.pending = { resolve, reject, timer };
+      this.pending = { command: cmd, resolve, reject, timer };
 
       this.writeToCharacteristic(cmd + '\r').catch((e: unknown) => {
         this.failPending(e instanceof Error ? e : new Error(String(e)));

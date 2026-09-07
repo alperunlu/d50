@@ -111,7 +111,17 @@ export type OrderFrameReasonCode =
   | 'rpm-unstable'
   | 'rpm-mismatch'
   | 'rpm-too-low'
+  | 'engine-off'
   | 'firing-invisible';
+
+/**
+ * OBD devri bunun altındaysa motor çalışmıyordur.
+ *
+ * `rpm-too-low`'daki 400 ile aynı sayı ama farklı bir soru: orası
+ * "çalışıyor ama order çözülemeyecek kadar yavaş", burası "hiç
+ * çalışmıyor". Karışmasın diye ayrı sabit.
+ */
+const ENGINE_RUNNING_RPM = 400;
 
 /** Devir bu kadar oynadıysa pencere order analizi için kullanılamaz. */
 const MAX_RPM_SPREAD = 100;
@@ -158,6 +168,24 @@ export function analyzeOrderFrame(input: OrderFrameInput): OrderFrame {
 
   if (rpm === null && audioRpm === null) {
     return noOrders('No engine speed reference — neither OBD RPM nor a clear firing peak.', 'no-reference');
+  }
+
+  /**
+   * Motor çalışmıyorsa ortada ölçülecek bir şey yok.
+   *
+   * Bu kapı olmadan aşağıdaki uyuşma testi sıfıra bölüyordu: `rpm` 0 iken
+   * `|audio - rpm| / rpm` sonsuz çıkıyor ve HER pencere "ses ile OBD
+   * anlaşamadı" hatası veriyordu. 7 Eylül kaydında kontak açık, motor
+   * kapalıyken üretilen satır aynen şuydu:
+   *
+   *     Sound and OBD disagree on engine speed (879 vs 0 rpm)
+   *
+   * Sıfır devirle 879'u karşılaştırmak anlamsız — biri ölçüm, diğeri
+   * motorun durduğunun ifadesi. Mikrofonun o sırada duyduğu şey de
+   * gerçekten başka bir şey: fan, trafik, rüzgâr.
+   */
+  if (rpm !== null && rpm < ENGINE_RUNNING_RPM) {
+    return noOrders('Engine is not running — there are no firing orders to measure.', 'engine-off');
   }
 
   if (rpmSpread !== null && rpmSpread !== undefined && rpmSpread > MAX_RPM_SPREAD) {

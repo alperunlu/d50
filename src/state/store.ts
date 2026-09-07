@@ -292,6 +292,17 @@ let backgroundedAt: number | null = null;
  */
 let lastSampleAt = 0;
 /**
+ * Kayıt boyunca diske yazılan toplam örnek sayısı.
+ *
+ * "Arka planda kayıt sürdü mü" sorusunun tek dürüst ölçüsü: son örneğin
+ * TAZE olması yetmez, çünkü askıya alınmış bir uygulama foreground'a
+ * dönerken biriken cevabı hemen işleyip o alanı tazeliyor. Sayacın farkı
+ * ise arka planda gerçekten ne yazıldığını söyler.
+ */
+let samplesWritten = 0;
+/** Arka plana düşerken sayacın değeri. */
+let samplesAtBackground = 0;
+/**
  * Süren kaydın kimliği: oturum, zaman tabanı ve komut kuyruğu.
  *
  * Cycle adım değiştirdiğinde poller'ı bu üçlüyle yeniden kuruyor — oturum
@@ -1185,6 +1196,7 @@ async function flushSamples(
   }));
 
   lastSampleAt = Date.now();
+  samplesWritten += dbSamples.length;
   try {
     await repo.insertSamples(dbSamples);
   } catch (e) {
@@ -1238,6 +1250,7 @@ async function flushSensorSamples(
 ): Promise<void> {
   if (samples.length === 0) return;
   lastSampleAt = Date.now();
+  samplesWritten += samples.length;
   try {
     await repo.insertSamples(
       samples.map((s) => ({ sessionId, ts: s.ts, pid: s.key, value: s.value })),
@@ -1326,6 +1339,7 @@ function watchBackgroundGaps(
   appStateSub = RNAppState.addEventListener('change', (next) => {
     if (next === 'background') {
       backgroundedAt = Date.now();
+      samplesAtBackground = samplesWritten;
       appendLog(set, {
         ts: Date.now(),
         direction: 'info',
@@ -1348,13 +1362,25 @@ function watchBackgroundGaps(
        * Arka plan modları açık bir derlemede kayıt sürüyor ve kullanıcı
        * haritaya bakabiliyor. "Arka plana düştün" ile "veri kaybettin"
        * aynı şey değil; ikincisini yalnızca örneklerin kesilmesi söyler.
+       *
+       * AMA son örneğin taze olması yetmiyor. 7 Eylül 2026 kaydında
+       * uygulama askıya alınmıştı, foreground'a dönerken biriken cevap
+       * hemen işlendi, `lastSampleAt` tazelendi ve log 29 saniyelik bir
+       * ölü aralığa "recording continued" dedi. Ölçüm aletinin kendi
+       * verisi hakkında yalan söylemesi, veriyi kaybetmesinden kötü.
+       *
+       * Şart artık şu: arka planda geçen sürenin BOYUNCA örnek gelmiş
+       * olmalı, yani arka planda yazılan örnek sayısı süreye göre makul
+       * olmalı. Saniyede bir örnek bile fazlasıyla düşük bir eşik; ondan
+       * azı "kayıt sürüyordu" değildir.
        */
+      const recordedInBackground = samplesWritten - samplesAtBackground;
       const silentSeconds = Math.round((now - lastSampleAt) / 1000);
-      if (lastSampleAt > 0 && silentSeconds <= 10) {
+      if (lastSampleAt > 0 && silentSeconds <= 10 && recordedInBackground >= seconds) {
         appendLog(set, {
           ts: now,
           direction: 'info',
-          text: `Back in the foreground — recording continued in the background for ${seconds} s`,
+          text: `Back in the foreground — recording continued in the background for ${seconds} s (${recordedInBackground} samples)`,
         });
         return;
       }
@@ -1362,7 +1388,9 @@ function watchBackgroundGaps(
       appendLog(set, {
         ts: now,
         direction: 'error',
-        text: `Back in the foreground — ${silentSeconds} s with no data recorded`,
+        text:
+          `Back in the foreground — ${seconds} s in the background produced ` +
+          `${recordedInBackground} samples; last one ${silentSeconds} s ago`,
       });
       set((state) => ({
         recordingGaps: [...state.recordingGaps, { at, seconds: silentSeconds }],
@@ -1572,13 +1600,19 @@ function buildPoller(
     onFlush: (samples: PollSample[]) => {
       void flushSamples(sessionId, samples, set, get);
     },
-    // Cevap vermeyen bir kanal seyreltildiğinde kullanıcı bunu debug
-    // log'unda görsün — sessizce yavaşlayan bir kanal kafa karıştırır.
-    onBackoff: (pid, failures) =>
+    /**
+     * Adaptör destekliyorsa komutların sonuna "bir cevap yeter" hanesi
+     * eklenir. Sahada ölçülen kazanç bekleniyor: PID başına 272 ms'nin
+     * ~225 ms'si adaptörün boşuna beklemesiydi.
+     */
+    expectedReplies: get().initResult?.supportsReplyCount ? 1 : undefined,
+    // Araçta olmadığı anlaşılan bir kanal çıkarıldığında kullanıcı görsün —
+    // sessizce kaybolan bir kanal kafa karıştırır.
+    onBackoff: (pid) =>
       appendLog(set, {
         ts: Date.now(),
         direction: 'info',
-        text: `PID ${pid} did not answer ${failures}x — polling it less often`,
+        text: `PID ${pid} did not answer while other channels did — dropping it for this session`,
       }),
     onSilence: (seconds) => void recoverProtocol(seconds, queue, set, get),
   });
