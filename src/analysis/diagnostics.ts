@@ -67,6 +67,149 @@ function has(series: SeriesMap, key: string, min = 5): boolean {
  * yapmayı engelliyor: 10 saniye önceki gaz kelebeği değeri şimdiki devirle
  * ilişkilendirilemez.
  */
+/**
+ * ---------------------------------------------------------------------------
+ * EŞ ZAMANLI VE KARARLI ÇİFT
+ * ---------------------------------------------------------------------------
+ *
+ * İki kanalı BÖLEREK üretilen her ölçüm (aktarma oranı, tekerlek çevresi,
+ * kilometre saati sapması) aynı tuzağa düşüyor: kanallar aynı anda
+ * örneklenmiyor. Aracın hızlandığı bir anda güncel devri 1.5 saniye eski
+ * bir hızla bölmek, şanzımanı değil örnekleme gecikmesini ölçer.
+ *
+ * 7 Eylül 2026 saha kayıtları bunun bedelini gösterdi. Sağlam bir araçta:
+ *
+ *   - "Drive ratio wanders within a single gear" — %8 yayılım. Yalnızca
+ *     hızın gerçekten sabit olduğu anlara bakınca %3.6'ya düştü, kalanı da
+ *     ölçüm tabanıydı: 85 km/h sabitken devir serisi bir saniye içinde
+ *     2435 ile 2670 arasında oynuyor ve tek bir kaba hız okumasıyla
+ *     eşleşince 3.27-3.58 arası oran üretiyor. Ortada arıza yok.
+ *   - Fiziksel olarak imkânsız oranlar: en uzun vitesten düşük değerler.
+ *     Yavaşlarken eski (yüksek) hızı güncel (düşmüş) devirle bölmenin
+ *     doğrudan sonucu.
+ *
+ * Bu yüzden bölme yapan her teşhis artık aynı kapıdan geçiyor: iki örnek
+ * BİRBİRİNE YAKIN ZAMANDA alınmış olmalı, ve o civarda İKİSİ DE kararlı
+ * olmalı. Kararlı olmayan anı ölçmemek, yanlış ölçmekten iyidir.
+ */
+export interface SteadyPair {
+  readonly ts: number;
+  readonly rpm: number;
+  readonly speedKmh: number;
+}
+
+/** İki örnek bu kadar zaman farkıyla alınmışsa "aynı ana ait" sayılır. */
+const CO_TIMED_MS = 400;
+/** Hız bu bant içinde kalmalı (km/h) — PID 0D zaten tam km/h döndürüyor. */
+const SPEED_STEADY_KMH = 1;
+/** Devir bu orandan fazla oynamışsa an kararlı değildir. */
+const RPM_STEADY_RATIO = 0.02;
+/** Kararlılık bu pencerede aranır. */
+const STEADY_WINDOW_MS = 1500;
+/**
+ * Kararlılık penceresinde en az bu kadar örnek olmalı — yani ÖRNEKLEME
+ * HIZI şartı: 3 saniyelik pencerede 6 örnek, 2 Hz demek.
+ *
+ * NEDEN BİR EŞİK DEĞİL DE ŞART: 7 Eylül kaydında bu ölçüm sağlam bir
+ * araca "aktarma kaçırıyor" dedi. Eş zamanlılık ve kararlılık kapıları
+ * eklendikten sonra bile session 21'de %3.5 kaldı, ve kalanın kaynağı
+ * belliydi: 86→90 km/h hafifçe hızlanan bir bölüm "sabit" sayılıyordu,
+ * çünkü hız 1.5 Hz'de örnekleniyordu ve üç saniyelik pencereye topu
+ * topu 4 örnek düşüyordu. Dört örnekle "hız sabitti" demek, aradaki
+ * hızlanmayı görmemek demek.
+ *
+ * Eşiği yeşil ışık yanana kadar gevşetmek, istenen cevaba göre ayar
+ * yapmak olurdu. Doğrusu aletin şartını yazmak: bu ölçüm hız kanalı en az
+ * 2 Hz örneklenmeden YAPILAMAZ. Yapılamadığında "ölçemedim" denir.
+ *
+ * Yeni planlayıcıda hızın hedefi 250 ms (4 Hz), yani pencereye 12 örnek
+ * düşüyor ve şart rahatça sağlanıyor.
+ */
+const STEADY_MIN_SAMPLES = 6;
+/**
+ * Bu hızın altında ölçüm yapılmaz.
+ *
+ * PID 0D tam km/h döndürüyor, yani ±0.5 km/h nicemleme hatası var ve bu
+ * bağıl olarak hız düştükçe büyüyor: 25 km/h'de ±%2, 50'de ±%1, 80'de
+ * ±%0.6. %3'lük bir eşiğin altında anlamlı olabilmesi için nicemleme
+ * tabanının belirgin şekilde küçük kalması gerekiyor.
+ */
+const MIN_RATIO_SPEED_KMH = 50;
+
+/**
+ * Bir serinin verilen pencerede en küçük/en büyük değeri.
+ *
+ * Pencere TAM olmalı: kaydın başına ya da sonuna denk gelen bir pencere
+ * yarım genişliktedir ve dolayısıyla değişimin yarısını görür. Sabit
+ * hızlanan bir seride bu, ilk ve son noktanın "sabit" sayılmasına yol
+ * açıyordu — testin yakaladığı gerçek bir zayıflık.
+ */
+function windowExtent(
+  series: readonly TimeSeriesPoint[],
+  ts: number,
+  halfWindowMs: number,
+): { min: number; max: number; count: number } | null {
+  let min = Infinity;
+  let max = -Infinity;
+  let count = 0;
+  let first: number | null = null;
+  let last = 0;
+  for (const p of series) {
+    if (p.ts < ts - halfWindowMs) continue;
+    if (p.ts > ts + halfWindowMs) break;
+    if (p.value < min) min = p.value;
+    if (p.value > max) max = p.value;
+    if (first === null) first = p.ts;
+    last = p.ts;
+    count++;
+  }
+  if (first === null) return null;
+  // Pencerenin ikisi de tarafı dolu mu — %80'i kapsanmalı.
+  if (last - first < halfWindowMs * 2 * 0.8) return null;
+  return { min, max, count };
+}
+
+/**
+ * Devir ve hızın EŞ ZAMANLI ve İKİSİ DE KARARLI olduğu anları döndürür.
+ *
+ * Az nokta üretir ve üretmesi gereken de budur: sonuç "ölçemedim" ise,
+ * "ölçtüm ve şanzıman bozuk" demekten dürüsttür.
+ */
+export function steadyRatioPairs(
+  rpmSeries: readonly TimeSeriesPoint[],
+  speedSeries: readonly TimeSeriesPoint[],
+  minSpeedKmh = MIN_RATIO_SPEED_KMH,
+): SteadyPair[] {
+  const out: SteadyPair[] = [];
+
+  for (const s of speedSeries) {
+    if (s.value < minSpeedKmh) continue;
+
+    // Hız o civarda gerçekten sabit mi?
+    const speedWindow = windowExtent(speedSeries, s.ts, STEADY_WINDOW_MS);
+    if (!speedWindow || speedWindow.count < STEADY_MIN_SAMPLES) continue;
+    if (speedWindow.max - speedWindow.min > SPEED_STEADY_KMH) continue;
+
+    // Devir o civarda gerçekten sabit mi? (85 km/h sabitken 2435-2670
+    // arasında oynayan bir devir, oranı tek başına %10 saçıyordu.)
+    const rpmWindow = windowExtent(rpmSeries, s.ts, STEADY_WINDOW_MS);
+    if (!rpmWindow || rpmWindow.count < STEADY_MIN_SAMPLES || rpmWindow.min <= 0) continue;
+    if ((rpmWindow.max - rpmWindow.min) / rpmWindow.min > RPM_STEADY_RATIO) continue;
+
+    // Ve en yakın devir örneği gerçekten AYNI ANA ait mi?
+    let nearest: TimeSeriesPoint | null = null;
+    for (const r of rpmSeries) {
+      if (Math.abs(r.ts - s.ts) > CO_TIMED_MS) continue;
+      if (nearest === null || Math.abs(r.ts - s.ts) < Math.abs(nearest.ts - s.ts)) nearest = r;
+    }
+    if (nearest === null) continue;
+
+    out.push({ ts: s.ts, rpm: nearest.value, speedKmh: s.value });
+  }
+
+  return out;
+}
+
 export function sampleAt(
   series: readonly TimeSeriesPoint[],
   ts: number,
@@ -1158,9 +1301,29 @@ function measuredCircumference(
   const gps = get(series, 'gps_speed');
   if (obd.length < 10 || gps.length < 10) return null;
 
+  /**
+   * Yalnızca hızın gerçekten sabit olduğu anlar.
+   *
+   * Eskiden GPS örneği 2 saniyeye kadar eski bir ECU hızıyla eşleşiyordu
+   * ve kararlılık hiç aranmıyordu. Sahada bunun bedeli %1.5'lik sahte bir
+   * sapmaydı; hızlanma dışlanınca %0.7'ye indi (7 Eylül 2026).
+   *
+   * `steadyRatioPairs` burada GPS'i "hız kanalı" olarak alıyor: kararlılık
+   * hem GPS hem ECU tarafında aranmalı, ve GPS zaten ikisinin yavaş olanı.
+   */
   const values: number[] = [];
   for (const g of gps) {
-    const o = sampleAt(obd, g.ts, 2000);
+    if (g.value < MIN_RATIO_SPEED_KMH) continue;
+
+    const gpsWindow = windowExtent(gps, g.ts, STEADY_WINDOW_MS);
+    if (!gpsWindow || gpsWindow.count < STEADY_MIN_SAMPLES) continue;
+    if (gpsWindow.max - gpsWindow.min > SPEED_STEADY_KMH) continue;
+
+    const obdWindow = windowExtent(obd, g.ts, STEADY_WINDOW_MS);
+    if (!obdWindow || obdWindow.count < STEADY_MIN_SAMPLES) continue;
+    if (obdWindow.max - obdWindow.min > SPEED_STEADY_KMH) continue;
+
+    const o = sampleAt(obd, g.ts, CO_TIMED_MS);
     if (o === null) continue;
     const c = circumferenceFromSpeedPair(o, g.value, vehicle.factoryTyre);
     if (c !== null) values.push(c);
@@ -1255,17 +1418,22 @@ export function driveRatioStability(
   }
 
   const circumference = rollingCircumferenceMm(vehicle.fittedTyre);
+  /**
+   * Yalnızca eş zamanlı VE kararlı anlar. Eskiden devir, 1.5 saniyeye
+   * kadar eski bir hızla bölünüyordu ve tek şart hızın 25 km/h üstünde
+   * olmasıydı — yani araç hızlanırken de ölçülüyordu. Sağlam bir araçta
+   * bu %8 yayılım üretti ve "aktarma kaçırıyor" dedi (bkz. steadyRatioPairs).
+   */
   const ratios: number[] = [];
-  for (const r of rpm) {
-    const v = sampleAt(speed, r.ts, 1500);
-    if (v === null || v < 25) continue;
-    const ratio = totalDriveRatio(r.value, v, circumference);
+  for (const p of steadyRatioPairs(rpm, speed)) {
+    const ratio = totalDriveRatio(p.rpm, p.speedKmh, circumference);
     if (ratio !== null && ratio > 1 && ratio < 30) ratios.push(ratio);
   }
 
   if (ratios.length < 15) {
     return inconclusive(key, title, [],
-      'Needs steady driving above 25 km/h — ratios below that are dominated by the clutch.');
+      'Needs a steady cruise above 50 km/h — held speed, no gear changes. ' +
+      'Measuring while the car accelerates reads the sampling delay, not the gearbox.');
   }
 
   /**
@@ -1300,8 +1468,16 @@ export function driveRatioStability(
     solid.map((c) => round(mean(c) as number, 2)).join(' · ') +
     `, worst spread ${round(worst)} %`;
 
-  // Sağlam bir aktarmada sabit vitesteki oran neredeyse hiç oynamaz; %3
-  // bağıl yayılım, ölçüm gürültüsünün üstünde kalan ilk anlamlı eşik.
+  /**
+   * Eşik, ALETİN KENDİ TABANININ üstünde olmalı.
+   *
+   * Kalan iki gürültü kaynağı: PID 0D tam km/h döndürüyor (50 km/h'de
+   * ±%1, 80'de ±%0.6) ve kararlılık penceresi hıza ±1 km/h serbestlik
+   * bırakıyor (50 km/h'de %2). İkisi birlikte ~%2.2'lik bir taban
+   * bırakıyor; %3 bunun hemen üstünde ve ancak eş zamanlı/kararlı
+   * çiftlerle anlamlı — eskiden aynı eşik, %8 gürültünün üstünde
+   * kullanılıyordu ve her sağlam araca "kaçırıyor" diyordu.
+   */
   if (worst > 3) {
     return {
       key, title, verdict: 'attention',
@@ -1347,11 +1523,28 @@ export function tyreSizeCalibration(
       ? `measured rolling circumference ${Math.round(measurement.mm)} mm vs ${Math.round(factoryMm)} mm factory — ECU speed off by ${round(-errorPct)} % (${measurement.samples} GPS samples)`
       : `fitted ${formatTyreSize(vehicle.fittedTyre)}, factory ${formatTyreSize(vehicle.factoryTyre)} — ECU speed off by ${round(-errorPct)} % (from the entered size; record GPS to measure it)`;
 
-  if (Math.abs(errorPct) < 0.5) {
+  /**
+   * "Fabrikayla aynı" bandı, LASTİK EBADI DIŞINDAKİ açıklamaları kapsamalı.
+   *
+   * Eski eşik %0.5'ti ve iki ayrı sebeple yanlıştı:
+   *
+   *   1. Ölçümün kendi saçılımından (sahada ±%0.5-1.2) dardı — yani aletin
+   *      göremeyeceği bir farkı rapor ediyordu.
+   *   2. Bir lastik sıfırdan kanuni sınıra aşınırken ~%2 çevre kaybeder,
+   *      basınç da katkı verir. %0.7'lik bir farkı "başka ebat takılmış"
+   *      diye sunmak, aşınmayı ebat sanmaktır.
+   *
+   * Gerçek bir ebat basamağı çok daha büyük: 175/65 R15 → 185/65 R15
+   * ~%2.2, → 195/60 R15 ~%2.5. Bant %2, yani bir ebat basamağının
+   * hemen altında ve aşınmanın hemen üstünde.
+   */
+  if (Math.abs(errorPct) < 2) {
     return {
       key, title, verdict: 'ok',
-      headline: 'Fitted tyre matches the factory size',
-      detail: 'The ECU speed and distance readings need no correction.',
+      headline: 'Speed readings match the factory tyre size',
+      detail:
+        `The ECU is within ${round(Math.abs(errorPct))} % of the factory rolling circumference — ` +
+        'inside what tread wear and tyre pressure alone explain, so no size correction is called for.',
       evidence,
     };
   }
