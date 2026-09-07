@@ -9,6 +9,7 @@
 import type { SQLiteDatabase } from 'expo-sqlite';
 import { getDb } from './index';
 import type { Sample, Session, SupportedPidMap } from './types';
+import { scopeToVehicle } from '../analysis/trend';
 
 /**
  * TÜM yazma işlemleri tek bir zincirden geçer.
@@ -43,15 +44,18 @@ function serialize<T>(work: () => Promise<T>): Promise<T> {
 export async function startSession(
   pids: readonly string[],
   supportedPids?: SupportedPidMap | null,
+  /** Aracın VIN'i, okunabildiyse. Trend verisini araca bağlayan tek şey. */
+  vin?: string | null,
 ): Promise<Session> {
   return serialize(async () => {
   const db = await getDb();
   const startedAt = Date.now();
   const result = await db.runAsync(
-    'INSERT INTO sessions (started_at, ended_at, note, pids, supported_pids) VALUES (?, NULL, NULL, ?, ?)',
+    'INSERT INTO sessions (started_at, ended_at, note, pids, supported_pids, vin) VALUES (?, NULL, NULL, ?, ?, ?)',
     startedAt,
     JSON.stringify(pids),
     supportedPids ? JSON.stringify(supportedPids) : null,
+    vin ?? null,
   );
   return {
     id: result.lastInsertRowId,
@@ -60,6 +64,7 @@ export async function startSession(
     note: null,
     pids,
     supportedPids: supportedPids ?? null,
+    vin: vin ?? null,
   };
   });
 }
@@ -99,8 +104,9 @@ export async function listSessions(): Promise<Session[]> {
     note: string | null;
     pids: string;
     supported_pids: string | null;
+    vin: string | null;
   }>(
-    'SELECT id, started_at, ended_at, note, pids, supported_pids FROM sessions ORDER BY started_at DESC',
+    'SELECT id, started_at, ended_at, note, pids, supported_pids, vin FROM sessions ORDER BY started_at DESC',
   );
 
   return rows.map(rowToSession);
@@ -115,8 +121,9 @@ export async function getSession(sessionId: number): Promise<Session | null> {
     note: string | null;
     pids: string;
     supported_pids: string | null;
+    vin: string | null;
   }>(
-    'SELECT id, started_at, ended_at, note, pids, supported_pids FROM sessions WHERE id = ?',
+    'SELECT id, started_at, ended_at, note, pids, supported_pids, vin FROM sessions WHERE id = ?',
     sessionId,
   );
   return row ? rowToSession(row) : null;
@@ -212,12 +219,14 @@ function rowToSession(row: {
   note: string | null;
   pids: string;
   supported_pids?: string | null;
+  vin?: string | null;
 }): Session {
   return {
     id: row.id,
     startedAt: row.started_at,
     endedAt: row.ended_at,
     note: row.note,
+    vin: row.vin ?? null,
     pids: JSON.parse(row.pids) as string[],
     // Bozuk/eksik JSON oturumu okunamaz yapmamalı; en kötü ihtimalle
     // maskeyi bilmeden eski davranışa düşeriz.
@@ -287,23 +296,37 @@ export type VitalSource = 'cycle' | 'drive';
  */
 export async function readVitalHistory(
   key: string,
-): Promise<{ at: number; value: number; sessionId: number; source: VitalSource }[]> {
+  /**
+   * Şu anki aracın VIN'i. Verilirse geçmiş o araca daraltılır
+   * (bkz. `scopeToVehicle`); verilmezse daraltma yapılmaz.
+   */
+  currentVin?: string | null,
+): Promise<
+  { at: number; value: number; sessionId: number; source: VitalSource; vin: string | null }[]
+> {
   const db = await getDb();
   const rows = await db.getAllAsync<{
     recorded_at: number;
     value: number;
     session_id: number;
     source: string | null;
+    vin: string | null;
   }>(
-    'SELECT recorded_at, value, session_id, source FROM cycle_vitals WHERE key = ? ORDER BY recorded_at ASC',
+    `SELECT v.recorded_at, v.value, v.session_id, v.source, s.vin
+       FROM cycle_vitals v
+       JOIN sessions s ON s.id = v.session_id
+      WHERE v.key = ?
+      ORDER BY v.recorded_at ASC`,
     key,
   );
-  return rows.map((r) => ({
+  const points = rows.map((r) => ({
     at: r.recorded_at,
     value: r.value,
     sessionId: r.session_id,
-    source: r.source === 'drive' ? 'drive' : 'cycle',
+    source: (r.source === 'drive' ? 'drive' : 'cycle') as VitalSource,
+    vin: r.vin,
   }));
+  return currentVin === undefined ? points : scopeToVehicle(points, currentVin);
 }
 
 /** Bir oturumun vitals'ı — raporda o cycle'ın kendi tablosu için. */
@@ -337,12 +360,45 @@ export async function readSkippedSteps(sessionId: number): Promise<string[]> {
  * sonuncusu. Tek sorguda alınıyor: cycle sayısı arttıkça ekran açılışı
  * yavaşlamasın.
  */
-export async function readLatestVitals(): Promise<{ key: string; value: number; unit: string }[]> {
+export async function readLatestVitals(
+  currentVin?: string | null,
+): Promise<{ key: string; value: number; unit: string }[]> {
   const db = await getDb();
-  return db.getAllAsync<{ key: string; value: number; unit: string }>(
-    `SELECT v.key, v.value, v.unit
+  const rows = await db.getAllAsync<{
+    key: string;
+    value: number;
+    unit: string;
+    recorded_at: number;
+    vin: string | null;
+  }>(
+    `SELECT v.key, v.value, v.unit, v.recorded_at, s.vin
        FROM cycle_vitals v
-       JOIN (SELECT key, MAX(recorded_at) AS latest FROM cycle_vitals GROUP BY key) m
-         ON m.key = v.key AND m.latest = v.recorded_at`,
+       JOIN sessions s ON s.id = v.session_id
+      ORDER BY v.recorded_at ASC`,
   );
+
+  // Araca daraltma SQL'de değil burada: "tek VIN görülmüşse bilinmeyenler
+  // de o araca aittir" kuralı bütün satırlara birden bakmayı gerektiriyor
+  // ve o kural tek yerde durmalı (bkz. scopeToVehicle).
+  const scoped = currentVin === undefined ? rows : scopeToVehicle(rows, currentVin);
+
+  // Sıralı geldiği için son yazan kazanır — anahtar başına EN SON ölçüm.
+  const latest = new Map<string, { key: string; value: number; unit: string }>();
+  for (const r of scoped) latest.set(r.key, { key: r.key, value: r.value, unit: r.unit });
+  return [...latest.values()];
+}
+
+/**
+ * Veritabanının gördüğü VIN'ler ve en son hangisinin kullanıldığı.
+ *
+ * Bağlantı yokken de trendleri doğru araca daraltabilmek için gerekiyor:
+ * Faults ekranı araca takılı olmadan da açılıyor ve o sırada canlı bir VIN
+ * yok. En son sürülen araba, "şu anki araba"nın makul karşılığı.
+ */
+export async function knownVins(): Promise<{ latest: string | null; all: string[] }> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<{ vin: string; started_at: number }>(
+    'SELECT DISTINCT vin, MAX(started_at) AS started_at FROM sessions WHERE vin IS NOT NULL GROUP BY vin ORDER BY started_at DESC',
+  );
+  return { latest: rows[0]?.vin ?? null, all: rows.map((r) => r.vin) };
 }

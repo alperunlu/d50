@@ -35,11 +35,35 @@ export interface ReportVital {
   readonly source: 'cycle' | 'drive';
 }
 
+/**
+ * Raporun araç bölümü.
+ *
+ * NEDEN AYRI BİR TİP: rapor bugüne kadar başlığına "MINI Cooper R50
+ * (2001-2006)" yazıyordu ve bunu yalnızca kodda gömülü profilden
+ * biliyordu — yani bilmiyordu, varsayıyordu. Kullanıcı sordu, cevabı
+ * "hiçbir yerden"di. Artık iki şey ayrı ayrı yazılıyor: neyin ÖLÇÜLDÜĞÜ
+ * (VIN) ve neyin VARSAYILDIĞI (profil), ve ikisi çelişiyorsa bu da yazıyor.
+ */
+export interface ReportVehicle {
+  /** Hesapların dayandığı profilin adı. ÖLÇÜM DEĞİL, VARSAYIM. */
+  readonly profileName: string;
+  /** Araçtan okunan VIN, okunabildiyse. */
+  readonly vin: string | null;
+  /** VIN'in yapısından çıkanlar. Üretici veritabanı sorgulanmıyor. */
+  readonly manufacturer: string | null;
+  readonly modelYear: number | null;
+  /**
+   * Profilin dayandığı ve hesapları doğrudan etkileyen varsayımlar.
+   * Okuyan kişi hangi sayının neye bağlı olduğunu görebilmeli.
+   */
+  readonly assumptions: readonly string[];
+}
+
 export interface ReportInput {
   readonly sessionId: number;
   readonly startedAt: number;
   readonly durationSec: number;
-  readonly vehicle: string;
+  readonly vehicle: ReportVehicle;
   readonly buildTag: string;
   readonly summary: TripSummary;
   readonly findings: readonly Finding[];
@@ -129,12 +153,67 @@ const STYLE = `
   .trend.improving { color: #2f7d5a; }
   .trend.stable, .trend.baseline { color: #7b8a82; }
   .note { color: #7b8a82; font-size: 12px; margin-top: 24px; }
+  .attention-note { color: #b5701f; border-left: 3px solid #b5701f; padding-left: 10px; }
+  code { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .04em; }
   @media print {
     body { padding: 0; }
     h2 { break-after: avoid; }
     .finding { break-inside: avoid; }
   }
 `;
+
+/**
+ * Araç bölümü: ÖLÇÜLENİ ve VARSAYILANI ayrı ayrı yazar.
+ *
+ * Üç durum var ve üçü de açıkça söyleniyor:
+ *   - VIN okundu ve profille tutarlı: her şey yerinde.
+ *   - VIN okundu ama profille çelişiyor: hesaplar YANLIŞ araca göre
+ *     yapılıyor demektir; bunu gizlemek raporu güvenilmez yapar.
+ *   - VIN okunamadı: profil bir varsayım olarak duruyor, ve öyle yazıyor.
+ */
+function vehicleHtml(v: ReportVehicle): string {
+  const rows: [string, string][] = [];
+
+  if (v.vin) {
+    rows.push(['VIN (read from the car)', `<code>${escapeHtml(v.vin)}</code>`]);
+    if (v.manufacturer) rows.push(['Manufacturer (from the VIN)', escapeHtml(v.manufacturer)]);
+    if (v.modelYear !== null) rows.push(['Model year (from the VIN)', String(v.modelYear)]);
+  }
+  rows.push(['Profile used for the calculations', escapeHtml(v.profileName)]);
+
+  // Çelişki kontrolü kasıtlı olarak KABA: VIN'den çıkan üreticiyle profil
+  // adının aynı markayı söyleyip söylemediğine bakıyor. Model/motor
+  // eşleşmesini VIN'den bilemeyiz (üretici çözüm tablosu gerekir), o yüzden
+  // iddia da etmiyoruz.
+  const brand = v.profileName.split(/\s+/)[0]?.toUpperCase() ?? '';
+  const mismatch =
+    v.manufacturer !== null && brand.length > 1 && !v.manufacturer.toUpperCase().includes(brand);
+
+  const notice = v.vin
+    ? mismatch
+      ? `<p class="note attention-note">The VIN says this car was built by ${escapeHtml(
+          v.manufacturer ?? 'another manufacturer',
+        )}, but the calculations below use the ${escapeHtml(
+          v.profileName,
+        )} profile. Mass, drag and displacement are all taken from that profile, so every derived
+        figure — power, torque, consumption, road load — is wrong by whatever the two cars differ by.
+        Change the profile before trusting them.</p>`
+      : `<p class="note">The VIN was read from the car; the model and engine are not derivable from it
+        without the manufacturer's lookup tables, so the profile below is still a choice, not a
+        measurement.</p>`
+    : `<p class="note">This car's VIN could not be read — the ECU either does not support Mode 09 or
+      did not answer, which is common on cars of this age. Everything below therefore rests on an
+      assumed profile rather than on anything the car said about itself.</p>`;
+
+  const assumptions = v.assumptions.length
+    ? `<p class="note">The profile supplies these figures, and the derived results move with them:
+       ${escapeHtml(v.assumptions.join(' · '))}.</p>`
+    : '';
+
+  return `<table>${rows
+    .map(([k, val]) => `<tr><td class="label">${escapeHtml(k)}</td><td class="value">${val}</td></tr>`)
+    .join('')}</table>${notice}${assumptions}`;
+}
 
 export function buildReportHtml(input: ReportInput): string {
   const started = new Date(input.startedAt);
@@ -190,8 +269,10 @@ export function buildReportHtml(input: ReportInput): string {
 <style>${STYLE}</style></head>
 <body>
   <h1>D50 vehicle report</h1>
-  <div class="meta">${escapeHtml(input.vehicle)}</div>
   <div class="meta">${escapeHtml(started.toLocaleString())} · ${minutes} min · session ${input.sessionId}</div>
+
+  <h2>Vehicle</h2>
+  ${vehicleHtml(input.vehicle)}
 
   <h2>Vitals and trend</h2>
   <table>${vitalsHtml}</table>

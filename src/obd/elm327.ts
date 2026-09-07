@@ -14,6 +14,7 @@
 
 import type { ObdTransport } from '../ble/transport';
 import type { SupportedPidMap } from './pids';
+import { parseVin } from './vin';
 
 /** ELM327 komut/cevap sınırı. Cevaplar bu prompt ile biter. */
 export const PROMPT = '>';
@@ -102,6 +103,16 @@ export interface InitResult {
    * Bir blok sorulmadıysa ya da cevapsız kaldıysa o alan tanımsız kalır.
    */
   supportedPids: SupportedPidMap;
+  /**
+   * Aracın şasi numarası, okunabildiyse.
+   *
+   * `null` üç ayrı şeyi birlikte anlatıyor ve üçünü ayırmaya gerek yok:
+   * ECU Mode 09'u hiç desteklemiyor olabilir (2003 model bir K-line aracında
+   * bu sık), 0902'ye cevap vermemiş olabilir, ya da cevap çözümlenememiş
+   * olabilir. Hepsinin sonucu aynı: VIN'i bilmiyoruz, ve bilmediğimizi
+   * söylemek uydurmaktan iyi.
+   */
+  vin: string | null;
 }
 
 /**
@@ -115,6 +126,14 @@ export interface InitResult {
 export async function initElm327(
   queue: CommandQueue,
   preferredProtocol?: string,
+  /**
+   * VIN okumayı atlar ve verilen değeri sonuca koyar.
+   *
+   * Kurtarma (`recoverProtocol`) için: bus zaten sorunluyken ona iki
+   * fazladan komut daha sormanın anlamı yok, üstelik VIN değişmiyor —
+   * bağlantı başında okunan hâlâ geçerli.
+   */
+  knownVin?: string | null,
 ): Promise<InitResult> {
   const reset = await queue.send('ATZ', RESET_TIMEOUT_MS);
   if (!/ELM327/i.test(reset)) {
@@ -150,13 +169,44 @@ export async function initElm327(
 
   const dpn = await queue.send('ATDPN');
   const info = await queue.send('ATI');
+  const vin = knownVin !== undefined ? knownVin : await readVin(queue);
 
   return {
     adapterInfo: info.trim(),
     protocolNumber: dpn.trim(),
     supportedPids,
+    vin,
   };
 }
+
+/**
+ * VIN'i okur. Bağlantı başına BİR kez — VIN değişmez.
+ *
+ * Önce 0900 ile Mode 09'un desteklenip desteklenmediği soruluyor. Bunun
+ * sebebi ölçülü olmak: desteklenmeyen bir moda soru sormak K-line'da boşa
+ * timeout beklemek demek ve bağlantı açılışını yavaşlatır. 0900 cevapsız
+ * kalırsa 0902 hiç denenmiyor.
+ *
+ * Hiçbir hata yukarı sızmıyor: VIN okunamadı diye bağlantı kurulamamış
+ * sayılmaz. VIN bir kolaylık, bağlantının şartı değil.
+ */
+async function readVin(queue: CommandQueue): Promise<string | null> {
+  try {
+    const support = await queue.send('0900');
+    if (!/4900/.test(support.replace(/\s/g, ''))) return null;
+
+    const response = await queue.send('0902', VIN_TIMEOUT_MS);
+    return parseVin(response);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * VIN çok çerçeveli gelir ve K-line'da her çerçeve ayrı ayrı zamanlanır;
+ * tek bir PID'e verilen süre yetmiyor.
+ */
+const VIN_TIMEOUT_MS = 5_000;
 
 /**
  * Bitmask'in en düşük biti (PID x20) "bir sonraki blok da destekleniyor"
