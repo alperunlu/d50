@@ -9,7 +9,7 @@
 
 import React from 'react';
 import { View, Text, Pressable, StyleSheet, type ViewStyle, type StyleProp } from 'react-native';
-import Svg, { Polyline } from 'react-native-svg';
+import Svg, { Polyline, Circle } from 'react-native-svg';
 import { color, type, space, hairlineWidth } from './theme';
 
 /**
@@ -140,12 +140,20 @@ export function Tag({ text, tint = color.chrome }: { text: string; tint?: string
   );
 }
 
-/** Durum noktası + metin (LINKED, RECORDING). Kare, daire değil. */
+/**
+ * Durum noktası + metin (LINKED, RECORDING). Kare, daire değil.
+ *
+ * Rengi NOKTA taşır, metin değil: `alert` (kırmızı) zemin üzerinde ~2.8:1
+ * kalıyor ve "RECORDING" / "FAULT" okunmaz oluyordu. Kırmızı durumda yazı
+ * kreme (`ink`) döner — nokta yine kırmızı, sinyal korunur, metin okunur.
+ * Yeşil (`linked`) 6.2:1 geçtiği için olduğu gibi bırakılıyor.
+ */
 export function StatusDot({ text, tint }: { text: string; tint: string }) {
+  const textColor = tint === color.alert ? color.ink : tint;
   return (
     <View style={styles.statusRow}>
       <View style={{ width: 6, height: 6, backgroundColor: tint }} />
-      <Text style={[type.status, { color: tint }]}>{text}</Text>
+      <Text style={[type.status, { color: textColor }]}>{text}</Text>
     </View>
   );
 }
@@ -212,7 +220,9 @@ export function GhostAction({
 
 /**
  * Değerin altındaki iz. Eksen yok, ızgara yok, etiket yok — sadece şeklin
- * kendisi. Sayı zaten değeri söylüyor; iz yalnızca yönü söylüyor.
+ * kendisi ve ucundaki güncel-değer işareti. Sayı zaten değeri söylüyor; iz
+ * yönü, uçtaki nokta da "şu an neredeyiz"i söylüyor (düz bir rölanti ile
+ * tırmanan bir eğri artık ilk bakışta ayırt edilebiliyor).
  */
 export function Sparkline({
   points,
@@ -252,11 +262,20 @@ export function Sparkline({
       .join(' ');
   }, [points, width, height, windowMs]);
 
+  /** İzin son noktası — üstüne "şu an" işareti konuyor. */
+  const lastPoint = React.useMemo(() => {
+    if (!polyline) return null;
+    const parts = polyline.split(' ');
+    const [x, y] = parts[parts.length - 1].split(',').map(Number);
+    return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+  }, [polyline]);
+
   return (
     <View style={{ height, marginTop: space(2) }} onLayout={(e) => setWidth(e.nativeEvent.layout.width)}>
       {polyline ? (
         <Svg width={width} height={height}>
           <Polyline points={polyline} fill="none" stroke={tint} strokeWidth={1.5} />
+          {lastPoint ? <Circle cx={lastPoint.x} cy={lastPoint.y} r={2.5} fill={color.ink} /> : null}
         </Svg>
       ) : null}
     </View>

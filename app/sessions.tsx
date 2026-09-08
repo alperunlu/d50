@@ -195,7 +195,7 @@ export default function TripsScreen() {
                   <View style={styles.tripActions}>
                     <TripAction label="CSV" onPress={() => void exportCsv(s)} disabled={busy} />
                     <TripAction label="Log" onPress={() => void exportLog(s)} disabled={busy} />
-                    <TripAction label="Delete" onPress={() => remove(s)} tint={color.alert} />
+                    <TripAction label="Delete" onPress={() => remove(s)} tint={color.chrome} />
                   </View>
                 </View>
               )}

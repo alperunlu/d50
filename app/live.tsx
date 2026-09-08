@@ -106,7 +106,7 @@ export default function LiveScreen() {
           </View>
 
           <Pressable
-            style={[styles.recordChip, isRecording && { borderColor: color.alert }]}
+            style={[styles.recordChip, isRecording && styles.recordChipOn]}
             onPress={() => (isRecording ? stopRecording() : startRecording())}
             disabled={notConnected}
           >
@@ -557,6 +557,15 @@ const styles = StyleSheet.create({
     paddingHorizontal: space(4),
     minHeight: 44,
     justifyContent: 'center',
+  },
+  /**
+   * Kayıt durumu: kırmızıyı 1px hairline kenarlık olarak taşımak zemin
+   * üzerinde ~2.8:1 kalıyordu. Bunun yerine 3px kırmızı DOLU sol bar —
+   * kırmızı yine sadece dolgu, kenarlığın geri kalanı nötr.
+   */
+  recordChipOn: {
+    borderLeftWidth: 3,
+    borderLeftColor: color.alert,
   },
   scroll: { paddingBottom: space(4), gap: space(4) },
   hint: { textAlign: 'center', marginTop: space(6) },

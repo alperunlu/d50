@@ -33,18 +33,23 @@ const ICONS: Record<string, string[]> = {
 function TabIcon({ name, focused }: { name: string; focused: boolean }) {
   const stroke = focused ? color.ink : color.muted;
   return (
-    <Svg width={21} height={21} viewBox="0 0 24 24" fill="none">
-      {ICONS[name]?.map((d, i) => (
-        <Path
-          key={i}
-          d={d}
-          stroke={stroke}
-          strokeWidth={1.5}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-      ))}
-    </Svg>
+    <View style={styles.iconWrap}>
+      {/* Aktif sekme göstergesi: ikon+etiket rengi (muted→ink) tek başına
+          zayıf ayrışıyordu; üstte 2px krem çubuk seçili sekmeyi netleştiriyor. */}
+      {focused ? <View style={styles.tabIndicator} /> : null}
+      <Svg width={21} height={21} viewBox="0 0 24 24" fill="none">
+        {ICONS[name]?.map((d, i) => (
+          <Path
+            key={i}
+            d={d}
+            stroke={stroke}
+            strokeWidth={1.5}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        ))}
+      </Svg>
+    </View>
   );
 }
 
@@ -148,12 +153,27 @@ export default function RootLayout() {
 }
 
 const styles = StyleSheet.create({
+  iconWrap: { alignItems: 'center', justifyContent: 'center' },
+  /** Seçili sekmenin üstündeki 2px krem çubuk. */
+  tabIndicator: {
+    position: 'absolute',
+    top: -space(2.5),
+    width: 22,
+    height: 2,
+    backgroundColor: color.ink,
+  },
+  /**
+   * Arıza rozeti. 6px çıplak kare zemin üzerinde kayboluyordu; 8px + krem
+   * hairline halka onu fondan ayırıyor — dikkat çekmesi gereken tek işaret bu.
+   */
   badge: {
     position: 'absolute',
-    top: -2,
-    right: -6,
-    width: 6,
-    height: 6,
+    top: -3,
+    right: -8,
+    width: 8,
+    height: 8,
     backgroundColor: color.alert,
+    borderWidth: 1,
+    borderColor: color.ink,
   },
 });

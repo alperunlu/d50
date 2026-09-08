@@ -237,9 +237,11 @@ export default function DebugScreen() {
 }
 
 function LogLine({ entry }: { entry: RawLogEntry }) {
+  // Hata satırı: kırmızı metin zemin üzerinde okunmuyor (~2.8:1). Amber
+  // (6.1:1) hem okunur hem "bir şey ters" sinyalini korur; '!' öneki zaten var.
   const tint =
     entry.direction === 'error'
-      ? color.alert
+      ? color.caution
       : entry.direction === 'tx'
         ? color.linked
         : entry.direction === 'rx'

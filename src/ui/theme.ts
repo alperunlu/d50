@@ -32,7 +32,12 @@ export const color = {
   muted: '#8FA398',
   /** Bağlantı kurulu göstergesi ve grafik izi. */
   linked: '#7FB08E',
-  /** SADECE motor arıza lambası ve aktif kayıt. Başka hiçbir yerde. */
+  /**
+   * SADECE motor arıza lambası ve aktif kayıt. Başka hiçbir yerde.
+   * DOLGU/BAR olarak kullanılır — zemin (#0F2A21) üzerinde METİN/İKON rengi
+   * DEĞİL: oradaki kontrastı ~2.8:1, yani WCAG eşiğinin altında. Kırmızının
+   * eşlik ettiği yazı her zaman krem (`ink`) kalır; rengi nokta/çubuk taşır.
+   */
   alert: '#C4342C',
   /** SADECE uyarı (hazır değil, dikkat). Başka hiçbir yerde. */
   caution: '#D19A3A',
@@ -151,23 +156,28 @@ export const type = StyleSheet.create({
     color: color.ink,
     lineHeight: 19,
   },
-  /** İkincil/soluk düzyazı. */
+  /**
+   * İkincil/soluk düzyazı.
+   * Taban 12px: araç içinde, güneş yansımasında ve titreşimde 10-11px Barlow
+   * 400 pratikte okunmuyordu. Gerçekten üçüncül olan bilgi hiç gösterilmemeli,
+   * gösterilecekse en az bu boyutta.
+   */
   meta: {
     fontFamily: font.prose,
-    fontSize: 11,
+    fontSize: 12,
     color: color.muted,
     letterSpacing: 0.2,
   },
   metaSmall: {
     fontFamily: font.prose,
-    fontSize: 10,
+    fontSize: 12,
     color: color.muted,
-    letterSpacing: 0.4,
+    letterSpacing: 0.3,
   },
   /** Ham log / teknik döküm — sabit genişlik gerekir. */
   mono: {
     fontFamily: 'monospace',
-    fontSize: 11,
+    fontSize: 12,
     color: color.chrome,
   },
 });
