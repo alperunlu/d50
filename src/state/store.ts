@@ -1493,7 +1493,7 @@ function startCycleTicker(
     const step = CYCLE_STEPS[state.stepIndex];
     const now = Date.now();
     const elapsedMs = recordingContext ? now - recordingContext.startedAt : 0;
-    const progress = evaluateStep(step, get().liveSeries, cycleHeldSince, now, elapsedMs);
+    const progress = evaluateStep(step, get().liveSeries, cycleHeldSince, now, elapsedMs, cycleStepFromMs);
     cycleHeldSince = nextHeldSince(progress, cycleHeldSince, now);
 
     set((s) => (s.cycle ? { cycle: { ...s.cycle, progress } } : {}));

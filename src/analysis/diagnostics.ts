@@ -1549,6 +1549,46 @@ export function tyreSizeCalibration(
     };
   }
 
+  /**
+   * ÖLÇÜLDÜYSE (GPS'ten): gerçek bir bulgu — girilen ebatla FİİLEN dönen
+   * tekerlek uyuşmuyor. Aşınma, basınç ya da yanlış girilmiş bir ebat
+   * olabilir; `attention` burada doğru, çünkü bu app'in KENDİ VARSAYIMI
+   * değil, ölçtüğü bir şey.
+   *
+   * ÖLÇÜLMEDİYSE: burada dönen sayı VERİDEN gelmiyor, kullanıcının Link
+   * ekranında SEÇTİĞİ ebadın salt geometrisinden geliyor — aynı yüzde,
+   * kullanıcı o ebadı seçerken zaten bir kez gösterilmişti (bkz.
+   * `TyreOption`). Yani burada "keşfedilen" bir şey yok, kullanıcının
+   * kendi girdisinin aritmetik sonucu tekrarlanıyor.
+   *
+   * 8 Eylül 2026: 195/55 R16 girildi (MINI'nin kendi "Plus 1" fabrika
+   * seçeneği — R50'de 175/65 R15'in resmi alternatifi, uydurma bir ebat
+   * değil) ve `attention` (kırmızıya yakın amber) rengiyle "lastikler
+   * fabrikadan büyük" diye raporun TEŞHİS bölümünde, gerçek mekanik
+   * bulguların yanında listelendi. Kullanıcı haklı olarak bunu "arabamda
+   * bir sorun mu var" diye okudu — oysa GPS'in ya da ECU'nun yanlış
+   * ölçtüğüne dair HİÇBİR iddia yok, kayıt zaten hiç hareket etmemişti.
+   *
+   * Ölçülmediği sürece bu satır `ok` kalıyor: düzeltme hâlâ uygulanıyor
+   * ve hâlâ önemli, ama bu bir ARIZA değil bir KALİBRASYON notu. Gerçek
+   * bir yanlış girişi (aşırı büyük bir sapma) de aynı yolla ele alınıyor
+   * — "büyük" demek "bozuk" demek değil, "kontrol et" demek, ve bunu
+   * söylemenin yeri amber bir teşhis kartı değil sakin bir not.
+   */
+  if (measurement === null) {
+    return {
+      key, title, verdict: 'ok',
+      headline: 'Speed and distance are corrected for the tyre size entered in Link',
+      detail:
+        `This ${round(Math.abs(errorPct))} % comes from the SIZE you entered, not from a measurement — ` +
+        `the car has not been driven far enough in this recording for GPS to check it. Every ECU speed ` +
+        `and distance reading (and anything derived from them) is corrected by ${round(factor, 3)}× to ` +
+        `account for it. If that is not what is actually fitted, correct it in Link; if it is, a few ` +
+        `minutes above 40 km/h with GPS on replaces this estimate with a real measurement.`,
+      evidence,
+    };
+  }
+
   return {
     key, title, verdict: 'attention',
     headline:

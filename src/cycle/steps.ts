@@ -39,6 +39,24 @@ export interface StepCondition {
   readonly channel: string;
   readonly min?: number;
   readonly max?: number;
+  /**
+   * Kanal bu adım BAŞLADIĞINDAN BERİ en az bir kez bu değere ulaşmış olmalı.
+   *
+   * `min`/`max` yalnızca GÜNCEL değere bakıyor — "şu an öyle mi". Bazı
+   * adımların ölçtüğü şey bir OLAY (tur attın mı, hızlandın mı), "şu an"
+   * değil "oldu mu" sorusu. Bu ayrım olmadan iki adım 8 Eylül 2026 saha
+   * testinde sessizce yanlış tamamlandı:
+   *
+   *   - "Coast down": koşul yalnızca "hız ≤ 45" idi. Araç DURURKEN bu
+   *     zaten doğru — adım hiç coast etmeden, bir saniye içinde tamamlandı.
+   *   - "Rev sweep": koşul yalnızca "devir ≥ 400" idi, yani rölantide
+   *     BEKLEMEK bile 60 saniye sonra adımı bitiriyordu; sürücünün gerçekten
+   *     gaza bastığını hiçbir şey doğrulamıyordu.
+   *
+   * Bu alan, adımın gerektirdiği tepe değerin GERÇEKTEN görüldüğünü şart
+   * koşuyor.
+   */
+  readonly reachedAtLeastOnce?: number;
 }
 
 export interface CycleStep {
@@ -108,7 +126,12 @@ export const CYCLE_STEPS: readonly CycleStep[] = [
       'Cylinder balance and rotational balance from engine sound. Parked, so road and wind noise cannot inflate the orders.',
     channels: { pids: ['0C'], sensors: ['mic_db'] },
     holdSeconds: 60,
-    conditions: [{ label: 'engine running', channel: '0C', min: 400 }],
+    conditions: [
+      { label: 'engine running', channel: '0C', min: 400 },
+      // "engine running" tek başına rölantide beklemekle de sağlanıyordu —
+      // sürücü hiç gaza basmasa da 60 saniye sonra adım "tamamlanıyordu".
+      { label: 'revved above 2000 rpm at least once', channel: '0C', reachedAtLeastOnce: 2000 },
+    ],
   },
   {
     id: 'warm-up-drive',
@@ -155,7 +178,12 @@ export const CYCLE_STEPS: readonly CycleStep[] = [
     measures: 'Road load — rolling resistance and drag, which every power estimate leans on.',
     channels: { pids: ['0C', '0D'], sensors: ['gps_speed', 'accel_magnitude'] },
     holdSeconds: 0,
-    conditions: [{ label: 'slowed below 45 km/h', channel: '0D', max: 45 }],
+    conditions: [
+      // Durarak beklemek bunu bedavaya sağlıyordu — "≤ 45" duran arabada
+      // zaten doğru. Önce gerçekten hızlanmış olması şart koşuluyor.
+      { label: 'reached at least 55 km/h before coasting', channel: '0D', reachedAtLeastOnce: 55 },
+      { label: 'slowed below 45 km/h', channel: '0D', max: 45 },
+    ],
   },
   {
     id: 'warm-idle',

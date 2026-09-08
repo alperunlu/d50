@@ -58,10 +58,38 @@ function freshValue(series: LiveSeries, channel: string, elapsedMs: number): num
   return elapsedMs - last.ts <= MAX_SAMPLE_AGE_MS ? last.value : null;
 }
 
-function conditionMet(condition: StepCondition, value: number | null): boolean {
-  if (value === null) return false;
-  if (condition.min !== undefined && value < condition.min) return false;
-  if (condition.max !== undefined && value > condition.max) return false;
+/**
+ * Bir kanalın step BAŞLADIĞINDAN BERİ gördüğü en yüksek değer.
+ *
+ * `series` oturumun tamamını taşıyor (adım sınırında temizlenmiyor), bu
+ * yüzden `sinceMs`'ten öncesi kasıtlı olarak atlanıyor — yoksa ÖNCEKİ
+ * adımdan kalma bir tepe değeri ("rev sweep bitti, coast başladı, ama
+ * coast'un tepe hızı hâlâ rev sweep'ten önceki sürüşten") bu adıma sızardı.
+ */
+function peakSince(
+  series: LiveSeries,
+  channel: string,
+  sinceMs: number,
+): number | null {
+  const points = series[channel];
+  if (!points || points.length === 0) return null;
+  let peak: number | null = null;
+  for (const p of points) {
+    if (p.ts < sinceMs) continue;
+    if (peak === null || p.value > peak) peak = p.value;
+  }
+  return peak;
+}
+
+function conditionMet(condition: StepCondition, value: number | null, peak: number | null): boolean {
+  if (condition.reachedAtLeastOnce !== undefined) {
+    if (peak === null || peak < condition.reachedAtLeastOnce) return false;
+  }
+  if (condition.min !== undefined || condition.max !== undefined) {
+    if (value === null) return false;
+    if (condition.min !== undefined && value < condition.min) return false;
+    if (condition.max !== undefined && value > condition.max) return false;
+  }
   return true;
 }
 
@@ -82,10 +110,26 @@ export function evaluateStep(
    * AYNI saat. Tazelik ancak aynı saatle ölçülebilir.
    */
   elapsedMs: number,
+  /**
+   * Şu ANKİ adımın kaydın başından beri geçen süre cinsinden başlangıcı.
+   * `reachedAtLeastOnce`'ın tepe aramasını buraya kadar sınırlar; yoksa
+   * önceki bir adımdan kalma bir tepe değeri bu adıma sızar (bkz. peakSince).
+   * Verilmezse 0: tüm kaydı tara — testlerde ve `series` boş verildiğinde
+   * (bir adım daha yeni başlarken) zararsız.
+   */
+  stepStartMs = 0,
 ): StepProgress {
   const conditions: ConditionState[] = step.conditions.map((c) => {
     const value = freshValue(series, c.channel, elapsedMs);
-    return { label: c.label, met: conditionMet(c, value), value };
+    const peak = c.reachedAtLeastOnce !== undefined ? peakSince(series, c.channel, stepStartMs) : null;
+    const met = conditionMet(c, value, peak);
+    // Yalnızca tepe koşulu olan bir satırda GÜNCEL değeri göstermek yanıltır
+    // ("revved above 2000 rpm — 850" rölantideyken okunca ters anlaşılır);
+    // orada görülen en yüksek değer gösteriliyor.
+    const displayValue = c.reachedAtLeastOnce !== undefined && c.min === undefined && c.max === undefined
+      ? peak
+      : value;
+    return { label: c.label, met, value: displayValue };
   });
 
   const allMet = conditions.every((c) => c.met);
