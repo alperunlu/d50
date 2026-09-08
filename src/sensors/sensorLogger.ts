@@ -28,7 +28,7 @@
  */
 import { MicLevelMeter } from './micLevel';
 import { EngineSoundListener, isAudioStreamAvailable } from './engineSound';
-import { DEFAULT_SPL_CALIBRATION_DB } from '../analysis/spl';
+import { DEFAULT_SPL_CALIBRATION_DB, dbfsToSpl } from '../analysis/spl';
 import type { SensorGroupKey } from '../data/channels';
 
 type LocationModule = typeof import('expo-location');
@@ -184,8 +184,19 @@ export class SensorLogger {
 
     this.opts.onError?.('Falling back to level-only microphone (no order tracking)');
     this.mic = new MicLevelMeter({ onError: (m) => this.opts.onError?.(m) });
+    /**
+     * Ham dBFS DEĞİL, kalibre edilmiş SPL yazılıyor.
+     *
+     * `EngineSoundListener` yolu zaten `getCalibrationDb()`'yi uyguluyordu;
+     * bu geri düşüş yolu unutulmuştu ve ham dBFS'i `mic_db` diye
+     * kaydediyordu — kalibrasyonu 0'a sabitlemekle aynı şey. Artık kayıt
+     * kartı gürültü metresinin TEK arayüzü olduğu için (bkz. Link'teki
+     * mikrofon kontrolü) bu sessiz tutarsızlık artık daha görünür bir
+     * hataya dönüşürdü.
+     */
     await this.mic.start((dbfs) => {
-      this.push({ key: 'mic_db', ts: Date.now() - this.opts.startedAt, value: dbfs });
+      const calibrated = dbfsToSpl(dbfs, this.opts.getCalibrationDb?.() ?? DEFAULT_SPL_CALIBRATION_DB);
+      this.push({ key: 'mic_db', ts: Date.now() - this.opts.startedAt, value: calibrated });
     });
   }
 

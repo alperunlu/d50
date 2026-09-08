@@ -3,7 +3,7 @@ import { View, Text, StyleSheet, Pressable, ScrollView, ActivityIndicator } from
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useAppStore } from '../src/state/store';
 import { VehicleChrome } from '../src/ui/VehicleChrome';
-import { SectionRule, PrimaryAction, GhostAction, Note, Label } from '../src/ui/primitives';
+import { SectionRule, PrimaryAction, GhostAction, Note, Label, Frame, Measure } from '../src/ui/primitives';
 import {
   formatTyreSize,
   rollingCircumferenceMm,
@@ -13,6 +13,7 @@ import {
 } from '../src/analysis/tyre';
 import type { TyreSize } from '../src/analysis/vehicle';
 import { decodeVin } from '../src/obd/vin';
+import { describeSpl, MIN_SPL_CALIBRATION_DB, MAX_SPL_CALIBRATION_DB } from '../src/analysis/spl';
 import { color, type, space, hairlineWidth } from '../src/ui/theme';
 
 /**
@@ -43,6 +44,18 @@ export default function LinkScreen() {
   const tyreError = useAppStore((s) => s.tyreError);
   const setFittedTyre = useAppStore((s) => s.setFittedTyre);
   const [tyreOpen, setTyreOpen] = useState(false);
+
+  const soundMeterOn = useAppStore((s) => s.soundMeterOn);
+  const soundNow = useAppStore((s) => s.soundNow);
+  const soundMin = useAppStore((s) => s.soundMin);
+  const soundMax = useAppStore((s) => s.soundMax);
+  const soundAvg = useAppStore((s) => s.soundAvg);
+  const soundError = useAppStore((s) => s.soundError);
+  const splCalibrationDb = useAppStore((s) => s.splCalibrationDb);
+  const startSoundMeter = useAppStore((s) => s.startSoundMeter);
+  const stopSoundMeter = useAppStore((s) => s.stopSoundMeter);
+  const resetSoundStats = useAppStore((s) => s.resetSoundStats);
+  const setSplCalibration = useAppStore((s) => s.setSplCalibration);
 
   const busy = connectionState === 'connecting';
   const linked = connectionState === 'connected';
@@ -195,6 +208,36 @@ export default function LinkScreen() {
             </Text>
           ) : null}
         </View>
+
+        {/*
+          Buraya taşındı (eskiden Live ekranındaydı) çünkü kalibrasyon canlı
+          geri bildirim istiyor: elindeki referans metreye bakıp +/- ile
+          sayı eşleşene kadar nudge ediyorsun. Sayı ile düğmeler aynı ekranda
+          olmalı, yoksa her dokunuşta iki ekran arası gidip gelmen gerekirdi.
+
+          OBD'den de BAĞIMSIZ: adaptöre bağlanmadan, kayıt başlatmadan
+          çalışır — "kabinde şu an ne kadar gürültü var" sorusunun aracın
+          ECU'suyla ilgisi yok. Bu yüzden bir kurulum işi olarak Link'te
+          duruyor, tıpkı lastik ebadı gibi.
+
+          Live ekranındaki `mic_db` kartı artık BUNDAN bağımsız: kayıt
+          sırasında SensorLogger'ın kendi mikrofon dinleyicisinden besleniyor.
+        */}
+        <View style={{ marginTop: space(6) }}>
+          <SoundMeter
+            on={soundMeterOn}
+            now={soundNow}
+            min={soundMin}
+            max={soundMax}
+            avg={soundAvg}
+            error={soundError}
+            calibration={splCalibrationDb}
+            onStart={() => void startSoundMeter()}
+            onStop={stopSoundMeter}
+            onReset={resetSoundStats}
+            onCalibrate={(delta) => void setSplCalibration(splCalibrationDb + delta)}
+          />
+        </View>
       </ScrollView>
 
       <View style={styles.actions}>
@@ -275,6 +318,120 @@ function vinSummary(vin: string): string {
   return known.length > 0 ? known.join(' · ') : `WMI ${info.wmi}`;
 }
 
+/**
+ * Gürültü ölçer — dB(A).
+ *
+ * OBD'den bağımsız: adaptör bağlı olmasa da çalışıyor, çünkü "kabinde ne
+ * kadar gürültü var" sorusunun aracın ECU'suyla ilgisi yok. Ölçüm ayrı
+ * bir uygulama gerektirmesin diye Link ekranına, kurulum işlerinin
+ * yanına kondu (bkz. Tyres bölümü — aynı gerekçe).
+ *
+ * Anlık değerin yanında MIN/ORT/MAKS de gösteriliyor: gürültü sürekli
+ * dalgalanır, tek bir anlık sayı ("73") aslında hiçbir şey söylemez.
+ * Bir desibelmetreyi kullanılabilir kılan, bir süre boyunca tutulan
+ * bu üç değerdir.
+ */
+function SoundMeter({
+  on,
+  now,
+  min,
+  max,
+  avg,
+  error,
+  calibration,
+  onStart,
+  onStop,
+  onReset,
+  onCalibrate,
+}: {
+  on: boolean;
+  now: number | null;
+  min: number | null;
+  max: number | null;
+  avg: number | null;
+  error: string | null;
+  calibration: number;
+  onStart: () => void;
+  onStop: () => void;
+  onReset: () => void;
+  onCalibrate: (delta: number) => void;
+}) {
+  return (
+    <View>
+      <SectionRule
+        label="Microphone"
+        meta={on ? 'Measuring' : 'Off'}
+        metaColor={on ? color.linked : undefined}
+      />
+
+      <Frame style={styles.soundFrame} cornerTint="rgba(241,235,221,0.5)">
+        <Measure hero value={now === null ? null : now.toFixed(1)} unit="dB(A)" />
+        <Text style={[type.meta, { marginTop: space(1) }]}>
+          {now === null ? 'Not measuring' : describeSpl(now)}
+        </Text>
+
+        <View style={styles.soundStats}>
+          <SoundStat label="Min" value={min} />
+          <SoundStat label="Avg" value={avg} />
+          <SoundStat label="Max" value={max} />
+        </View>
+      </Frame>
+
+      <View style={styles.soundActions}>
+        {on ? (
+          <GhostAction label="Stop" onPress={onStop} style={{ flex: 1 }} />
+        ) : (
+          <PrimaryAction label="Measure" onPress={onStart} style={{ flex: 1 }} />
+        )}
+        <GhostAction label="Reset" onPress={onReset} style={{ flex: 1 }} />
+      </View>
+
+      {/*
+        Kalibrasyon: telefon mikrofonu kalibre bir ölçüm cihazı değil, o yüzden
+        mutlak doğruluk ancak bilinen bir referansla eşitlenerek sağlanır.
+        Ticari desibelmetre uygulamalarının yaptığı da budur.
+      */}
+      <View style={styles.calibrationRow}>
+        <View style={{ flex: 1 }}>
+          <Label small>Calibration</Label>
+          <Text style={[type.metaSmall, { marginTop: space(0.75), lineHeight: 14 }]}>
+            {`0 dBFS = ${calibration} dB SPL. Put a meter you trust next to the phone and nudge until they agree.`}
+          </Text>
+        </View>
+        <Pressable
+          style={styles.calButton}
+          onPress={() => onCalibrate(-1)}
+          disabled={calibration <= MIN_SPL_CALIBRATION_DB}
+        >
+          <Text style={[type.status, { color: color.ink, fontSize: 15 }]}>−</Text>
+        </Pressable>
+        <Pressable
+          style={styles.calButton}
+          onPress={() => onCalibrate(1)}
+          disabled={calibration >= MAX_SPL_CALIBRATION_DB}
+        >
+          <Text style={[type.status, { color: color.ink, fontSize: 15 }]}>+</Text>
+        </Pressable>
+      </View>
+
+      {error ? (
+        <Text style={[type.meta, { color: color.caution, marginTop: space(2) }]}>{error}</Text>
+      ) : null}
+    </View>
+  );
+}
+
+function SoundStat({ label, value }: { label: string; value: number | null }) {
+  return (
+    <View style={{ flex: 1 }}>
+      <Label small>{label}</Label>
+      <Text style={[type.cellValue, { fontSize: 18, lineHeight: 20, marginTop: space(0.5) }]}>
+        {value === null ? '·' : value.toFixed(1)}
+      </Text>
+    </View>
+  );
+}
+
 function Fact({ label, value }: { label: string; value: string }) {
   return (
     <View style={styles.factRow}>
@@ -330,6 +487,31 @@ const styles = StyleSheet.create({
     backgroundColor: color.groundAlt,
   },
   tyreList: { marginTop: space(1) },
+  soundFrame: { paddingBottom: space(2), marginTop: space(1) },
+  soundStats: {
+    flexDirection: 'row',
+    gap: space(3),
+    marginTop: space(3),
+    paddingTop: space(2.5),
+    borderTopWidth: hairlineWidth,
+    borderTopColor: color.hairlineFaint,
+  },
+  soundActions: { flexDirection: 'row', gap: space(3), marginTop: space(3) },
+  calibrationRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: space(2.5),
+    marginTop: space(3),
+  },
+  calButton: {
+    width: 44,
+    height: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: hairlineWidth,
+    borderColor: color.hairlineStrong,
+    backgroundColor: color.groundAlt,
+  },
   tyreOption: {
     flexDirection: 'row',
     alignItems: 'center',

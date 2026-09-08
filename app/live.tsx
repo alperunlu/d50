@@ -6,7 +6,6 @@ import { orderedCards } from '../src/data/cardOrder';
 import { getPidDefinition } from '../src/obd/pids';
 import { getChannel, SELECTABLE_SENSOR_CHANNELS } from '../src/data/channels';
 import { deriveLive, type DerivedReading } from '../src/analysis/live';
-import { describeSpl, MIN_SPL_CALIBRATION_DB, MAX_SPL_CALIBRATION_DB } from '../src/analysis/spl';
 import { VehicleChrome } from '../src/ui/VehicleChrome';
 import { DragGrid } from '../src/ui/DragGrid';
 import { CYCLE_STEPS } from '../src/cycle/steps';
@@ -51,18 +50,6 @@ export default function LiveScreen() {
   const selectedSensorChannels = useAppStore((s) => s.selectedSensorChannels);
   const toggleSensorChannel = useAppStore((s) => s.toggleSensorChannel);
   const sensorStatus = useAppStore((s) => s.sensorStatus);
-
-  const soundMeterOn = useAppStore((s) => s.soundMeterOn);
-  const soundNow = useAppStore((s) => s.soundNow);
-  const soundMin = useAppStore((s) => s.soundMin);
-  const soundMax = useAppStore((s) => s.soundMax);
-  const soundAvg = useAppStore((s) => s.soundAvg);
-  const soundError = useAppStore((s) => s.soundError);
-  const splCalibrationDb = useAppStore((s) => s.splCalibrationDb);
-  const startSoundMeter = useAppStore((s) => s.startSoundMeter);
-  const stopSoundMeter = useAppStore((s) => s.stopSoundMeter);
-  const resetSoundStats = useAppStore((s) => s.resetSoundStats);
-  const setSplCalibration = useAppStore((s) => s.setSplCalibration);
 
   const [picking, setPicking] = useState(false);
   // Sürükleme sırasında ScrollView kilitleniyor; yoksa kart yerine
@@ -200,20 +187,6 @@ export default function LiveScreen() {
               <CellChannel channelKey={key} series={liveSeries[key] ?? []} />
             )}
           />}
-
-          <SoundMeter
-            on={soundMeterOn}
-            now={soundNow}
-            min={soundMin}
-            max={soundMax}
-            avg={soundAvg}
-            error={soundError}
-            calibration={splCalibrationDb}
-            onStart={() => void startSoundMeter()}
-            onStop={stopSoundMeter}
-            onReset={resetSoundStats}
-            onCalibrate={(delta) => void setSplCalibration(splCalibrationDb + delta)}
-          />
 
           <DerivedSection series={liveSeries} isPidSupported={isPidSupported} />
         </ScrollView>
@@ -368,119 +341,6 @@ const CellChannel = React.memo(function CellChannel({
     </Frame>
   );
 });
-
-/**
- * Gürültü ölçer — dB(A).
- *
- * OBD'den bağımsız: adaptör bağlı olmasa da çalışıyor, çünkü "kabinde ne
- * kadar gürültü var" sorusunun aracın ECU'suyla ilgisi yok. Ölçüm ayrı
- * bir uygulama gerektirmesin diye buraya kondu.
- *
- * Anlık değerin yanında MIN/ORT/MAKS de gösteriliyor: gürültü sürekli
- * dalgalanır, tek bir anlık sayı ("73") aslında hiçbir şey söylemez.
- * Bir desibelmetreyi kullanılabilir kılan, bir süre boyunca tutulan
- * bu üç değerdir.
- */
-function SoundMeter({
-  on,
-  now,
-  min,
-  max,
-  avg,
-  error,
-  calibration,
-  onStart,
-  onStop,
-  onReset,
-  onCalibrate,
-}: {
-  on: boolean;
-  now: number | null;
-  min: number | null;
-  max: number | null;
-  avg: number | null;
-  error: string | null;
-  calibration: number;
-  onStart: () => void;
-  onStop: () => void;
-  onReset: () => void;
-  onCalibrate: (delta: number) => void;
-}) {
-  return (
-    <View style={{ marginTop: space(2) }}>
-      <SectionRule
-        label="Noise"
-        meta={on ? 'Measuring' : 'Off'}
-        metaColor={on ? color.linked : undefined}
-      />
-
-      <Frame style={styles.soundFrame} cornerTint="rgba(241,235,221,0.5)">
-        <Measure hero value={now === null ? null : now.toFixed(1)} unit="dB(A)" />
-        <Text style={[type.meta, { marginTop: space(1) }]}>
-          {now === null ? 'Not measuring' : describeSpl(now)}
-        </Text>
-
-        <View style={styles.soundStats}>
-          <SoundStat label="Min" value={min} />
-          <SoundStat label="Avg" value={avg} />
-          <SoundStat label="Max" value={max} />
-        </View>
-      </Frame>
-
-      <View style={styles.soundActions}>
-        {on ? (
-          <GhostAction label="Stop" onPress={onStop} style={{ flex: 1 }} />
-        ) : (
-          <PrimaryAction label="Measure" onPress={onStart} style={{ flex: 1 }} />
-        )}
-        <GhostAction label="Reset" onPress={onReset} style={{ flex: 1 }} />
-      </View>
-
-      {/*
-        Kalibrasyon: telefon mikrofonu kalibre bir ölçüm cihazı değil, o yüzden
-        mutlak doğruluk ancak bilinen bir referansla eşitlenerek sağlanır.
-        Ticari desibelmetre uygulamalarının yaptığı da budur.
-      */}
-      <View style={styles.calibrationRow}>
-        <View style={{ flex: 1 }}>
-          <Label small>Calibration</Label>
-          <Text style={[type.metaSmall, { marginTop: space(0.75), lineHeight: 14 }]}>
-            {`0 dBFS = ${calibration} dB SPL. Put a meter you trust next to the phone and nudge until they agree.`}
-          </Text>
-        </View>
-        <Pressable
-          style={styles.calButton}
-          onPress={() => onCalibrate(-1)}
-          disabled={calibration <= MIN_SPL_CALIBRATION_DB}
-        >
-          <Text style={[type.status, { color: color.ink, fontSize: 15 }]}>−</Text>
-        </Pressable>
-        <Pressable
-          style={styles.calButton}
-          onPress={() => onCalibrate(1)}
-          disabled={calibration >= MAX_SPL_CALIBRATION_DB}
-        >
-          <Text style={[type.status, { color: color.ink, fontSize: 15 }]}>+</Text>
-        </Pressable>
-      </View>
-
-      {error ? (
-        <Text style={[type.meta, { color: color.caution, marginTop: space(2) }]}>{error}</Text>
-      ) : null}
-    </View>
-  );
-}
-
-function SoundStat({ label, value }: { label: string; value: number | null }) {
-  return (
-    <View style={{ flex: 1 }}>
-      <Label small>{label}</Label>
-      <Text style={[type.cellValue, { fontSize: 18, lineHeight: 20, marginTop: space(0.5) }]}>
-        {value === null ? '·' : value.toFixed(1)}
-      </Text>
-    </View>
-  );
-}
 
 /**
  * Türetilmiş ölçümler — tek bir PID'in söyleyemeyeceği şeyler.
@@ -763,31 +623,6 @@ const styles = StyleSheet.create({
     borderBottomColor: color.hairlineFaint,
   },
   derivedValue: { flexDirection: 'row', alignItems: 'baseline', gap: space(1.5) },
-  soundFrame: { paddingBottom: space(2) },
-  soundStats: {
-    flexDirection: 'row',
-    gap: space(3),
-    marginTop: space(3),
-    paddingTop: space(2.5),
-    borderTopWidth: hairlineWidth,
-    borderTopColor: color.hairlineFaint,
-  },
-  soundActions: { flexDirection: 'row', gap: space(3), marginTop: space(3) },
-  calibrationRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: space(2.5),
-    marginTop: space(3),
-  },
-  calButton: {
-    width: 44,
-    height: 44,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: hairlineWidth,
-    borderColor: color.hairlineStrong,
-    backgroundColor: color.groundAlt,
-  },
   pickMark: {
     width: 22,
     height: 22,

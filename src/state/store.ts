@@ -212,7 +212,11 @@ interface AppState {
    *
    * OBD'den BAĞIMSIZ çalışır: adaptör takılı olmasa da, kayıt sürmese de
    * kullanılabilir. Amaç bunun tek başına bir desibelmetre olması;
-   * araç bağlantısını şart koşmak onu kullanılamaz kılardı.
+   * araç bağlantısını şart koşmak onu kullanılamaz kılardı. Arayüzü Link
+   * ekranında — bir kurulum işi, tıpkı lastik ebadı gibi. Kayıt sırasında
+   * Live'daki `mic_db` kartını besleyen SensorLogger'ın kendi mikrofon
+   * dinleyicisi bundan tamamen ayrı; `startRecording` ikisinin aynı anda
+   * mikrofonu istemesini önlemek için bunu durduruyor (bkz. orada).
    */
   soundMeterOn: boolean;
   soundNow: number | null;
@@ -859,6 +863,18 @@ export const useAppStore = create<AppState>((set, get) => ({
     const selectedPids = channels?.pids ?? get().selectedPids;
     if (!queue) throw new Error('You must connect first');
     if (selectedPids.length === 0) throw new Error('You must select at least one PID');
+
+    /**
+     * Bağımsız gürültü metresi (Link ekranı) çalışıyorsa önce o durduruluyor.
+     *
+     * İkisi de aynı mikrofonu istiyor: standalone metre kendi dinleyicisini
+     * açık tutarken kayıt `mic_db` seçiliyse SensorLogger İKİNCİ bir
+     * dinleyici açmaya çalışır — iOS'ta ses oturumu tek sahiplidir, sonucu
+     * tanımsız. Eskiden ikisinin kontrolü aynı ekrandaydı ve kullanıcı
+     * doğal olarak birini bırakıp ötekini başlatıyordu; kontrol ayrı
+     * ekranlara taşınınca (bkz. Link) bu artık garanti değil.
+     */
+    if (get().soundMeterOn) get().stopSoundMeter();
 
     /**
      * ECU'nun DESTEKLEMEDİĞİNİ söylediği kanalları sormuyoruz.
