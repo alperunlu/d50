@@ -41,6 +41,14 @@ export interface VehicleProfile {
   /** Normal çalışma sıcaklığı (°C). */
   readonly normalCoolantC: number;
   /**
+   * Motor çalışırken AKÜ UÇLARINDA beklenen gerilim bandı (V).
+   *
+   * Araca ait: sabit regülatörlü eski sistemlerle, şarjı bilerek kısan
+   * modern "akıllı" alternatörlerin bantları aynı değil. R50 (2001-2006)
+   * sabit regülatörlü — Valeo regülatörünün ayar noktası ~14.5 V.
+   */
+  readonly chargingVoltageV: { readonly min: number; readonly max: number };
+  /**
    * ECU'nun hız/mesafe hesabında varsaydığı FABRİKA lastik ebadı.
    * Araca ait sabit bir değer; kullanıcı değiştirmez.
    */
@@ -64,6 +72,8 @@ export const MINI_R50: VehicleProfile = {
   idleRpm: 850,
   thermostatOpenC: 88,
   normalCoolantC: 95,
+  // Üretici/servis kaynakları: motor çalışırken 13.5-14.8 V, ayar ~14.5 V.
+  chargingVoltageV: { min: 13.5, max: 14.8 },
   // R50 Cooper'ın standart ebadı. Kullanıcı farklı bir ebat taktıysa
   // `fittedTyre` ayarlardan güncellenir; fabrika değeri sabit kalır çünkü
   // ECU'nun hız hesabı ona göre kalibre edilmiştir.
@@ -89,3 +99,23 @@ export const PHYSICS = {
   /** Benzin yoğunluğu (g/L). */
   gasolineDensityGPerL: 745,
 } as const;
+
+/**
+ * Profilin getirdiği ve türetilmiş sonuçları DOĞRUDAN belirleyen sayılar.
+ *
+ * Raporda yazıyor çünkü bu değerler ölçüm değil varsayım, ve rapordaki
+ * güç/tork/tüketim/yol yükü rakamlarının hepsi bunlara bağlı. Kütle 100 kg
+ * yanlışsa tork tahmini de o oranda yanlış — okuyan kişinin bunu görmesi,
+ * sonra keşfetmesinden iyi.
+ */
+export function profileAssumptions(v: VehicleProfile): string[] {
+  const t = v.fittedTyre;
+  return [
+    `mass ${v.massKg} kg`,
+    `displacement ${v.displacementL.toFixed(3)} L`,
+    `Cd ${v.dragCoefficient} over ${v.frontalAreaM2} m²`,
+    `rolling resistance ${v.rollingResistance}`,
+    `idle ${v.idleRpm} rpm`,
+    `tyres ${t.widthMm}/${t.aspectRatio} R${t.rimInch}`,
+  ];
+}

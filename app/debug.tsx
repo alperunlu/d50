@@ -4,12 +4,12 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Updates from 'expo-updates';
 import { useAppStore } from '../src/state/store';
 import { writeAndShare } from '../src/util/exportFile';
-import { ALLOWED_COMMANDS_SUMMARY } from '../src/obd/allowlist';
 import type { RawLogEntry } from '../src/state/store';
 import type { ProfileCandidate } from '../src/ble/profiles';
 import { VehicleChrome } from '../src/ui/VehicleChrome';
 import { SectionRule, GhostAction, PrimaryAction, Note, Tag } from '../src/ui/primitives';
 import { JS_BUILD_TAG } from '../src/ui/buildTag';
+import { readLastCrash, clearLastCrash, type CrashRecord } from '../src/util/crashLog';
 import { color, type, space, hairlineWidth } from '../src/ui/theme';
 
 /**
@@ -35,8 +35,13 @@ export default function DebugScreen() {
   const runPidScan = useAppStore((s) => s.runPidScan);
 
   const [busy, setBusy] = useState(false);
+  /**
+   * Son yakalanmamış JS hatası. TestFlight'ın çökme raporu yalnızca yerel
+   * yığını içeriyor — hatanın metni bu dosyada; uygulama yeniden açılınca
+   * burada görünür.
+   */
+  const [crash, setCrash] = useState<CrashRecord | null>(() => readLastCrash());
   const [manualBusy, setManualBusy] = useState(false);
-  const [showCommands, setShowCommands] = useState(false);
   const [updateBusy, setUpdateBusy] = useState(false);
 
   /**
@@ -64,6 +69,30 @@ export default function DebugScreen() {
     } finally {
       setUpdateBusy(false);
     }
+  }, []);
+
+  const shareCrash = useCallback(async () => {
+    if (!crash) return;
+    const text =
+      `${new Date(crash.at).toISOString()} ${crash.fatal ? 'FATAL' : 'non-fatal'}\n` +
+      `${crash.message}\n\n${crash.stack ?? '(no stack)'}\n\n` +
+      `Breadcrumbs:\n${crash.breadcrumbs.join('\n')}\n`;
+    try {
+      const { uri, shared } = await writeAndShare(
+        `d50_crash_${crash.at}.txt`,
+        text,
+        'text/plain',
+        'Share crash report',
+      );
+      if (!shared) Alert.alert('Sharing unavailable', `File saved: ${uri}`);
+    } catch (e) {
+      Alert.alert('Error', e instanceof Error ? e.message : String(e));
+    }
+  }, [crash]);
+
+  const dismissCrash = useCallback(() => {
+    clearLastCrash();
+    setCrash(null);
   }, []);
 
   const shareLog = useCallback(async () => {
@@ -133,6 +162,33 @@ export default function DebugScreen() {
             style={{ marginTop: space(2.5) }}
           />
 
+          {crash && (
+            <View style={{ marginTop: space(5) }}>
+              <SectionRule
+                label="Last crash"
+                meta={new Date(crash.at).toLocaleString()}
+                metaColor={color.alert}
+              />
+              <Text style={[type.prose, { color: color.ink, marginTop: space(2) }]}>
+                {crash.message}
+              </Text>
+              {crash.stack ? (
+                <Text style={[type.metaSmall, { marginTop: space(2), lineHeight: 14 }]}>
+                  {crash.stack.split('\n').slice(0, 8).join('\n')}
+                </Text>
+              ) : null}
+              {crash.breadcrumbs.length > 0 ? (
+                <Text style={[type.metaSmall, { marginTop: space(2), lineHeight: 14 }]}>
+                  {crash.breadcrumbs.slice(-4).join('\n')}
+                </Text>
+              ) : null}
+              <View style={{ flexDirection: 'row', gap: space(3), marginTop: space(2.5) }}>
+                <GhostAction label="Share crash" onPress={shareCrash} style={{ flex: 1 }} />
+                <GhostAction label="Dismiss" onPress={dismissCrash} style={{ flex: 1 }} />
+              </View>
+            </View>
+          )}
+
           {bleCandidates && bleCandidates.length > 0 && (
             <View style={{ marginTop: space(5) }}>
               <SectionRule label="Manual profile" meta="No automatic match" metaColor={color.caution} />
@@ -188,16 +244,6 @@ export default function DebugScreen() {
             />
           </View>
 
-          <View style={{ marginTop: space(5) }}>
-            <Pressable onPress={() => setShowCommands((v) => !v)}>
-              <SectionRule label="Allowed commands" meta={showCommands ? 'Hide' : 'Show'} />
-            </Pressable>
-            {showCommands && (
-              <Text style={[type.mono, { marginTop: space(2.5), lineHeight: 16 }]}>
-                {ALLOWED_COMMANDS_SUMMARY}
-              </Text>
-            )}
-          </View>
         </ScrollView>
 
         <View style={styles.logSection}>

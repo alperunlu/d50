@@ -9,6 +9,7 @@ import { deriveLive, type DerivedReading } from '../src/analysis/live';
 import { describeSpl, MIN_SPL_CALIBRATION_DB, MAX_SPL_CALIBRATION_DB } from '../src/analysis/spl';
 import { VehicleChrome } from '../src/ui/VehicleChrome';
 import { DragGrid } from '../src/ui/DragGrid';
+import { CYCLE_STEPS } from '../src/cycle/steps';
 import {
   Frame,
   Label,
@@ -37,6 +38,11 @@ export default function LiveScreen() {
   const selectedPids = useAppStore((s) => s.selectedPids);
   const liveSeries = useAppStore((s) => s.liveSeries);
   const isRecording = useAppStore((s) => s.isRecording);
+  const recordingGaps = useAppStore((s) => s.recordingGaps);
+  const cycle = useAppStore((s) => s.cycle);
+  const startCycle = useAppStore((s) => s.startCycle);
+  const advanceCycle = useAppStore((s) => s.advanceCycle);
+  const stopCycle = useAppStore((s) => s.stopCycle);
   const sampleRate = useAppStore((s) => s.sampleRate);
   const startRecording = useAppStore((s) => s.startRecording);
   const stopRecording = useAppStore((s) => s.stopRecording);
@@ -96,7 +102,7 @@ export default function LiveScreen() {
             <Text
               style={[
                 type.cellValue,
-                { fontSize: 22, lineHeight: 22 },
+                { fontSize: 22, lineHeight: 24 },
                 !isRecording && { color: color.muted },
               ]}
             >
@@ -105,16 +111,37 @@ export default function LiveScreen() {
             <Label small>samples/s</Label>
           </View>
 
-          <Pressable
-            style={[styles.recordChip, isRecording && styles.recordChipOn]}
-            onPress={() => (isRecording ? stopRecording() : startRecording())}
-            disabled={notConnected}
-          >
-            <StatusDot
-              text={isRecording ? 'Recording' : 'Record'}
-              tint={isRecording ? color.alert : color.chrome}
-            />
-          </Pressable>
+          <View style={styles.topActions}>
+            {/*
+              Cycle çalışırken Record düğmesi gizleniyor: cycle zaten bir
+              kayıttır, ikinci bir "kaydı durdur" düğmesi iki farklı şeyi
+              durduruyormuş gibi görünürdü.
+            */}
+            {!cycle && (
+              <Pressable
+                style={[styles.recordChip, isRecording && styles.recordChipOn]}
+                onPress={() => (isRecording ? stopRecording() : startRecording())}
+                disabled={notConnected}
+              >
+                <StatusDot
+                  text={isRecording ? 'Recording' : 'Record'}
+                  tint={isRecording ? color.alert : color.chrome}
+                />
+              </Pressable>
+            )}
+
+            {!isRecording && !cycle && (
+              <Pressable
+                style={styles.recordChip}
+                onPress={() => void startCycle()}
+                disabled={notConnected}
+              >
+                <Text style={[type.status, { color: notConnected ? color.muted : color.chrome }]}>
+                  Guided
+                </Text>
+              </Pressable>
+            )}
+          </View>
         </View>
 
         <ScrollView
@@ -128,16 +155,41 @@ export default function LiveScreen() {
             </Text>
           )}
 
-          {selectedPids.length === 0 && (
+          {selectedPids.length === 0 && !cycle && (
             <Text style={[type.meta, styles.hint]}>No channels selected.</Text>
+          )}
+
+          {cycle && (
+            <CyclePanel
+              state={cycle}
+              onDone={() => advanceCycle(false)}
+              onSkip={() => advanceCycle(true)}
+              onStop={() => void stopCycle()}
+            />
+          )}
+
+          {/*
+            Arka planda geçen süre kaydedilmiyor. Sessizce eksik bir gezi
+            teslim etmektense burada söylemek gerekiyor: kullanıcı ya
+            telefonu açık bırakır ya da eksiği bilerek kabul eder.
+          */}
+          {recordingGaps.length > 0 && (
+            <Text style={[type.meta, styles.hint, { color: color.caution }]}>
+              {`${recordingGaps.length} gap${recordingGaps.length === 1 ? '' : 's'} in this recording — ` +
+                `${recordingGaps.reduce((total, g) => total + g.seconds, 0)} s were not recorded while the app was in the background. ` +
+                'Keep the app open and the screen on.'}
+            </Text>
           )}
 
           {/*
             Kartlar yerlerinde sürüklenebiliyor: bir kartı basılı tutup
             başka bir kartın üstüne bırakınca sıra değişiyor. İlk kart
             ekranın sahibi olan büyük kart.
+
+            Cycle çalışırken ızgara gizleniyor: o an ekranın sahibi
+            talimattır, sürücünün araması gereken tek şey odur.
           */}
-          <DragGrid
+          {!cycle && <DragGrid
             cards={cards}
             onReorder={moveCard}
             onDragStateChange={setDragging}
@@ -147,7 +199,7 @@ export default function LiveScreen() {
             renderCell={(key) => (
               <CellChannel channelKey={key} series={liveSeries[key] ?? []} />
             )}
-          />
+          />}
 
           <SoundMeter
             on={soundMeterOn}
@@ -179,6 +231,91 @@ export default function LiveScreen() {
         </View>
       </View>
     </SafeAreaView>
+  );
+}
+
+
+/**
+ * Rehberli test cycle'ının paneli.
+ *
+ * Ekranın sahibi TALİMAT. Sürücü araç kullanırken buraya bakacak; okunacak
+ * tek cümle, sağlanması gereken koşullar ve kalan süre dışındaki her şey
+ * gürültü. Koşullar canlı yeşilleniyor ki sürücü "yeterince yavaş mıyım"
+ * sorusunu ekrana bakarak cevaplayabilsin.
+ */
+function CyclePanel({
+  state,
+  onDone,
+  onSkip,
+  onStop,
+}: {
+  state: NonNullable<ReturnType<typeof useAppStore.getState>['cycle']>;
+  onDone: () => void;
+  onSkip: () => void;
+  onStop: () => void;
+}) {
+  const step = CYCLE_STEPS[state.stepIndex];
+  const { progress } = state;
+  const remaining =
+    step.holdSeconds > 0 ? Math.max(0, Math.ceil(step.holdSeconds - progress.heldSeconds)) : null;
+
+  return (
+    <View style={{ marginTop: space(2) }}>
+      <SectionRule
+        label={`Step ${state.stepIndex + 1} of ${CYCLE_STEPS.length}`}
+        meta={step.title}
+      />
+
+      <Text style={[type.headline, { color: color.ink, marginTop: space(3) }]}>
+        {step.instruction}
+      </Text>
+
+      {/* İlerleme: çubuk değil hairline — tasarımın dili bu. */}
+      <View style={styles.cycleTrack}>
+        <View style={[styles.cycleFill, { flex: Math.max(0.001, progress.fraction) }]} />
+        <View style={{ flex: Math.max(0.001, 1 - progress.fraction) }} />
+      </View>
+
+      <View style={styles.cycleConditions}>
+        {progress.conditions.map((c) => (
+          <Text
+            key={c.label}
+            style={[type.metaSmall, { color: c.met ? color.linked : color.caution }]}
+          >
+            {`${c.met ? '✓' : '·'} ${c.label}${c.value === null ? '' : ` — ${c.value.toFixed(0)}`}`}
+          </Text>
+        ))}
+        {remaining !== null ? (
+          <Text style={[type.metaSmall, { color: color.chrome }]}>{`${remaining} s left`}</Text>
+        ) : null}
+      </View>
+
+      <Text style={[type.meta, { marginTop: space(2.5), lineHeight: 16 }]}>{step.measures}</Text>
+
+      {/*
+        Ekran kapanırsa iOS uygulamayı askıya alır ve adım sayacı donar.
+        Arka plan modları bir sonraki derlemeye kadar yok.
+      */}
+      <Text style={[type.metaSmall, { marginTop: space(2), color: color.caution }]}>
+        Keep this screen open — the step timer stops if the app is suspended.
+      </Text>
+
+      {/*
+        "Done, next" ile "Skip step" AYNI ŞEY DEĞİL.
+        7 Eylül 2026 saha testinde ikisi de aynı çağrıyı yapıyordu: kontak
+        adımı kurallara uygun tamamlandı (motor kapalı, 11.4 V veride
+        duruyor) ama "atlandı" diye kaydedildi, akü vital'i hiç üretilmedi
+        ve rapor "yeterli veri yok" dedi. Ölçüm elde, kayıt çöpte.
+      */}
+      <View style={styles.cycleActions}>
+        {step.manualAdvance ? (
+          <GhostAction label="Done, next" onPress={onDone} style={{ flex: 1 }} />
+        ) : (
+          <GhostAction label="Skip step" onPress={onSkip} style={{ flex: 1 }} />
+        )}
+        <GhostAction label="End cycle" onPress={onStop} tint={color.alert} style={{ flex: 1 }} />
+      </View>
+    </View>
   );
 }
 
@@ -551,6 +688,16 @@ const styles = StyleSheet.create({
     marginBottom: space(4),
   },
   rateRow: { flexDirection: 'row', alignItems: 'baseline', gap: space(1.5) },
+  topActions: { flexDirection: 'row', gap: space(2.5) },
+  cycleTrack: {
+    flexDirection: 'row',
+    height: hairlineWidth * 3,
+    backgroundColor: color.hairlineFaint,
+    marginTop: space(3),
+  },
+  cycleFill: { backgroundColor: color.linked },
+  cycleConditions: { marginTop: space(2.5), gap: space(1) },
+  cycleActions: { flexDirection: 'row', gap: space(3), marginTop: space(4) },
   recordChip: {
     borderWidth: hairlineWidth,
     borderColor: color.hairlineStrong,

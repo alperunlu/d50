@@ -31,13 +31,42 @@ export interface PollerOptions {
   /** Her PID sorgusunun timeout'u. Varsayılan 3000ms (K-line yavaş). */
   readonly commandTimeoutMs?: number;
   /**
-   * Yavaş kanalların hedef aralığı (ms). Varsayılan 10 sn.
-   * Bkz. `buildPollSchedule` — kıt bus kapasitesini hızlı değişen
-   * değerlere ayırmanın yolu bu.
+   * Komut sonuna eklenecek "beklenen cevap sayısı" (ör. `010C1`).
+   *
+   * Adaptörün bunu desteklediği bağlantı başında sınanıyor
+   * (`InitResult.supportsReplyCount`); desteklemiyorsa verilmiyor ve
+   * komutlar eski biçiminde gidiyor.
    */
-  readonly slowIntervalMs?: number;
-  /** Cevap vermeyen bir PID geri çekildiğinde haber verir (debug log'u için). */
+  readonly expectedReplies?: number;
+  /** Araçta bulunmadığı anlaşılan bir PID çıkarıldığında haber verir. */
   readonly onBackoff?: (pid: string, failures: number) => void;
+  /**
+   * HİÇBİR PID bu kadar süredir cevap vermiyorsa çağrılır.
+   *
+   * Tek bir PID'in susması normaldir (araç o sensöre sahip olmayabilir);
+   * HEPSİNİN birden susması başka bir şeydir. 7 Eylül 2026 saha testinde
+   * ECU 563. saniyede sustu, 782 kez `NO DATA` döndü ve uygulama 12 dakika
+   * boyunca hiçbir şey fark etmeden sormaya devam etti — üstelik geri
+   * çekilme mantığı yüzünden gitgide daha seyrek. O sırada `ATRV` cevap
+   * veriyordu, yani BLE ve adaptör sağlamdı; kopan şey ECU protokolüydü ve
+   * çözümü yeniden başlatmaktı. Poller bunu kendi başına yapmıyor; haber
+   * veriyor, kararı store veriyor.
+   */
+  readonly onSilence?: (seconds: number) => void;
+  /** Sessizlik eşiği (ms). Varsayılan 10 sn. */
+  readonly silenceTimeoutMs?: number;
+  /**
+   * Örnek zaman damgalarının sıfır noktası (epoch ms).
+   *
+   * Verilmezse poller'ın kendi başlangıcı kullanılır. Rehberli test
+   * cycle'ında kanal seti adım adım değiştiği için poller kayıt ortasında
+   * yeniden kuruluyor; zaman tabanı poller'ın içinde kalsaydı her yeniden
+   * kurulumda `ts` sıfırlanır ve TEK bir oturumun zaman ekseni başa
+   * sarardı — 0-100, ivme ve seri eşleştirmelerinin tamamı bozulurdu.
+   * Oturumla birlikte bir kez üretilip her poller'a aynısı geçiliyor.
+   * `SensorLogger` bunu zaten böyle alıyordu.
+   */
+  readonly startedAt?: number;
 }
 
 /**
@@ -67,82 +96,68 @@ export interface PollScheduleState {
   readonly nowMs: number;
   /** PID -> en son ne zaman soruldu (ms). Hiç sorulmadıysa alan yok. */
   readonly lastPolledMs: Readonly<Record<string, number>>;
-  /** PID -> üst üste kaç kez cevapsız kaldı. */
-  readonly failures: Readonly<Record<string, number>>;
-  /** Yavaş kanalların hedef aralığı (ms). */
-  readonly slowIntervalMs?: number;
 }
 
 /**
- * Üst üste başarısız olan bir PID kaç turda bir sorulsun.
- * 0-1 hata: her tur · 2-3 hata: 4 turda bir · 4+: 16 turda bir.
- */
-export function backoffCycles(failures: number): number {
-  if (failures < 2) return 1;
-  if (failures < 4) return 4;
-  return 16;
-}
-
-export function buildPollSchedule(
-  pids: readonly PidDefinition[],
-  cycleIndex: number,
-  state: PollScheduleState,
-): PidDefinition[] {
-  const slowIntervalMs = state.slowIntervalMs ?? DEFAULT_SLOW_INTERVAL_MS;
-
-  const active = pids.filter((p) => {
-    const every = backoffCycles(state.failures[p.pid] ?? 0);
-    return cycleIndex % every === 0;
-  });
-
-  const fast = active.filter((p) => p.refresh !== 'slow');
-  const slow = active.filter((p) => p.refresh === 'slow');
-
-  // Yavaş kanallardan zamanı GELMİŞ olanlar; en uzun süredir beklemiş
-  // olan öne alınıyor ki hiçbiri sürekli sıranın sonunda kalmasın.
-  const dueSlow = slow
-    .filter((p) => state.nowMs - (state.lastPolledMs[p.pid] ?? 0) >= slowIntervalMs)
-    .sort(
-      (a, b) =>
-        (state.lastPolledMs[a.pid] ?? 0) - (state.lastPolledMs[b.pid] ?? 0),
-    );
-
-  // Hiç hızlı PID seçilmemişse yavaşları kısmak anlamsız — hepsi her turda.
-  if (fast.length === 0) return slow.length > 0 ? [...slow] : [];
-
-  return [...spreadByWeight(fast), ...dueSlow.slice(0, 1)];
-}
-
-/**
- * Ağırlıklı PID'leri tekrarları yan yana gelmeyecek şekilde sıralar.
+ * Sıradaki PID: hedefine göre EN ÇOK GECİKMİŞ olan.
  *
- * Ağırlığı 2 olan devir için [devir, devir, hız] yerine [devir, hız, devir]
- * üretilmesi önemli: iki ölçüm arasındaki boşluğun EŞİT olması, ivme ve
- * order analizinin dayandığı düzgün zaman eksenini veriyor.
+ * NEDEN BÖYLE (7 Eylül 2026 saha kaydı): eskiden sabit bir ağırlık tablosu
+ * ve tur sayacı vardı. Bus çöktüğünde her PID tek tek "cevap vermiyor"
+ * damgası yedi ve 16 turda bire düşürüldü; bus düzeldikten SONRA da öyle
+ * kaldı. Ölçülen sonuç: MAP 25 saniyede bir, soğutma suyu 150 saniyede bir.
+ * Bir kanal sıranın dibine düştüğünde kendi başına çıkamıyordu.
+ *
+ * Gecikme oranı (`geçen süre / hedef aralık`) bunu yapısal olarak
+ * imkânsız kılıyor: sorulmayan kanalın oranı sınırsız büyür, er geç
+ * birinci olur. Bütçe yetmediğinde de herkes ORANTILI yavaşlar — biri
+ * çökmez.
+ *
+ * Hiçbir kanal hedefine ulaşmamışsa (`ratio < 1`) yine de en gecikmiş olan
+ * sorulur: hattı boş bekletmenin kimseye faydası yok.
  */
-function spreadByWeight(pids: readonly PidDefinition[]): PidDefinition[] {
-  const slots: { pid: PidDefinition; position: number }[] = [];
+export function selectNextPid(
+  pids: readonly PidDefinition[],
+  state: PollScheduleState,
+): PidDefinition | null {
+  let best: PidDefinition | null = null;
+  let bestRatio = -Infinity;
+
   for (const pid of pids) {
-    const weight = Math.max(1, Math.round(pid.weight ?? 1));
-    for (let k = 0; k < weight; k++) {
-      // Bresenham benzeri yayma: her tekrar kendi diliminin ortasına düşer.
-      slots.push({ pid, position: (k + 0.5) / weight });
+    // Hiç sorulmamış bir kanal her şeyin önüne geçer: ilk örneği almadan
+    // o kanal hakkında hiçbir şey bilmiyoruz.
+    const last = state.lastPolledMs[pid.pid];
+    if (last === undefined) return pid;
+
+    const ratio = (state.nowMs - last) / Math.max(1, pid.targetIntervalMs);
+    if (ratio > bestRatio) {
+      bestRatio = ratio;
+      best = pid;
     }
   }
-  slots.sort((a, b) => a.position - b.position);
-  return slots.map((s) => s.pid);
+
+  return best;
 }
+
+/**
+ * Bir kanala "desteklenmiyor" damgası vurmak için bus'ın bu kadar yakın
+ * zamanda BAŞKA bir kanala cevap vermiş olması gerekir.
+ */
+const BUS_ALIVE_WINDOW_MS = 5_000;
+/** Çalışan bir bus'ta bu kadar üst üste susan kanal gerçekten yoktur. */
+const UNSUPPORTED_AFTER_FAILURES = 3;
 
 const DEFAULT_FLUSH_MS = 1000;
 const DEFAULT_TIMEOUT_MS = 3000;
 /** Yavaş kanalların hedef örnekleme aralığı. Soğutma suyu için fazlasıyla yeterli. */
 const DEFAULT_SLOW_INTERVAL_MS = 10_000;
+/** Bu kadar süre HİÇBİR PID cevap vermezse bağlantı kopmuş sayılır. */
+const DEFAULT_SILENCE_MS = 10_000;
 
 export class Poller {
   private running = false;
   private buffer: PollSample[] = [];
   private flushTimer: ReturnType<typeof setInterval> | null = null;
-  private readonly startedAt = Date.now();
+  private readonly startedAt: number;
   private loopPromise: Promise<void> | null = null;
 
   /** Son bir saniyede tamamlanan örnek sayısı — UI'da "~N örnek/sn" göstermek için. */
@@ -150,7 +165,9 @@ export class Poller {
   private lastRateWindowStart = Date.now();
   private currentRate = 0;
 
-  constructor(private readonly opts: PollerOptions) {}
+  constructor(private readonly opts: PollerOptions) {
+    this.startedAt = opts.startedAt ?? Date.now();
+  }
 
   start(): void {
     if (this.running) return;
@@ -186,39 +203,75 @@ export class Poller {
   private lastPolledMs: Record<string, number> = {};
   /** PID -> üst üste cevapsız kalma sayısı; geri çekilme buna dayanıyor. */
   private failures: Record<string, number> = {};
+  /**
+   * Araçta bulunmadığı anlaşılan kanallar — SEYRELTİLMEZ, tamamen çıkarılır.
+   *
+   * Seyreltmek yanlış cevaptı: olmayan bir sensör 16 turda bir sorulunca da
+   * yok, ve her sorgusu çalışan kanallardan çalınmış bir zaman dilimi.
+   */
+  private unsupported = new Set<string>();
+  /** Son GEÇERLİ cevabın alındığı an. Sessizlik bunun üstünden ölçülüyor. */
+  private lastAnswerAt = Date.now();
+  /** Sessizlik bir kez bildirildi mi — her turda tekrar bildirmemek için. */
+  private silenceReported = false;
 
   private async loop(): Promise<void> {
-    let cycleIndex = 0;
     while (this.running) {
-      const cycle = buildPollSchedule(this.opts.pids, cycleIndex, {
-        nowMs: Date.now(),
-        lastPolledMs: this.lastPolledMs,
-        failures: this.failures,
-        slowIntervalMs: this.opts.slowIntervalMs,
-      });
-      cycleIndex++;
+      const pid = selectNextPid(
+        this.opts.pids.filter((p) => !this.unsupported.has(p.pid)),
+        { nowMs: Date.now(), lastPolledMs: this.lastPolledMs },
+      );
 
-      // Hiçbir PID sıraya girmediyse (hepsi geri çekilmişse) boş dönüp
-      // CPU yakmayalım.
-      if (cycle.length === 0) {
+      // Sorulacak kanal kalmadıysa (kanal seti boş) CPU yakmayalım.
+      if (!pid) {
         await new Promise<void>((resolve) => setTimeout(resolve, 250));
         continue;
       }
 
-      for (const pid of cycle) {
-        if (!this.running) break;
-        await this.pollOne(pid);
-        // Her sorgudan sonra makro göreve dön (aşağıdaki nota bak).
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      }
+      await this.pollOne(pid);
+      this.checkSilence();
+      // Her sorgudan sonra makro göreve dön (aşağıdaki nota bak).
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
     }
+  }
+
+  /**
+   * Bütün kanalların sustuğu durumu bildirir. Bir kez bildirir; kurtarma
+   * denendikten sonra ilk geçerli cevap sayacı sıfırlar.
+   */
+  private checkSilence(): void {
+    if (this.silenceReported) return;
+    const silentMs = Date.now() - this.lastAnswerAt;
+    if (silentMs < (this.opts.silenceTimeoutMs ?? DEFAULT_SILENCE_MS)) return;
+    this.silenceReported = true;
+    this.opts.onSilence?.(Math.round(silentMs / 1000));
+  }
+
+  /**
+   * Kurtarma sonrası çağrılır: geri çekilme cezaları silinir.
+   *
+   * Sessizlik boyunca her PID defalarca cevapsız kaldı ve seyreltildi.
+   * Protokol geri geldiğinde o cezalarla devam etmek, sağlam bir bağlantıyı
+   * dakikalarca yavaş tutmak demek olurdu.
+   */
+  resetAfterRecovery(): void {
+    this.failures = {};
+    /**
+     * Damgalar da siliniyor. Kurtarma öncesi "desteklenmiyor" kararı
+     * sessiz bir bus üstünde verilmiş olabilir; protokol geri geldiğinde
+     * kanala yeniden şans vermek, sağlam bir kanalı oturum boyunca kapalı
+     * tutmaktan iyidir.
+     */
+    this.unsupported.clear();
+    this.lastAnswerAt = Date.now();
+    this.silenceReported = false;
   }
 
   private async pollOne(pid: PidDefinition): Promise<void> {
     this.lastPolledMs[pid.pid] = Date.now();
     try {
       const raw = await this.opts.queue.send(
-        commandFor(pid),
+        commandFor(pid, this.opts.expectedReplies),
         this.opts.commandTimeoutMs ?? DEFAULT_TIMEOUT_MS,
       );
       const value = decode(pid, raw);
@@ -228,6 +281,8 @@ export class Poller {
         // Tek bir başarılı cevap cezayı siler: geçici bir aksaklık yüzünden
         // bir kanalı kalıcı olarak seyreltmek istemiyoruz.
         this.failures[pid.pid] = 0;
+        this.lastAnswerAt = Date.now();
+        this.silenceReported = false;
       } else {
         this.registerFailure(pid);
       }
@@ -240,14 +295,28 @@ export class Poller {
   }
 
   /**
-   * Cevapsız kalan PID'in sayacını artırır ve geri çekilme eşiği
-   * geçildiğinde haber verir — kullanıcı neden bir kanalın seyreldiğini
-   * debug log'unda görebilsin.
+   * Cevapsız kalan PID'i kaydeder.
+   *
+   * KRİTİK AYRIM (7 Eylül 2026): "bu kanal desteklenmiyor" ile "bus çökmüş"
+   * aynı şey değil, ve eskiden ayırt edilmiyorlardı. Bağlantı koptuğunda
+   * her PID sırayla cevapsız kaldı, her biri ayrı ayrı damgalandı ve
+   * seyreltildi — geçici bir arıza kalıcı bir bozulmaya dönüştü.
+   *
+   * Artık bir kanala kusur yazmanın şartı, BAŞKA bir kanalın yakın zamanda
+   * cevap vermiş olması: bus çalışıyor ama bu kanal susuyorsa kanal
+   * gerçekten yok demektir. Bus tümden sessizse kimse suçlanmaz; o durumu
+   * `checkSilence` zaten ayrıca bildiriyor ve kurtarma çalışıyor.
    */
   private registerFailure(pid: PidDefinition): void {
+    const busAlive = Date.now() - this.lastAnswerAt < BUS_ALIVE_WINDOW_MS;
+    if (!busAlive) return;
+
     const next = (this.failures[pid.pid] ?? 0) + 1;
     this.failures[pid.pid] = next;
-    if (next === 2 || next === 4) this.opts.onBackoff?.(pid.pid, next);
+    if (next === UNSUPPORTED_AFTER_FAILURES) {
+      this.unsupported.add(pid.pid);
+      this.opts.onBackoff?.(pid.pid, next);
+    }
   }
   // NOT: Her sorgudan sonra bilerek makro göreve dönülüyor (loop içinde).
   // Transport anında (senkron mikro görevle) cevap verirse — mock'ta olduğu

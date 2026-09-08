@@ -9,6 +9,7 @@ import {
 } from '@expo-google-fonts/barlow-condensed';
 import { Barlow_400Regular } from '@expo-google-fonts/barlow';
 import { useAppStore } from '../src/state/store';
+import { installCrashLogger, breadcrumb } from '../src/util/crashLog';
 import { color, type, space, hairlineWidth } from '../src/ui/theme';
 
 /**
@@ -53,11 +54,21 @@ function TabIcon({ name, focused }: { name: string; focused: boolean }) {
   );
 }
 
-/** Arıza varsa Faults sekmesinde kırmızı nokta — kırmızının izinli iki yerinden biri. */
+/**
+ * Arıza varsa Faults sekmesinde kırmızı nokta — kırmızının izinli iki
+ * yerinden biri.
+ *
+ * Kayan bir vital de buraya dahil: erken uyarının bütün değeri, kullanıcı
+ * o ekranı açmayı akıl etmeden görünmesinde. Arıza kodu geç cevap, kayan
+ * ölçüm erken cevap; ikisi de aynı soruyu cevaplıyor.
+ */
 function FaultBadge() {
   const milOn = useAppStore((s) => s.milStatus?.milOn ?? false);
   const stored = useAppStore((s) => s.dtcGroups?.stored.length ?? 0);
-  if (!milOn && stored === 0) return null;
+  const drifting = useAppStore(
+    (s) => s.vitalTrends.filter((t) => t.trend.verdict === 'drifting').length,
+  );
+  if (!milOn && stored === 0 && drifting === 0) return null;
   return <View style={styles.badge} />;
 }
 
@@ -74,6 +85,13 @@ function TabLabel({ label, focused }: { label: string; focused: boolean }) {
   );
 }
 
+/**
+ * Kanca ekran ağacından ÖNCE, modül yüklenirken kuruluyor: render sırasında
+ * atılan bir hata da yakalansın diye.
+ */
+installCrashLogger();
+breadcrumb('app launched');
+
 export default function RootLayout() {
   const [fontsLoaded] = useFonts({
     BarlowCondensed_500Medium,
@@ -83,9 +101,12 @@ export default function RootLayout() {
 
   // Kalıcı ayarlar (takılı lastik ebadı) açılışta bir kez yükleniyor.
   const loadSettings = useAppStore((s) => s.loadSettings);
+  const loadVitalTrends = useAppStore((s) => s.loadVitalTrends);
   useEffect(() => {
     void loadSettings();
-  }, [loadSettings]);
+    // Rozet, kullanıcı Faults'a girmeden de doğru olsun.
+    void loadVitalTrends();
+  }, [loadSettings, loadVitalTrends]);
 
   // Fontlar yüklenene kadar zemin rengini gösteriyoruz — sistem fontuyla bir
   // kare çizip sonra Barlow'a atlamak göze çarpan bir sıçrama yaratıyordu.

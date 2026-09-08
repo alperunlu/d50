@@ -20,7 +20,8 @@
  *    okur — uygulamanın salt-okunur şartıyla aynı hizada.
  */
 
-import { type SeriesMap, type TimeSeriesPoint } from './derived';
+import { maxOf } from '../util/agg';
+import { idleSamples, idleStabilityRpm, type SeriesMap, type TimeSeriesPoint } from './derived';
 import { MINI_R50, type VehicleProfile } from './vehicle';
 import {
   rollingCircumferenceMm,
@@ -66,6 +67,149 @@ function has(series: SeriesMap, key: string, min = 5): boolean {
  * yapmayı engelliyor: 10 saniye önceki gaz kelebeği değeri şimdiki devirle
  * ilişkilendirilemez.
  */
+/**
+ * ---------------------------------------------------------------------------
+ * EŞ ZAMANLI VE KARARLI ÇİFT
+ * ---------------------------------------------------------------------------
+ *
+ * İki kanalı BÖLEREK üretilen her ölçüm (aktarma oranı, tekerlek çevresi,
+ * kilometre saati sapması) aynı tuzağa düşüyor: kanallar aynı anda
+ * örneklenmiyor. Aracın hızlandığı bir anda güncel devri 1.5 saniye eski
+ * bir hızla bölmek, şanzımanı değil örnekleme gecikmesini ölçer.
+ *
+ * 7 Eylül 2026 saha kayıtları bunun bedelini gösterdi. Sağlam bir araçta:
+ *
+ *   - "Drive ratio wanders within a single gear" — %8 yayılım. Yalnızca
+ *     hızın gerçekten sabit olduğu anlara bakınca %3.6'ya düştü, kalanı da
+ *     ölçüm tabanıydı: 85 km/h sabitken devir serisi bir saniye içinde
+ *     2435 ile 2670 arasında oynuyor ve tek bir kaba hız okumasıyla
+ *     eşleşince 3.27-3.58 arası oran üretiyor. Ortada arıza yok.
+ *   - Fiziksel olarak imkânsız oranlar: en uzun vitesten düşük değerler.
+ *     Yavaşlarken eski (yüksek) hızı güncel (düşmüş) devirle bölmenin
+ *     doğrudan sonucu.
+ *
+ * Bu yüzden bölme yapan her teşhis artık aynı kapıdan geçiyor: iki örnek
+ * BİRBİRİNE YAKIN ZAMANDA alınmış olmalı, ve o civarda İKİSİ DE kararlı
+ * olmalı. Kararlı olmayan anı ölçmemek, yanlış ölçmekten iyidir.
+ */
+export interface SteadyPair {
+  readonly ts: number;
+  readonly rpm: number;
+  readonly speedKmh: number;
+}
+
+/** İki örnek bu kadar zaman farkıyla alınmışsa "aynı ana ait" sayılır. */
+const CO_TIMED_MS = 400;
+/** Hız bu bant içinde kalmalı (km/h) — PID 0D zaten tam km/h döndürüyor. */
+const SPEED_STEADY_KMH = 1;
+/** Devir bu orandan fazla oynamışsa an kararlı değildir. */
+const RPM_STEADY_RATIO = 0.02;
+/** Kararlılık bu pencerede aranır. */
+const STEADY_WINDOW_MS = 1500;
+/**
+ * Kararlılık penceresinde en az bu kadar örnek olmalı — yani ÖRNEKLEME
+ * HIZI şartı: 3 saniyelik pencerede 6 örnek, 2 Hz demek.
+ *
+ * NEDEN BİR EŞİK DEĞİL DE ŞART: 7 Eylül kaydında bu ölçüm sağlam bir
+ * araca "aktarma kaçırıyor" dedi. Eş zamanlılık ve kararlılık kapıları
+ * eklendikten sonra bile session 21'de %3.5 kaldı, ve kalanın kaynağı
+ * belliydi: 86→90 km/h hafifçe hızlanan bir bölüm "sabit" sayılıyordu,
+ * çünkü hız 1.5 Hz'de örnekleniyordu ve üç saniyelik pencereye topu
+ * topu 4 örnek düşüyordu. Dört örnekle "hız sabitti" demek, aradaki
+ * hızlanmayı görmemek demek.
+ *
+ * Eşiği yeşil ışık yanana kadar gevşetmek, istenen cevaba göre ayar
+ * yapmak olurdu. Doğrusu aletin şartını yazmak: bu ölçüm hız kanalı en az
+ * 2 Hz örneklenmeden YAPILAMAZ. Yapılamadığında "ölçemedim" denir.
+ *
+ * Yeni planlayıcıda hızın hedefi 250 ms (4 Hz), yani pencereye 12 örnek
+ * düşüyor ve şart rahatça sağlanıyor.
+ */
+const STEADY_MIN_SAMPLES = 6;
+/**
+ * Bu hızın altında ölçüm yapılmaz.
+ *
+ * PID 0D tam km/h döndürüyor, yani ±0.5 km/h nicemleme hatası var ve bu
+ * bağıl olarak hız düştükçe büyüyor: 25 km/h'de ±%2, 50'de ±%1, 80'de
+ * ±%0.6. %3'lük bir eşiğin altında anlamlı olabilmesi için nicemleme
+ * tabanının belirgin şekilde küçük kalması gerekiyor.
+ */
+const MIN_RATIO_SPEED_KMH = 50;
+
+/**
+ * Bir serinin verilen pencerede en küçük/en büyük değeri.
+ *
+ * Pencere TAM olmalı: kaydın başına ya da sonuna denk gelen bir pencere
+ * yarım genişliktedir ve dolayısıyla değişimin yarısını görür. Sabit
+ * hızlanan bir seride bu, ilk ve son noktanın "sabit" sayılmasına yol
+ * açıyordu — testin yakaladığı gerçek bir zayıflık.
+ */
+function windowExtent(
+  series: readonly TimeSeriesPoint[],
+  ts: number,
+  halfWindowMs: number,
+): { min: number; max: number; count: number } | null {
+  let min = Infinity;
+  let max = -Infinity;
+  let count = 0;
+  let first: number | null = null;
+  let last = 0;
+  for (const p of series) {
+    if (p.ts < ts - halfWindowMs) continue;
+    if (p.ts > ts + halfWindowMs) break;
+    if (p.value < min) min = p.value;
+    if (p.value > max) max = p.value;
+    if (first === null) first = p.ts;
+    last = p.ts;
+    count++;
+  }
+  if (first === null) return null;
+  // Pencerenin ikisi de tarafı dolu mu — %80'i kapsanmalı.
+  if (last - first < halfWindowMs * 2 * 0.8) return null;
+  return { min, max, count };
+}
+
+/**
+ * Devir ve hızın EŞ ZAMANLI ve İKİSİ DE KARARLI olduğu anları döndürür.
+ *
+ * Az nokta üretir ve üretmesi gereken de budur: sonuç "ölçemedim" ise,
+ * "ölçtüm ve şanzıman bozuk" demekten dürüsttür.
+ */
+export function steadyRatioPairs(
+  rpmSeries: readonly TimeSeriesPoint[],
+  speedSeries: readonly TimeSeriesPoint[],
+  minSpeedKmh = MIN_RATIO_SPEED_KMH,
+): SteadyPair[] {
+  const out: SteadyPair[] = [];
+
+  for (const s of speedSeries) {
+    if (s.value < minSpeedKmh) continue;
+
+    // Hız o civarda gerçekten sabit mi?
+    const speedWindow = windowExtent(speedSeries, s.ts, STEADY_WINDOW_MS);
+    if (!speedWindow || speedWindow.count < STEADY_MIN_SAMPLES) continue;
+    if (speedWindow.max - speedWindow.min > SPEED_STEADY_KMH) continue;
+
+    // Devir o civarda gerçekten sabit mi? (85 km/h sabitken 2435-2670
+    // arasında oynayan bir devir, oranı tek başına %10 saçıyordu.)
+    const rpmWindow = windowExtent(rpmSeries, s.ts, STEADY_WINDOW_MS);
+    if (!rpmWindow || rpmWindow.count < STEADY_MIN_SAMPLES || rpmWindow.min <= 0) continue;
+    if ((rpmWindow.max - rpmWindow.min) / rpmWindow.min > RPM_STEADY_RATIO) continue;
+
+    // Ve en yakın devir örneği gerçekten AYNI ANA ait mi?
+    let nearest: TimeSeriesPoint | null = null;
+    for (const r of rpmSeries) {
+      if (Math.abs(r.ts - s.ts) > CO_TIMED_MS) continue;
+      if (nearest === null || Math.abs(r.ts - s.ts) < Math.abs(nearest.ts - s.ts)) nearest = r;
+    }
+    if (nearest === null) continue;
+
+    out.push({ ts: s.ts, rpm: nearest.value, speedKmh: s.value });
+  }
+
+  return out;
+}
+
 export function sampleAt(
   series: readonly TimeSeriesPoint[],
   ts: number,
@@ -123,6 +267,18 @@ export function countCrossings(
 }
 
 /** Serinin kapsadığı süre (saniye). */
+/**
+ * Serinin örnekleme hızı (Hz).
+ *
+ * Bir teşhis, ölçtüğü olaydan daha yavaş örneklenmiş bir seriden hüküm
+ * çıkaramaz. Nyquist: saniyede f geçiş görebilmek için en az 2f örnek
+ * gerekir. Altındaki her sonuç, sensörü değil POLLER'I ölçer.
+ */
+function sampleHz(series: readonly TimeSeriesPoint[]): number {
+  const seconds = spanSeconds(series);
+  return seconds > 0 ? (series.length - 1) / seconds : 0;
+}
+
 function spanSeconds(series: readonly TimeSeriesPoint[]): number {
   if (series.length < 2) return 0;
   return (series[series.length - 1].ts - series[0].ts) / 1000;
@@ -254,11 +410,32 @@ export function oxygenSensorResponse(series: SeriesMap): Finding {
     return inconclusive(key, title, [], 'Needs at least 30 seconds of O2 data.');
   }
 
+  /**
+   * ÖNCE örnekleme hızı, sonra hüküm.
+   *
+   * 6 Eylül 2026 kaydı: 28 kanallı turda ön sonda 0.29 Hz sorgulandı,
+   * Nyquist sınırı 0.15 Hz, ekrana düşen sonuç da tam 0.15 Hz oldu — yani
+   * rapor edilen sayı sondanın değil, poller'ın hızıydı. Eşik 0.4 Hz
+   * olduğu için kart o kayıtta ASLA geçemezdi: sapasağlam bir sondaya
+   * "yaşlanmış olabilir" dedi. Ölçüm aletinde kalıcı yanlış alarm, hiç
+   * ölçmemekten kötüdür.
+   */
+  const HEALTHY_HZ = 0.4;
+  const rate = sampleHz(pre);
+  if (rate < HEALTHY_HZ * 2) {
+    return inconclusive(key, title, [],
+      `The pre-cat channel was sampled at only ${round(rate, 2)} Hz, so switching faster than ` +
+      `${round(rate / 2, 2)} Hz is invisible — counting crossings here would measure the polling ` +
+      `rate, not the sensor. Record with just RPM and the O2 channels selected so the sensor is ` +
+      `polled at least twice a second.`);
+  }
+
   const switches = countCrossings(pre, 0.45, 0.05);
   const hz = switches / seconds;
-  const evidence = `${switches} switches in ${Math.round(seconds)} s (${round(hz, 2)} Hz)`;
+  const evidence =
+    `${switches} switches in ${Math.round(seconds)} s (${round(hz, 2)} Hz, sampled at ${round(rate, 2)} Hz)`;
 
-  if (hz < 0.4) {
+  if (hz < HEALTHY_HZ) {
     return {
       key, title, verdict: 'attention',
       headline: 'Sensor is switching slowly',
@@ -393,7 +570,7 @@ export function thermostatCheck(series: SeriesMap, vehicle: VehicleProfile = MIN
 
   const seconds = spanSeconds(coolant);
   const start = coolant[0].value;
-  const peak = Math.max(...coolant.map((p) => p.value));
+  const peak = maxOf(coolant.map((p) => p.value)) ?? 0;
   const evidence = `start ${round(start, 0)} °C, peak ${round(peak, 0)} °C over ${Math.round(seconds / 60)} min`;
 
   if (seconds < 300) {
@@ -401,12 +578,32 @@ export function thermostatCheck(series: SeriesMap, vehicle: VehicleProfile = MIN
       'The engine needs roughly ten minutes of running before a warm-up verdict means anything.');
   }
 
-  // Motor zaten sıcak başladıysa ısınma eğrisi yok; yine de plato bilgisi var.
+  /**
+   * Eşiğin ÜSTÜNDE başlayan bir kayıt o eşiğin geçildiğini kanıtlayamaz.
+   *
+   * 6 Eylül 2026: kayıt 90 °C'de başladı, eşik 88 °C. Kart "Reaches
+   * operating temperature ✓" dedi — oysa özet aynı ekranda "engine was
+   * already warm at the start, record from a cold start" diyordu. Aynı
+   * veriden iki zıt hüküm. Plato bilgisi yine gösteriliyor ama bu bir
+   * geçiş notu değil.
+   */
+  if (start >= vehicle.thermostatOpenC) {
+    return {
+      key, title, verdict: 'inconclusive',
+      headline: 'Engine was already warm',
+      detail:
+        `The recording starts at ${round(start, 0)} °C, above the ${vehicle.thermostatOpenC} °C ` +
+        'the thermostat opens at, so there is no warm-up to judge. Record from a cold start — ' +
+        'the first drive of the day is the useful one.',
+      evidence,
+    };
+  }
+
   if (peak >= vehicle.thermostatOpenC) {
     return {
       key, title, verdict: 'ok',
       headline: 'Reaches operating temperature',
-      detail: `Coolant passed the ${vehicle.thermostatOpenC} °C the thermostat should open at.`,
+      detail: `Coolant climbed past the ${vehicle.thermostatOpenC} °C the thermostat should open at.`,
       evidence,
     };
   }
@@ -543,7 +740,19 @@ export function clutchSlip(series: SeriesMap): Finding {
   const rpm = get(series, '0C');
   const speedObd = get(series, '0D');
   const speed = speedObd.length > 0 ? speedObd : get(series, 'gps_speed');
-  const throttle = get(series, '11').length > 0 ? get(series, '11') : get(series, '04');
+  // Gaz kelebeği yoksa motor yükü vekil olarak kullanılıyor — ama ikisi
+  // farklı büyüklükler ve aynı eşikle karşılaştırılamazlar.
+  const usingThrottle = get(series, '11').length > 0;
+  const throttle = usingThrottle ? get(series, '11') : get(series, '04');
+  /**
+   * "Gaz altında" eşiği.
+   *
+   * Kelebek eşiği %40'tı ve bu araçta neredeyse tam gaz demek: 6 Eylül 2026
+   * kaydında 223 örneğin yalnızca 5'i (%2) o eşiğin üstündeydi, medyan %18.
+   * 0'dan 109 km/h'a çıkılmış bir gezide kart "yeterince hızlanma yok" dedi.
+   * Aranan şey tam gaz değil, motorun çekiyor olması.
+   */
+  const THROTTLE_MIN = usingThrottle ? 25 : 45;
 
   const needs: string[] = [];
   if (!has(series, '0C')) needs.push('Engine RPM');
@@ -555,18 +764,26 @@ export function clutchSlip(series: SeriesMap): Finding {
 
   let slipEvents = 0;
   let compared = 0;
+  let underThrottle = 0;
 
   for (let i = 1; i < rpm.length; i++) {
     const prev = rpm[i - 1];
     const cur = rpm[i];
     const dt = (cur.ts - prev.ts) / 1000;
-    if (dt <= 0 || dt > 2) continue;
+    /**
+     * Üst sınır 2 sn'ydi ve ardışık devir örneklerinin %48'ini eliyordu:
+     * çok kanallı bir turda devir iki kez soruluyor, aralıklar bir kısa
+     * bir uzun geliyor. Kaydın kendi ritmini cezalandırmak yerine sınır
+     * gevşetildi; hızlar zaten saniyeye bölünerek karşılaştırılıyor.
+     */
+    if (dt <= 0 || dt > 4) continue;
 
     const th = sampleAt(throttle, cur.ts, 1500);
     const vPrev = sampleAt(speed, prev.ts, 1500);
     const vCur = sampleAt(speed, cur.ts, 1500);
     if (th === null || vPrev === null || vCur === null) continue;
-    if (th < 40 || vCur < 25) continue; // gaz kapalıysa ya da yavaşsa anlamsız
+    if (th >= THROTTLE_MIN) underThrottle++;
+    if (th < THROTTLE_MIN || vCur < 25) continue; // gaz kapalıysa ya da yavaşsa anlamsız
 
     compared++;
     const rpmRise = (cur.value - prev.value) / dt; // rpm/s
@@ -578,8 +795,12 @@ export function clutchSlip(series: SeriesMap): Finding {
   }
 
   if (compared < 10) {
+    // Neyin eksik kaldığını SAYIYLA söyle: kullanıcı bir dahaki sefere
+    // neyi farklı yapacağını ancak böyle bilir.
     return inconclusive(key, title, [],
-      'Needs some accelerating under throttle above 25 km/h in the recording.');
+      `Only ${compared} usable moments — slip needs the engine pulling (${usingThrottle ? 'throttle' : 'load'} ` +
+      `over ${THROTTLE_MIN} %) above 25 km/h. This recording had ${underThrottle} samples under throttle. ` +
+      'A steady pull in one gear from about 40 to 90 km/h is enough.');
   }
 
   const rate = slipEvents / compared;
@@ -622,23 +843,19 @@ export function idleQuality(series: SeriesMap, vehicle: VehicleProfile = MINI_R5
     return inconclusive(key, title, ['Engine RPM'], 'Record a minute of idling.');
   }
 
-  const idleRpm: number[] = [];
-  const idleTs: number[] = [];
-  for (const p of rpm) {
-    const v = speed.length > 0 ? sampleAt(speed, p.ts, 3000) : 0;
-    const stationary = v === null ? false : v < 2;
-    if (stationary && p.value > 300 && p.value < vehicle.idleRpm * 1.6) {
-      idleRpm.push(p.value);
-      idleTs.push(p.ts);
-    }
-  }
+  // Tanım derived.ts'te, tek yerde: özetteki "Idle stability" ile bu kartın
+  // aynı sayıyı vermesi buna bağlı (bkz. idleSamples).
+  const idlePoints = idleSamples(rpm, speed, vehicle);
+  const idleRpm = idlePoints.map((p) => p.value);
+  const idleTs = idlePoints.map((p) => p.ts);
 
   if (idleRpm.length < 10) {
     return inconclusive(key, title, [],
       'No stationary idling found in this recording. Leave it idling for a minute while recording.');
   }
 
-  const sd = stdDev(idleRpm) as number;
+  // Aynı istatistik, aynı yerden: kayan pencere sapması (bkz. derived.ts).
+  const sd = (idleStabilityRpm(idlePoints) ?? stdDev(idleRpm)) as number;
   const avg = mean(idleRpm) as number;
 
   // Aynı zaman aralığındaki titreşim ve ses — varsa tabloyu tamamlıyorlar.
@@ -835,6 +1052,27 @@ export function misfireOrderSignature(series: SeriesMap): Finding {
   const value = median(half.map((p) => p.value)) as number;
   const evidence = `median half-order ratio ${round(value, 2)} over ${half.length} windows`;
 
+  /**
+   * Kartın kendi metni "yol ve rüzgâr gürültüsü bu sayıyı şişirir, park
+   * hâlinde tekrarla" diyor — o hâlde şişmiş bir sayıdan "dikkat" hükmü de
+   * çıkmamalı. 6 Eylül 2026'da tam bunu yaptı: 109 km/h'a çıkılan bir
+   * gezideki ölçümden silindir dengesi uyarısı üretti.
+   */
+  const speedSeries = get(series, '0D').length > 0 ? get(series, '0D') : get(series, 'gps_speed');
+  if (speedSeries.length > 0) {
+    const moving = half.filter((p) => {
+      const v = sampleAt(speedSeries, p.ts, 3000);
+      return v !== null && v >= 5;
+    }).length;
+    if (moving / half.length > 0.5) {
+      return inconclusive(key, title, [],
+        `Measured while driving (${Math.round((moving / half.length) * 100)} % of windows above ` +
+        `5 km/h), where road and wind noise sit right on top of the engine orders and inflate this ` +
+        `number — ${evidence} here, but it cannot be trusted. Repeat parked in neutral, engine ` +
+        'warm, phone wedged in place.');
+    }
+  }
+
   if (value > 0.45) {
     return {
       key, title, verdict: 'attention',
@@ -928,7 +1166,20 @@ export function orderTrackingQuality(series: SeriesMap): Finding {
   }
 
   const agreement = round((1 - m) * 100, 0);
-  const evidence = `sound and OBD agree within ${round(m * 100)} % (median of ${errors.length} windows)`;
+  /**
+   * Medyan tek başına güven vermiyor.
+   *
+   * 6 Eylül 2026 kaydında bu kart "Sound is locked to engine speed" dedi
+   * (medyan sapma %5.8) ama order oranları yalnızca 1381 pencerede üretildi
+   * — 2501 pencerenin ~%45'i hiç kilitlenmemişti ve canlı log "mikrofon
+   * başka bir şey duyuyor" satırlarıyla doluydu. Medyan iyi olabilirken
+   * pencerelerin yarısı çöp olabilir; kullanıcı bunu görmeli.
+   */
+  const within = errors.filter((e) => e <= 0.12).length;
+  const lockedPct = Math.round((within / errors.length) * 100);
+  const evidence =
+    `sound and OBD agree within ${round(m * 100)} % (median of ${errors.length} windows), ` +
+    `${lockedPct} % of windows locked`;
 
   if (m > 0.1) {
     return {
@@ -1032,6 +1283,55 @@ export function idleManifoldVacuum(series: SeriesMap, vehicle: VehicleProfile = 
  * Uyarı: ölçüm GPS'e dayanıyor ve GPS hızı ±0.5 km/h gürültülü. Bu yüzden
  * 40 km/h altı örnekler atılıyor ve tek ölçüm değil ORTANCA kullanılıyor.
  */
+/**
+ * GPS ile ECU hızını karşılaştırarak ÖLÇÜLEN yuvarlanma çevresi (mm).
+ *
+ * Tek yerde duruyor çünkü iki kart da buna dayanmalı. 6 Eylül 2026'da
+ * dayanmıyorlardı ve aynı ekran kilometre saati için üç ayrı sayı
+ * gösterdi: lastik ebadından %2, ölçülen sapma %1.3, ölçülen çevre %1.
+ * Üçü aslında birbirini doğruluyordu (gerçek çevre nominalin %1 altında
+ * olunca ECU hatası %2 - %1 ≈ %1 kalıyor) ama kullanıcının bunu kafasında
+ * birleştirmesi bekleniyordu. Ölçüm varken tahmin kullanılmaz.
+ */
+function measuredCircumference(
+  series: SeriesMap,
+  vehicle: VehicleProfile,
+): { mm: number; samples: number } | null {
+  const obd = get(series, '0D');
+  const gps = get(series, 'gps_speed');
+  if (obd.length < 10 || gps.length < 10) return null;
+
+  /**
+   * Yalnızca hızın gerçekten sabit olduğu anlar.
+   *
+   * Eskiden GPS örneği 2 saniyeye kadar eski bir ECU hızıyla eşleşiyordu
+   * ve kararlılık hiç aranmıyordu. Sahada bunun bedeli %1.5'lik sahte bir
+   * sapmaydı; hızlanma dışlanınca %0.7'ye indi (7 Eylül 2026).
+   *
+   * `steadyRatioPairs` burada GPS'i "hız kanalı" olarak alıyor: kararlılık
+   * hem GPS hem ECU tarafında aranmalı, ve GPS zaten ikisinin yavaş olanı.
+   */
+  const values: number[] = [];
+  for (const g of gps) {
+    if (g.value < MIN_RATIO_SPEED_KMH) continue;
+
+    const gpsWindow = windowExtent(gps, g.ts, STEADY_WINDOW_MS);
+    if (!gpsWindow || gpsWindow.count < STEADY_MIN_SAMPLES) continue;
+    if (gpsWindow.max - gpsWindow.min > SPEED_STEADY_KMH) continue;
+
+    const obdWindow = windowExtent(obd, g.ts, STEADY_WINDOW_MS);
+    if (!obdWindow || obdWindow.count < STEADY_MIN_SAMPLES) continue;
+    if (obdWindow.max - obdWindow.min > SPEED_STEADY_KMH) continue;
+
+    const o = sampleAt(obd, g.ts, CO_TIMED_MS);
+    if (o === null) continue;
+    const c = circumferenceFromSpeedPair(o, g.value, vehicle.factoryTyre);
+    if (c !== null) values.push(c);
+  }
+  if (values.length < 10) return null;
+  return { mm: median(values) as number, samples: values.length };
+}
+
 export function tyreCircumferenceCheck(
   series: SeriesMap,
   vehicle: VehicleProfile = MINI_R50,
@@ -1049,20 +1349,14 @@ export function tyreCircumferenceCheck(
       'Needs both ECU speed and GPS speed — the ratio between them is the measurement.');
   }
 
-  const measured: number[] = [];
-  for (const g of gps) {
-    const o = sampleAt(obd, g.ts, 2000);
-    if (o === null) continue;
-    const c = circumferenceFromSpeedPair(o, g.value, vehicle.factoryTyre);
-    if (c !== null) measured.push(c);
-  }
-
-  if (measured.length < 10) {
+  const measurement = measuredCircumference(series, vehicle);
+  if (measurement === null) {
     return inconclusive(key, title, [],
       'Needs a few minutes above 40 km/h — below that GPS speed is too noisy to compare.');
   }
 
-  const actual = median(measured) as number;
+  const actual = measurement.mm;
+  const measured = { length: measurement.samples };
   const nominal = rollingCircumferenceMm(vehicle.fittedTyre);
   const deviation = ((actual - nominal) / nominal) * 100;
   const evidence = `measured ${Math.round(actual)} mm vs ${Math.round(nominal)} mm nominal for ${formatTyreSize(vehicle.fittedTyre)} (${round(deviation)} %), ${measured.length} samples`;
@@ -1124,17 +1418,22 @@ export function driveRatioStability(
   }
 
   const circumference = rollingCircumferenceMm(vehicle.fittedTyre);
+  /**
+   * Yalnızca eş zamanlı VE kararlı anlar. Eskiden devir, 1.5 saniyeye
+   * kadar eski bir hızla bölünüyordu ve tek şart hızın 25 km/h üstünde
+   * olmasıydı — yani araç hızlanırken de ölçülüyordu. Sağlam bir araçta
+   * bu %8 yayılım üretti ve "aktarma kaçırıyor" dedi (bkz. steadyRatioPairs).
+   */
   const ratios: number[] = [];
-  for (const r of rpm) {
-    const v = sampleAt(speed, r.ts, 1500);
-    if (v === null || v < 25) continue;
-    const ratio = totalDriveRatio(r.value, v, circumference);
+  for (const p of steadyRatioPairs(rpm, speed)) {
+    const ratio = totalDriveRatio(p.rpm, p.speedKmh, circumference);
     if (ratio !== null && ratio > 1 && ratio < 30) ratios.push(ratio);
   }
 
   if (ratios.length < 15) {
     return inconclusive(key, title, [],
-      'Needs steady driving above 25 km/h — ratios below that are dominated by the clutch.');
+      'Needs a steady cruise above 50 km/h — held speed, no gear changes. ' +
+      'Measuring while the car accelerates reads the sampling delay, not the gearbox.');
   }
 
   /**
@@ -1163,14 +1462,22 @@ export function driveRatioStability(
 
   // Her küme içindeki bağıl yayılım: kaymanın ölçüsü.
   const spreads = solid.map((c) => ((stdDev(c) ?? 0) / (mean(c) as number)) * 100);
-  const worst = Math.max(...spreads);
+  const worst = maxOf(spreads) ?? 0;
   const evidence =
     `${solid.length} gear${solid.length === 1 ? '' : 's'} seen, ratios ` +
     solid.map((c) => round(mean(c) as number, 2)).join(' · ') +
     `, worst spread ${round(worst)} %`;
 
-  // Sağlam bir aktarmada sabit vitesteki oran neredeyse hiç oynamaz; %3
-  // bağıl yayılım, ölçüm gürültüsünün üstünde kalan ilk anlamlı eşik.
+  /**
+   * Eşik, ALETİN KENDİ TABANININ üstünde olmalı.
+   *
+   * Kalan iki gürültü kaynağı: PID 0D tam km/h döndürüyor (50 km/h'de
+   * ±%1, 80'de ±%0.6) ve kararlılık penceresi hıza ±1 km/h serbestlik
+   * bırakıyor (50 km/h'de %2). İkisi birlikte ~%2.2'lik bir taban
+   * bırakıyor; %3 bunun hemen üstünde ve ancak eş zamanlı/kararlı
+   * çiftlerle anlamlı — eskiden aynı eşik, %8 gürültünün üstünde
+   * kullanılıyordu ve her sağlam araca "kaçırıyor" diyordu.
+   */
   if (worst > 3) {
     return {
       key, title, verdict: 'attention',
@@ -1194,18 +1501,50 @@ export function driveRatioStability(
  * sistematik hatası. Teşhis değil, KALİBRASYON uyarısı: kullanıcı bilmezse
  * bütün mesafe ve tüketim rakamlarını yanlış okur.
  */
-export function tyreSizeCalibration(vehicle: VehicleProfile = MINI_R50): Finding {
+export function tyreSizeCalibration(
+  series: SeriesMap,
+  vehicle: VehicleProfile = MINI_R50,
+): Finding {
   const key = 'tyre_calibration';
   const title = 'Speed calibration';
-  const factor = speedCorrectionFactor(vehicle.fittedTyre, vehicle.factoryTyre);
-  const errorPct = (factor - 1) * 100;
-  const evidence = `fitted ${formatTyreSize(vehicle.fittedTyre)}, factory ${formatTyreSize(vehicle.factoryTyre)} — ECU speed off by ${round(-errorPct)} %`;
 
-  if (Math.abs(errorPct) < 0.5) {
+  // Ölçüm > tahmin. GPS ile ECU hızı birlikte kaydedildiyse düzeltme
+  // katsayısı girilen ebattan değil, tekerleğin gerçekte kat ettiği
+  // yoldan çıkar; lastik aşınması ve basınç da böyle hesaba girer.
+  const measurement = measuredCircumference(series, vehicle);
+  const factoryMm = rollingCircumferenceMm(vehicle.factoryTyre);
+  const factor =
+    measurement !== null
+      ? measurement.mm / factoryMm
+      : speedCorrectionFactor(vehicle.fittedTyre, vehicle.factoryTyre);
+  const errorPct = (factor - 1) * 100;
+  const evidence =
+    measurement !== null
+      ? `measured rolling circumference ${Math.round(measurement.mm)} mm vs ${Math.round(factoryMm)} mm factory — ECU speed off by ${round(-errorPct)} % (${measurement.samples} GPS samples)`
+      : `fitted ${formatTyreSize(vehicle.fittedTyre)}, factory ${formatTyreSize(vehicle.factoryTyre)} — ECU speed off by ${round(-errorPct)} % (from the entered size; record GPS to measure it)`;
+
+  /**
+   * "Fabrikayla aynı" bandı, LASTİK EBADI DIŞINDAKİ açıklamaları kapsamalı.
+   *
+   * Eski eşik %0.5'ti ve iki ayrı sebeple yanlıştı:
+   *
+   *   1. Ölçümün kendi saçılımından (sahada ±%0.5-1.2) dardı — yani aletin
+   *      göremeyeceği bir farkı rapor ediyordu.
+   *   2. Bir lastik sıfırdan kanuni sınıra aşınırken ~%2 çevre kaybeder,
+   *      basınç da katkı verir. %0.7'lik bir farkı "başka ebat takılmış"
+   *      diye sunmak, aşınmayı ebat sanmaktır.
+   *
+   * Gerçek bir ebat basamağı çok daha büyük: 175/65 R15 → 185/65 R15
+   * ~%2.2, → 195/60 R15 ~%2.5. Bant %2, yani bir ebat basamağının
+   * hemen altında ve aşınmanın hemen üstünde.
+   */
+  if (Math.abs(errorPct) < 2) {
     return {
       key, title, verdict: 'ok',
-      headline: 'Fitted tyre matches the factory size',
-      detail: 'The ECU speed and distance readings need no correction.',
+      headline: 'Speed readings match the factory tyre size',
+      detail:
+        `The ECU is within ${round(Math.abs(errorPct))} % of the factory rolling circumference — ` +
+        'inside what tread wear and tyre pressure alone explain, so no size correction is called for.',
       evidence,
     };
   }
@@ -1217,6 +1556,210 @@ export function tyreSizeCalibration(vehicle: VehicleProfile = MINI_R50): Finding
         ? 'Fitted tyres are larger than factory — the car travels further than it reports'
         : 'Fitted tyres are smaller than factory — the car reports more distance than it travels',
     detail: `Every ECU speed and distance reading is off by ${round(Math.abs(errorPct))} %, and so is anything derived from them, including consumption. True speed is ECU speed multiplied by ${round(factor, 3)}.`,
+    evidence,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Şarj sistemi ve akü — adaptörün voltmetresinden
+// ---------------------------------------------------------------------------
+
+/**
+ * Voltaj tek başına bir sayıdır; DEVİRLE eşleşince teşhis olur.
+ *
+ * Aynı 12.4 V, motor çalışırken "alternatör basmıyor", kontak açık motor
+ * kapalıyken "akü yarı dolu" demektir. Bu yüzden her iki kart da voltajı
+ * devirle birlikte okuyor ve hangi durumda ölçüldüğünü kanıtta yazıyor.
+ *
+ * Eşikler 12 V kurşun-asit sistem içindir. R50 (2001-2006) sabit gerilimli
+ * bir regülatör kullanıyor; modern araçlardaki değişken gerilimli "akıllı"
+ * alternatörlerde bu bantlar geçerli olmazdı, o yüzden araç profiline
+ * bağlı bir kontrol.
+ */
+/**
+ * Ölçüm AKÜ UÇLARINDA değil, OBD soketinin 16. pininde yapılıyor.
+ *
+ * Aradaki kablo ve sigorta üzerinde bir düşüş var; soket tipik olarak
+ * aküden 0.1-0.3 V daha düşük okur. Araç profilindeki bant akü uçları
+ * içindir, o yüzden eşikler bu kadar aşağı kaydırılıyor. Bu yapılmadığında
+ * 7 Eylül 2026 kaydındaki 13.4 V "düşük şarj" diye işaretlendi; oysa akü
+ * uçlarında ~13.6 V eder ve bandın içindedir.
+ */
+const SOCKET_DROP_V = 0.2;
+
+/** Motor çalışırken (devir > 400) ölçülen voltaj örnekleri. */
+function voltsWhileRunning(series: SeriesMap): number[] {
+  const volts = get(series, 'battery_v');
+  const rpm = get(series, '0C');
+  if (rpm.length === 0) return [];
+  const out: number[] = [];
+  for (const v of volts) {
+    const r = sampleAt(rpm, v.ts, 15_000);
+    if (r !== null && r > 400) out.push(v.value);
+  }
+  return out;
+}
+
+/** Motor DURURKEN (devir yok ya da 0) ölçülen voltaj örnekleri. */
+function voltsWhileStopped(series: SeriesMap): number[] {
+  const volts = get(series, 'battery_v');
+  const rpm = get(series, '0C');
+  const out: number[] = [];
+  for (const v of volts) {
+    const r = rpm.length === 0 ? null : sampleAt(rpm, v.ts, 15_000);
+    if (r !== null && r <= 400) out.push(v.value);
+  }
+  return out;
+}
+
+/**
+ * Şarj sistemi: alternatör basıyor mu, ne kadar basıyor.
+ *
+ * Ayrıca rölanti ile seyir voltajını karşılaştırıyor. Yorgun bir alternatör
+ * (aşınmış kömür, kayan kayış) seyirde yeterli basar ama rölantide düşer —
+ * tek bir ortalama bunu gizler, iki koşulun farkı gösterir.
+ */
+export function chargingSystem(series: SeriesMap, vehicle: VehicleProfile = MINI_R50): Finding {
+  const key = 'charging';
+  const title = 'Charging system';
+
+  if (get(series, 'battery_v').length < 3) {
+    return inconclusive(key, title, ['Battery Voltage'],
+      'The adapter reads system voltage on its own — record with the adapter connected.');
+  }
+  if (get(series, '0C').length < 5) {
+    return inconclusive(key, title, ['Engine RPM'],
+      'Voltage only becomes a diagnosis when it is read against engine speed.');
+  }
+
+  const running = voltsWhileRunning(series);
+  if (running.length < 3) {
+    return inconclusive(key, title, [],
+      'No voltage samples with the engine running — the charging voltage is what tells you whether the alternator works.');
+  }
+
+  const level = median(running) as number;
+  // Profil bandı akü uçları için; ölçüm soketten geldiği için kaydırılıyor.
+  const minV = vehicle.chargingVoltageV.min - SOCKET_DROP_V;
+  const maxV = vehicle.chargingVoltageV.max + SOCKET_DROP_V;
+
+  // Rölanti / seyir farkı: ikisi de varsa anlamlı.
+  const volts = get(series, 'battery_v');
+  const rpm = get(series, '0C');
+  const speed = get(series, '0D').length > 0 ? get(series, '0D') : get(series, 'gps_speed');
+  const idleVolts: number[] = [];
+  const cruiseVolts: number[] = [];
+  for (const v of volts) {
+    const r = sampleAt(rpm, v.ts, 15_000);
+    if (r === null || r <= 400) continue;
+    const kmh = speed.length > 0 ? sampleAt(speed, v.ts, 15_000) : null;
+    if (kmh === null) continue;
+    if (kmh < 2 && r < vehicle.idleRpm * 1.6) idleVolts.push(v.value);
+    else if (kmh > 40) cruiseVolts.push(v.value);
+  }
+  const idleLevel = idleVolts.length >= 3 ? (median(idleVolts) as number) : null;
+  const cruiseLevel = cruiseVolts.length >= 3 ? (median(cruiseVolts) as number) : null;
+
+  const parts = [`${round(level, 2)} V running (${running.length} samples)`];
+  if (idleLevel !== null) parts.push(`idle ${round(idleLevel, 2)} V`);
+  if (cruiseLevel !== null) parts.push(`cruise ${round(cruiseLevel, 2)} V`);
+  const evidence = parts.join(', ');
+
+  if (level < 13.0) {
+    return {
+      key, title, verdict: 'attention',
+      headline: 'The alternator is not charging',
+      detail:
+        `System voltage stays at ${round(level, 2)} V with the engine running, which is battery voltage, not charging voltage. The car is running off the battery and will stop when it runs out. Check the belt first, then the alternator and its connections.`,
+      evidence,
+    };
+  }
+
+  if (level < minV) {
+    return {
+      key, title, verdict: 'attention',
+      headline: 'Charging voltage is low',
+      detail:
+        `This car should hold ${vehicle.chargingVoltageV.min}-${vehicle.chargingVoltageV.max} V at the battery with the engine running, which is ${round(minV, 2)} V or more at the OBD socket where this is measured; it sits at ${round(level, 2)} V. A slipping belt, worn brushes or a tired regulator all look like this, and the battery will slowly fall behind.`,
+      evidence,
+    };
+  }
+
+  if (level > maxV) {
+    return {
+      key, title, verdict: 'attention',
+      headline: 'Charging voltage is too high',
+      detail:
+        `${round(level, 2)} V is above what the regulator should allow. Overcharging boils the electrolyte out of the battery and shortens the life of everything electrical. The regulator is the usual cause.`,
+      evidence,
+    };
+  }
+
+  // Seyirde iyi, rölantide düşük: alternatör sınırda.
+  if (idleLevel !== null && cruiseLevel !== null && cruiseLevel - idleLevel > 0.5 && idleLevel < 13.2) {
+    return {
+      key, title, verdict: 'attention',
+      headline: 'Charging drops away at idle',
+      detail:
+        `Voltage is healthy at speed (${round(cruiseLevel, 2)} V) but falls to ${round(idleLevel, 2)} V at idle, so at a long traffic light the battery is carrying the load rather than being charged. A slipping belt or a worn alternator behaves exactly like this.`,
+      evidence,
+    };
+  }
+
+  return {
+    key, title, verdict: 'ok',
+    headline: 'Charging voltage is healthy',
+    detail:
+      `The alternator holds the system in the normal band with the engine running. Measured at the OBD socket, which reads roughly ${SOCKET_DROP_V} V below the battery terminals.`,
+    evidence,
+  };
+}
+
+/**
+ * Akünün dinlenme voltajı — yalnızca motor DURURKEN anlamlı.
+ *
+ * Rehberli test cycle'ının ilk adımı tam olarak bu koşulu kuruyor: kontak
+ * açık, motor kapalı. Üstelik cycle sabah, araç bir gece dinlendikten sonra
+ * çalıştırıldığı için yüzey şarjı da inmiş oluyor — bu ölçümün dürüst
+ * olduğu tek an.
+ */
+export function batteryState(series: SeriesMap): Finding {
+  const key = 'battery';
+  const title = 'Battery state of charge';
+
+  const stopped = voltsWhileStopped(series);
+  if (stopped.length < 3) {
+    return inconclusive(key, title, [],
+      'Needs voltage readings with the ignition on and the engine not running — the first step of the guided test cycle does this.');
+  }
+
+  const level = median(stopped) as number;
+  const evidence = `${round(level, 2)} V with the engine off (${stopped.length} samples)`;
+
+  if (level < 12.0) {
+    return {
+      key, title, verdict: 'attention',
+      headline: 'Battery is discharged',
+      detail:
+        `${round(level, 2)} V resting is under half charge and near the point where the car will not start on a cold morning. Charge it and have it load-tested; a battery that keeps arriving here has either lost capacity or is being drained while parked.`,
+      evidence,
+    };
+  }
+
+  if (level < 12.4) {
+    return {
+      key, title, verdict: 'attention',
+      headline: 'Battery is partly discharged',
+      detail:
+        `${round(level, 2)} V resting is roughly half to three-quarters charged. Short trips that never let the alternator catch up are the usual reason; a long drive or a charger will tell you whether it holds a charge afterwards.`,
+      evidence,
+    };
+  }
+
+  return {
+    key, title, verdict: 'ok',
+    headline: 'Battery is charged',
+    detail: 'Resting voltage is in the band of a healthy, charged battery.',
     evidence,
   };
 }
@@ -1246,6 +1789,8 @@ export function runDiagnostics(series: SeriesMap, vehicle: VehicleProfile = MINI
     soundVsRpm(series),
     orderTrackingQuality(series),
     tyreCircumferenceCheck(series, vehicle),
+    chargingSystem(series, vehicle),
+    batteryState(series),
     driveRatioStability(series, vehicle),
   ];
 
@@ -1255,7 +1800,7 @@ export function runDiagnostics(series: SeriesMap, vehicle: VehicleProfile = MINI
    * söyleyecek bir şeyi olmayan bir satırdır — ve veri içermeyen bir
    * kayıtta tek başına "ok" görünüp listeyi yanıltırdı.
    */
-  const calibration = tyreSizeCalibration(vehicle);
+  const calibration = tyreSizeCalibration(series, vehicle);
   if (calibration.verdict !== 'ok') findings.push(calibration);
 
   const rank: Record<Verdict, number> = { attention: 0, ok: 1, inconclusive: 2 };

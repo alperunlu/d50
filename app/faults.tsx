@@ -1,6 +1,7 @@
 import React, { useCallback } from 'react';
 import { View, Text, StyleSheet, ScrollView, Alert, ActivityIndicator } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useFocusEffect } from 'expo-router';
 import { useAppStore } from '../src/state/store';
 import { writeAndShare } from '../src/util/exportFile';
 import { isManufacturerSpecific, type Dtc, type ReadinessStatus } from '../src/obd/dtc';
@@ -26,6 +27,18 @@ export default function FaultsScreen() {
   const readiness = useAppStore((s) => s.readiness);
   const dtcReading = useAppStore((s) => s.dtcReading);
   const readDtcs = useAppStore((s) => s.readDtcs);
+  const vitalTrends = useAppStore((s) => s.vitalTrends);
+  const loadVitalTrends = useAppStore((s) => s.loadVitalTrends);
+
+  /**
+   * Trendler bağlantı gerektirmiyor — geçmiş kayıtlardan geliyorlar.
+   * Ekran her açıldığında tazeleniyor ki yeni biten bir kayıt hemen görünsün.
+   */
+  useFocusEffect(
+    useCallback(() => {
+      void loadVitalTrends();
+    }, [loadVitalTrends]),
+  );
 
   const notConnected = connectionState !== 'connected';
 
@@ -50,12 +63,27 @@ export default function FaultsScreen() {
   const permanent = dtcGroups?.permanent ?? [];
   const anyRead = dtcGroups !== null;
 
+  /**
+   * Butonların NEDEN öyle davrandığını anlatan tek satır.
+   *
+   * Üçü de aynı soruya cevap verdiği ve birbirini dışladığı için tek yerde
+   * toplandı; ayrı ayrı dururken ekranın ortasında birbirinden kopuk
+   * duruyorlardı. Yeri de eylem çubuğunun dibi: açıkladığı şey orada.
+   */
+  const statusLine = notConnected
+    ? 'Not linked. Open Link and connect to the adapter.'
+    : !anyRead
+      ? 'No codes read yet.'
+      : null;
+
   return (
     <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
       <VehicleChrome subtitle="readonly" />
 
       <View style={styles.body}>
         <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
+          <TrendSection trends={vitalTrends} />
+
           {milStatus && (
             <View style={styles.headlineRow}>
               <View
@@ -76,16 +104,6 @@ export default function FaultsScreen() {
             </View>
           )}
 
-          {notConnected && (
-            <Text style={[type.meta, styles.hint]}>
-              Not linked. Open Link and connect to the adapter.
-            </Text>
-          )}
-
-          {!anyRead && !notConnected && (
-            <Text style={[type.meta, styles.hint]}>No codes read yet.</Text>
-          )}
-
           {stored.length > 0 && (
             <CodeGroup label="Stored" meta="Mode 03 · turns the light on" codes={stored} primary />
           )}
@@ -103,6 +121,20 @@ export default function FaultsScreen() {
           )}
 
           {readiness && <Readiness readiness={readiness} />}
+
+          {/*
+            Esneyen boşluk. Ekran boşken aşağıdaki iki blok dibe, eylem
+            çubuğunun hemen üstüne iner; kod listesi uzunken boşluk sıfıra
+            iner ve bloklar listenin sonunda kalır.
+
+            Alternatif, ikisini de çubuğun üstüne SABİTLEMEKTİ. Öyle
+            yapılmadı: uyarı üç satır ve her zaman görünse kod listesinden
+            kalıcı olarak yer çalardı, oysa okunması gereken tek an
+            başlangıçtaki boş ekran.
+          */}
+          <View style={{ flex: 1, minHeight: space(4) }} />
+
+          {statusLine ? <Text style={[type.meta, styles.hint]}>{statusLine}</Text> : null}
 
           <Note>
             {`${MINI_R50_DTC_COUNT} R50 service codes loaded, including P1xxx manufacturer codes. This app only reads — Mode 04 is blocked at the command allowlist, so no clear command can reach the car.`}
@@ -245,13 +277,93 @@ function Readiness({ readiness }: { readiness: ReadinessStatus }) {
   );
 }
 
+
+/**
+ * Kayan ölçümler — arıza lambası yanmadan önceki hâl.
+ *
+ * Faults ekranında duruyor çünkü bu ekranın sorusu "arabamda bir sorun var
+ * mı?". Arıza kodu o sorunun geç cevabı; kayan bir vital erken cevabı.
+ * Bağlantı da gerekmiyor: veriler geçmiş kayıtlardan geliyor, araca
+ * takılı olmasan da okunuyor.
+ *
+ * Kasıtlı olarak SESSİZ: taban çizgisi kurulmamış ölçümler ve sabit
+ * duranlar tek satırda özetleniyor. Ekranı dolduran bir liste, içindeki
+ * tek gerçek uyarıyı gizler.
+ */
+function TrendSection({
+  trends,
+}: {
+  trends: ReturnType<typeof useAppStore.getState>['vitalTrends'];
+}) {
+  if (trends.length === 0) {
+    return (
+      <View style={{ marginBottom: space(5) }}>
+        <SectionRule label="Trends" meta="Nothing recorded yet" />
+        <Note>
+          Most of these readings come out of ordinary recordings on their own — a cold start, a
+          wait at a red light, a steady stretch of road are all the app needs. The guided cycle
+          from Live sets those conditions deliberately and is the only way to reach the oxygen
+          sensor ones. After a few recordings this section starts showing which are moving.
+        </Note>
+      </View>
+    );
+  }
+
+  const drifting = trends.filter((t) => t.trend.verdict === 'drifting');
+  const quiet = trends.length - drifting.length;
+
+  return (
+    <View style={{ marginBottom: space(5) }}>
+      <SectionRule
+        label="Trends"
+        meta={drifting.length > 0 ? `${drifting.length} moving` : `${trends.length} steady`}
+        metaColor={drifting.length > 0 ? color.caution : undefined}
+      />
+
+      {drifting.map((t) => (
+        <View key={t.key} style={styles.trendRow}>
+          <View style={[styles.trendBar, { backgroundColor: color.caution }]} />
+          <View style={{ flex: 1 }}>
+            <Text style={type.metaSmall}>{t.label}</Text>
+            <Text style={[type.prose, { color: color.ink, marginTop: space(0.75) }]}>
+              {`${t.value.toFixed(2)} ${t.unit}`}
+            </Text>
+            <Text style={[type.meta, { marginTop: space(1), lineHeight: 16 }]}>
+              {`Baseline ${(t.trend.baseline ?? 0).toFixed(2)} ${t.unit}, now ${t.value.toFixed(2)} — ` +
+                `${(t.trend.change ?? 0) > 0 ? 'up' : 'down'} ${Math.abs(t.trend.change ?? 0).toFixed(2)}` +
+                (t.trend.slopePerMonth !== null && Number.isFinite(t.trend.slopePerMonth)
+                  ? `, about ${t.trend.slopePerMonth.toFixed(2)} ${t.unit} per month.`
+                  : '.')}
+            </Text>
+          </View>
+        </View>
+      ))}
+
+      {quiet > 0 ? (
+        <Text style={[type.metaSmall, { marginTop: space(2) }]}>
+          {`${quiet} other measurement${quiet === 1 ? '' : 's'} steady or still building a baseline.`}
+        </Text>
+      ) : null}
+
+      <Note>
+        Trends compare this car against its own earlier readings taken under the same conditions,
+        not against other cars, and they do not predict when something will fail.
+      </Note>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
+  trendRow: { flexDirection: 'row', gap: space(2.5), paddingVertical: space(2.5) },
+  trendBar: { width: 2, alignSelf: 'stretch' },
   safe: { flex: 1, backgroundColor: color.ground },
   body: { flex: 1, paddingHorizontal: space(5), paddingTop: space(4) },
-  scroll: { paddingBottom: space(5) },
+  // flexGrow: içerik kısa olsa bile kaydırma alanı ekranı doldursun —
+  // yukarıdaki esneyen boşluğun çalışması buna bağlı.
+  scroll: { flexGrow: 1, paddingBottom: space(5) },
   headlineRow: { flexDirection: 'row', gap: space(3.5), alignItems: 'stretch' },
   headlineBar: { width: 3 },
-  hint: { textAlign: 'center', marginTop: space(6) },
+  hint: { textAlign: 'center', marginBottom: space(1) },
   codeRow: {
     paddingVertical: space(2.75),
     borderBottomWidth: hairlineWidth,

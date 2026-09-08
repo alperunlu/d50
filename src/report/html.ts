@@ -1,0 +1,304 @@
+/**
+ * Tek dosyalık HTML rapor.
+ *
+ * NEDEN HTML — ve neden öyle KALIYOR: PDF üretmek `expo-print` isterdi,
+ * yani bir native modül ve yeni bir derleme. Denendi ve gerek olmadığına
+ * karar verildi (6 Eylül 2026): iOS paylaşım sayfasındaki "Print → Save as
+ * PDF" aynı işi zaten yapıyor, üstelik HTML telefonda, tarayıcıda ve
+ * e-postada doğrudan açılıyor — PDF'in olmadığı bir esneklik.
+ *
+ * Yani burası eksik bir adım değil, verilmiş bir karar. Dosya buna göre
+ * yazıldı: dış kaynak yok, stil gömülü, sayfa kırılmaları CSS'te tanımlı,
+ * tek dosya kendi kendine yetiyor.
+ *
+ * Rapor iki soruyu cevaplıyor:
+ *   1. Bu cycle'da ne ölçüldü, hangi koşulda? (kanıtla birlikte)
+ *   2. Bu sayılar geçen sefere göre nereye gidiyor? (taban çizgisiyle)
+ * İkincisi olmadan rapor bir fotoğraf; onunla birlikte bir eğri.
+ */
+
+import type { Finding } from '../analysis/diagnostics';
+import type { TripSummary } from '../analysis/derived';
+import type { Trend } from '../analysis/trend';
+
+export interface ReportVital {
+  readonly key: string;
+  readonly label: string;
+  readonly value: number;
+  readonly unit: string;
+  readonly trend: Trend;
+  /**
+   * Koşulu kimin kurduğu: rehberli cycle adımı mı, sıradan bir sürüşten
+   * veriye bakarak bulunmuş pencere mi. Raporda yazıyor çünkü ikisi aynı
+   * hassasiyette değil — okuyan kişi sayının nereden geldiğini bilmeli.
+   */
+  readonly source: 'cycle' | 'drive';
+}
+
+/**
+ * Raporun araç bölümü.
+ *
+ * NEDEN AYRI BİR TİP: rapor bugüne kadar başlığına "MINI Cooper R50
+ * (2001-2006)" yazıyordu ve bunu yalnızca kodda gömülü profilden
+ * biliyordu — yani bilmiyordu, varsayıyordu. Kullanıcı sordu, cevabı
+ * "hiçbir yerden"di. Artık iki şey ayrı ayrı yazılıyor: neyin ÖLÇÜLDÜĞÜ
+ * (VIN) ve neyin VARSAYILDIĞI (profil), ve ikisi çelişiyorsa bu da yazıyor.
+ */
+export interface ReportVehicle {
+  /** Hesapların dayandığı profilin adı. ÖLÇÜM DEĞİL, VARSAYIM. */
+  readonly profileName: string;
+  /** Araçtan okunan VIN, okunabildiyse. */
+  readonly vin: string | null;
+  /** VIN'in yapısından çıkanlar. Üretici veritabanı sorgulanmıyor. */
+  readonly manufacturer: string | null;
+  readonly modelYear: number | null;
+  /**
+   * Profilin dayandığı ve hesapları doğrudan etkileyen varsayımlar.
+   * Okuyan kişi hangi sayının neye bağlı olduğunu görebilmeli.
+   */
+  readonly assumptions: readonly string[];
+}
+
+export interface ReportInput {
+  readonly sessionId: number;
+  readonly startedAt: number;
+  readonly durationSec: number;
+  readonly vehicle: ReportVehicle;
+  readonly buildTag: string;
+  readonly summary: TripSummary;
+  readonly findings: readonly Finding[];
+  readonly vitals: readonly ReportVital[];
+  /** Atlanan cycle adımları — raporda "ölçülmedi" olarak görünür. */
+  readonly skippedSteps: readonly string[];
+}
+
+/** HTML'e gömülecek her metin buradan geçer. */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function fmt(value: number | null, unit: string, digits = 1): string {
+  if (value === null || !Number.isFinite(value)) return '—';
+  return `${value.toFixed(digits)}&thinsp;${escapeHtml(unit)}`;
+}
+
+/**
+ * Trendi tek cümleye çevirir.
+ *
+ * Sayı vermeden "kötüye gidiyor" demek işe yaramaz; kullanıcı ne kadar
+ * kaydığını ve neye göre kaydığını görmeli.
+ */
+function trendSentence(vital: ReportVital): string {
+  const t = vital.trend;
+  if (t.verdict === 'baseline') {
+    return t.needMore > 0
+      ? `Building a baseline — ${t.needMore} more cycle${t.needMore === 1 ? '' : 's'} before a trend means anything.`
+      : 'Building a baseline.';
+  }
+  const change = t.change ?? 0;
+  const direction = change > 0 ? 'up' : 'down';
+  const base = `${direction} ${Math.abs(change).toFixed(2)} ${vital.unit} from a baseline of ${(t.baseline ?? 0).toFixed(2)}`;
+  if (t.verdict === 'stable') return `Stable — within the noise of its own baseline.`;
+  if (t.verdict === 'improving') return `Improving: ${base}.`;
+  const rate =
+    t.slopePerMonth !== null && Number.isFinite(t.slopePerMonth)
+      ? ` (about ${t.slopePerMonth.toFixed(2)} ${vital.unit} per month)`
+      : '';
+  return `Drifting: ${base}${rate}.`;
+}
+
+const VERDICT_CLASS: Record<string, string> = {
+  attention: 'attention',
+  ok: 'ok',
+  inconclusive: 'muted',
+};
+
+const STYLE = `
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    color: #14201b; background: #fff;
+  }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: .02em; }
+  h2 {
+    font-size: 12px; letter-spacing: .12em; text-transform: uppercase;
+    color: #5c6b64; margin: 32px 0 8px; border-bottom: 1px solid #d8ded9; padding-bottom: 6px;
+  }
+  .meta { color: #5c6b64; font-size: 12px; margin-bottom: 4px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 7px 0; border-bottom: 1px solid #eceeeb; vertical-align: top; }
+  td.value { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .label { color: #14201b; }
+  .why { color: #7b8a82; font-size: 12px; }
+  .finding { padding: 10px 0 10px 12px; border-bottom: 1px solid #eceeeb; border-left: 3px solid #d8ded9; }
+  .finding.attention { border-left-color: #b5701f; }
+  .finding.ok { border-left-color: #2f7d5a; }
+  .finding .head { font-size: 12px; color: #5c6b64; }
+  .finding .headline { font-size: 15px; margin: 2px 0 4px; }
+  .finding .detail { color: #3d4a44; }
+  .finding .evidence { color: #7b8a82; font-size: 12px; margin-top: 4px; }
+  .source {
+    font-size: 10px; letter-spacing: .06em; text-transform: uppercase;
+    color: #7b8a82; border: 1px solid #d8ded9; border-radius: 3px;
+    padding: 1px 5px; margin-left: 6px; white-space: nowrap;
+  }
+  .trend { font-size: 12px; margin-top: 2px; }
+  .trend.drifting { color: #b5701f; }
+  .trend.improving { color: #2f7d5a; }
+  .trend.stable, .trend.baseline { color: #7b8a82; }
+  .note { color: #7b8a82; font-size: 12px; margin-top: 24px; }
+  .attention-note { color: #b5701f; border-left: 3px solid #b5701f; padding-left: 10px; }
+  code { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .04em; }
+  @media print {
+    body { padding: 0; }
+    h2 { break-after: avoid; }
+    .finding { break-inside: avoid; }
+  }
+`;
+
+/**
+ * Araç bölümü: ÖLÇÜLENİ ve VARSAYILANI ayrı ayrı yazar.
+ *
+ * Üç durum var ve üçü de açıkça söyleniyor:
+ *   - VIN okundu ve profille tutarlı: her şey yerinde.
+ *   - VIN okundu ama profille çelişiyor: hesaplar YANLIŞ araca göre
+ *     yapılıyor demektir; bunu gizlemek raporu güvenilmez yapar.
+ *   - VIN okunamadı: profil bir varsayım olarak duruyor, ve öyle yazıyor.
+ */
+function vehicleHtml(v: ReportVehicle): string {
+  const rows: [string, string][] = [];
+
+  if (v.vin) {
+    rows.push(['VIN (read from the car)', `<code>${escapeHtml(v.vin)}</code>`]);
+    if (v.manufacturer) rows.push(['Manufacturer (from the VIN)', escapeHtml(v.manufacturer)]);
+    if (v.modelYear !== null) rows.push(['Model year (from the VIN)', String(v.modelYear)]);
+  }
+  rows.push(['Profile used for the calculations', escapeHtml(v.profileName)]);
+
+  // Çelişki kontrolü kasıtlı olarak KABA: VIN'den çıkan üreticiyle profil
+  // adının aynı markayı söyleyip söylemediğine bakıyor. Model/motor
+  // eşleşmesini VIN'den bilemeyiz (üretici çözüm tablosu gerekir), o yüzden
+  // iddia da etmiyoruz.
+  const brand = v.profileName.split(/\s+/)[0]?.toUpperCase() ?? '';
+  const mismatch =
+    v.manufacturer !== null && brand.length > 1 && !v.manufacturer.toUpperCase().includes(brand);
+
+  const notice = v.vin
+    ? mismatch
+      ? `<p class="note attention-note">The VIN says this car was built by ${escapeHtml(
+          v.manufacturer ?? 'another manufacturer',
+        )}, but the calculations below use the ${escapeHtml(
+          v.profileName,
+        )} profile. Mass, drag and displacement are all taken from that profile, so every derived
+        figure — power, torque, consumption, road load — is wrong by whatever the two cars differ by.
+        Change the profile before trusting them.</p>`
+      : `<p class="note">The VIN was read from the car; the model and engine are not derivable from it
+        without the manufacturer's lookup tables, so the profile below is still a choice, not a
+        measurement.</p>`
+    : `<p class="note">This car's VIN could not be read — the ECU either does not support Mode 09 or
+      did not answer, which is common on cars of this age. Everything below therefore rests on an
+      assumed profile rather than on anything the car said about itself.</p>`;
+
+  const assumptions = v.assumptions.length
+    ? `<p class="note">The profile supplies these figures, and the derived results move with them:
+       ${escapeHtml(v.assumptions.join(' · '))}.</p>`
+    : '';
+
+  return `<table>${rows
+    .map(([k, val]) => `<tr><td class="label">${escapeHtml(k)}</td><td class="value">${val}</td></tr>`)
+    .join('')}</table>${notice}${assumptions}`;
+}
+
+export function buildReportHtml(input: ReportInput): string {
+  const started = new Date(input.startedAt);
+  const minutes = Math.round(input.durationSec / 60);
+
+  const summaryRows: [string, string][] = [
+    ['Max speed', fmt(input.summary.maxSpeedKmh, 'km/h', 0)],
+    ['Average speed', fmt(input.summary.avgSpeedKmh, 'km/h', 0)],
+    ['0-100', fmt(input.summary.zeroToHundredSec, 's', 2)],
+    ['Warm-up', fmt(input.summary.warmupSec, 's', 0)],
+    ['Peak power', fmt(input.summary.maxPowerKw, 'kW', 1)],
+    ['Peak torque', fmt(input.summary.maxEngineTorqueNm, 'Nm', 0)],
+    ['Consumption', fmt(input.summary.avgFuelPer100Km, 'L/100km', 1)],
+    ['Speedometer error', fmt(input.summary.speedometerErrorPct, '%', 1)],
+    ['Idle stability', fmt(input.summary.idleRpmStdDev, 'rpm σ', 0)],
+  ];
+
+  const vitalsHtml = input.vitals.length
+    ? input.vitals
+        .map(
+          (v) => `
+      <tr>
+        <td class="label">${escapeHtml(v.label)}
+          <span class="source">${v.source === 'cycle' ? 'guided step' : 'detected in drive'}</span>
+          <div class="trend ${v.trend.verdict}">${escapeHtml(trendSentence(v))}</div>
+        </td>
+        <td class="value">${fmt(v.value, v.unit, 2)}</td>
+      </tr>`,
+        )
+        .join('')
+    : `<tr><td class="why">No vitals were extracted — the steps they come from were skipped or produced too little data.</td></tr>`;
+
+  const findingsHtml = input.findings
+    .map(
+      (f) => `
+    <div class="finding ${VERDICT_CLASS[f.verdict] ?? 'muted'}">
+      <div class="head">${escapeHtml(f.title)}</div>
+      <div class="headline">${escapeHtml(f.headline)}</div>
+      <div class="detail">${escapeHtml(f.detail)}</div>
+      ${f.evidence ? `<div class="evidence">${escapeHtml(f.evidence)}</div>` : ''}
+    </div>`,
+    )
+    .join('');
+
+  const skipped = input.skippedSteps.length
+    ? `<p class="note">Steps skipped in this cycle, so anything that depends on them was not measured: ${escapeHtml(input.skippedSteps.join(', '))}.</p>`
+    : '';
+
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>D50 report — ${escapeHtml(started.toLocaleDateString())}</title>
+<style>${STYLE}</style></head>
+<body>
+  <h1>D50 vehicle report</h1>
+  <div class="meta">${escapeHtml(started.toLocaleString())} · ${minutes} min · session ${input.sessionId}</div>
+
+  <h2>Vehicle</h2>
+  ${vehicleHtml(input.vehicle)}
+
+  <h2>Vitals and trend</h2>
+  <table>${vitalsHtml}</table>
+
+  <h2>Trip summary</h2>
+  <table>
+    ${summaryRows.map(([k, v]) => `<tr><td class="label">${escapeHtml(k)}</td><td class="value">${v}</td></tr>`).join('')}
+  </table>
+
+  <h2>Diagnostics</h2>
+  ${findingsHtml}
+
+  ${skipped}
+  <p class="note">
+    Power, torque and consumption are estimates derived from vehicle mass and air mass flow,
+    not dynamometer measurements. Trends compare this car against its own earlier readings
+    taken under the same conditions; they are not a prediction of remaining life.
+  </p>
+  <p class="note">
+    A reading marked <em>guided step</em> was taken during a guided cycle, where the condition was
+    set deliberately. One marked <em>detected in drive</em> was found inside an ordinary recording
+    by looking for the same condition in the data — the same measurement, but with whatever the
+    traffic, the road and the air conditioning were doing at the time. Both feed the same trend,
+    because a trend needs points more than it needs perfect points, and the baseline's own scatter
+    is what decides whether a change counts.
+  </p>
+  <p class="note">Generated by D50 ${escapeHtml(input.buildTag)}</p>
+</body></html>`;
+}

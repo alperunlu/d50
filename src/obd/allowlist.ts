@@ -36,11 +36,43 @@ export class ReadOnlyViolationError extends Error {
  * Mode 01 = "show current data". Sadece okur, hiçbir yan etkisi yoktur.
  * Bu sürümün ihtiyacı bundan ibaret.
  *
- * Mode 02 (freeze frame), 06 ve 09 (VIN) de salt-okunurdur ama bu sürümde
+ * SON EKTEKİ RAKAM (ör. `010C1`) beklenen cevap sayısıdır ve 7 Eylül 2026
+ * ölçümünden sonra eklendi. ELM327, cevabı aldıktan sonra "başka ECU da
+ * konuşacak mı" diye kendi zaman aşımını doldurmayı sürdürüyor; sahada
+ * ölçülen 272 ms'nin 225 ms'si bu bekleme. Son ek "bir cevap yeter, kes"
+ * demek ve beklemeyi bitiriyor.
+ *
+ * Yazma yetkisi AÇMIYOR: hâlâ Mode 01, hâlâ tek yön. Son ek yalnızca
+ * ADAPTÖRE ne zaman dinlemeyi bırakacağını söylüyor, araca giden istek
+ * değişmiyor.
+ *
+ * Mode 02 (freeze frame) ve 06 de salt-okunurdur ama bu sürümde
  * gerekmiyorlar, o yüzden listede YOKLAR. İhtiyaç doğarsa tek tek, bilerek,
  * testiyle birlikte eklenirler.
  */
-const OBD_MODE_01 = /^01[0-9A-F]{2}$/;
+const OBD_MODE_01 = /^01[0-9A-F]{2}[1-9]?$/;
+
+/**
+ * Mode 09 — "request vehicle information". 2026-09-07'de, kullanıcının açık
+ * onayıyla ve YALNIZCA iki InfoType için eklendi.
+ *
+ *   0900 = hangi InfoType'ların desteklendiği (bitmask)
+ *   0902 = VIN
+ *
+ * Salt-okunur: ECU'nun ürettiği bantta yazan sabit bilgiyi sorar, hiçbir şey
+ * değiştirmez. Mode 09'un tamamı (kalibrasyon kimlikleri, performans
+ * sayaçları) AÇILMADI — dosyanın kuralı "tek tek, bilerek": bugünkü ihtiyaç
+ * VIN, o yüzden izin verilen VIN.
+ *
+ * VIN'in NİYE gerektiği: rapor bugüne kadar araca "MINI Cooper R50" diyordu
+ * ve bunu yalnızca kodda gömülü profilden biliyordu — yani aslında
+ * bilmiyordu, varsayıyordu. İkincisi, trend verisi araca bağlı olmalı; iki
+ * farklı arabanın rölanti ölçümü aynı seriye girerse seri anlamsızlaşır.
+ */
+const OBD_MODE_09_READ: ReadonlySet<string> = new Set([
+  '0900', // desteklenen InfoType'lar
+  '0902', // VIN
+]);
 
 /**
  * DTC (arıza kodu) OKUMA modları — 2026-09-04'te bilerek eklendi.
@@ -146,13 +178,14 @@ export function assertReadOnly(raw: string): string {
 
   if (OBD_MODE_01.test(cmd)) return cmd;
   if (OBD_DTC_READ.has(cmd)) return cmd;
+  if (OBD_MODE_09_READ.has(cmd)) return cmd;
   if (AT_LITERALS.has(cmd)) return cmd;
   if (AT_PATTERNS.some((p) => p.test(cmd))) return cmd;
 
   const known = KNOWN_DANGEROUS.find(([p]) => p.test(cmd));
   throw new ReadOnlyViolationError(
     raw,
-    known ? known[1] : 'not on the allowlist (this app only reads Mode 01)',
+    known ? known[1] : 'not on the allowlist (this app only reads, and only the modes listed there)',
   );
 }
 
@@ -168,8 +201,9 @@ export function isReadOnlyCommand(raw: string): boolean {
 
 /** Debug ekranında kullanıcıya gösterilmek üzere, izin verilen her şeyin listesi. */
 export const ALLOWED_COMMANDS_SUMMARY = [
-  'OBD: 01XX (Mode 01 — current data, read only)',
+  'OBD: 01XX / 01XXn (Mode 01 — current data, read only; n = expected replies)',
   'OBD: 03, 07, 0A (read fault codes — never clears them)',
+  'OBD: 0900, 0902 (vehicle information — VIN only)',
   `AT : ${[...AT_LITERALS].join(', ')}`,
   'AT : ATSP0-ATSPC (select protocol), ATSTxx (timeout)',
   'EVERY other command is rejected.',

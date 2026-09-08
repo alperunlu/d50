@@ -13,6 +13,7 @@
  * tahmin ile ölçümü birbirine karıştırmamak önemli.
  */
 
+import { maxOf, extentOf } from '../util/agg';
 import { MINI_R50, PHYSICS, type VehicleProfile } from './vehicle';
 import { rollingCircumferenceMm, totalDriveRatio, estimatedEngineTorqueNm, roadLoadForceN } from './tyre';
 
@@ -228,37 +229,150 @@ export function warmupSeconds(
 }
 
 /**
+ * Rölanti örneklerinin TEK tanımı — özet de teşhis de bunu kullanır.
+ *
+ * Önce iki ayrı tanım vardı ve aynı ekranda iki farklı sayı çıkıyordu:
+ * 6 Eylül 2026 kaydında özet "114 rpm σ", teşhis kartı "σ 44.4 rpm" dedi.
+ * Fark üst banttaydı — özet 1.8× rölantiye kadar (1530 rpm) sayıyordu ve
+ * araç dururken gaza basılan iki örneği (1435, 1472 rpm) rölanti sanıp
+ * sapmayı iki katından fazla şişiriyordu. 850 rpm rölantili bir motorda
+ * 1472 rpm rölanti değildir; dar bant doğru olandı.
+ *
+ * Ölçüm aletinde iki sayının çelişmesi, sayının kendisinden daha kötüdür:
+ * kullanıcı hangisine bakacağını bilemez. Tanım bu yüzden tek yerde.
+ */
+export function idleSamples(
+  rpmSeries: readonly TimeSeriesPoint[],
+  speedSeries: readonly TimeSeriesPoint[],
+  vehicle: VehicleProfile = MINI_R50,
+): TimeSeriesPoint[] {
+  // "Hız verisi yok" ile "hız verisi var ama araç hareket hâlinde" farklı
+  // şeylerdir: ilkinde devir bandına güvenip devam ederiz, ikincisinde
+  // rölanti diye bir şey yoktur ve ölçüm yapılmamalıdır.
+  const haveSpeedData = speedSeries.length > 0;
+
+  const out: TimeSeriesPoint[] = [];
+  for (const r of rpmSeries) {
+    // Alt sınır motorun ÇALIŞTIĞINI söyler (kontak kapalıyken devir 0 gelir),
+    // üst sınır rölantiden çıkıldığını.
+    if (r.value <= 300 || r.value >= vehicle.idleRpm * 1.6) continue;
+    if (!haveSpeedData) {
+      out.push(r);
+      continue;
+    }
+    // O andaki hız: devir örneğiyle aynı ts'e denk gelmeyebilir, o ana kadarki
+    // son hız örneği kullanılır (3 sn'den eskiyse "bilinmiyor" sayılır).
+    const speed = valueAtOrBefore(speedSeries, r.ts, 3000);
+    if (speed !== null && speed < 2) out.push(r);
+  }
+  return out;
+}
+
+/**
+ * Serinin `ts` anındaki değeri: o ana kadarki SON örnek (forward-fill).
+ * `maxAgeMs`'ten eskiyse `null` — bayat bir değeri "şu anki" diye sunmak
+ * ölçümü uydurmak olurdu. İkili arama; uzun kayıtlarda kareli maliyet
+ * bırakmamak için (bkz. nearestValue'daki not).
+ */
+export function valueAtOrBefore(
+  series: readonly TimeSeriesPoint[],
+  ts: number,
+  maxAgeMs: number,
+): number | null {
+  let lo = 0;
+  let hi = series.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (series[mid].ts <= ts) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo === 0) return null;
+  const last = series[lo - 1];
+  return ts - last.ts <= maxAgeMs ? last.value : null;
+}
+
+/**
  * Rölanti kararlılığı — devir standart sapması (RPM).
  *
  * Tekleme, kirli enjektör ya da vakum kaçağı rölantiyi dalgalandırır.
  * Sağlıklı bir motorda sapma tipik olarak 20-30 RPM altındadır; 60+ RPM
  * bir şeylerin yolunda olmadığının kaba ama kullanışlı bir işaretidir.
  */
+/**
+ * Rölanti kararlılığının TEK istatistiği: kayan pencerelerin standart
+ * sapmalarının ortancası.
+ *
+ * Yavaş sürüklenmeyi ölçüme sokmadan kısa süreli değişkenliği verir. Dışa
+ * açık, çünkü özet de teşhis de vital de AYNI sayıyı üretmek zorunda —
+ * örnek seçimini (idleSamples) tekilleştirmek yetmiyor, istatistiğin
+ * kendisi de tek yerde olmalı. Bu ayrım daha önce iki kez ayrı sayı
+ * ürettiği için testle sabitlendi.
+ */
+export function idleStabilityRpm(
+  points: readonly TimeSeriesPoint[],
+  windowMs = 10_000,
+  minSamples = 5,
+): number | null {
+  const deviations: number[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const from = points[i].ts;
+    const segment: number[] = [];
+    for (let j = i; j < points.length && points[j].ts < from + windowMs; j++) {
+      segment.push(points[j].value);
+    }
+    if (segment.length < minSamples) continue;
+    const m = segment.reduce((a, b) => a + b, 0) / segment.length;
+    deviations.push(
+      Math.sqrt(segment.reduce((a, v) => a + (v - m) ** 2, 0) / (segment.length - 1)),
+    );
+  }
+  if (deviations.length === 0) return null;
+  const sorted = [...deviations].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
 export function idleRpmStability(
   rpmSeries: readonly TimeSeriesPoint[],
   speedSeries: readonly TimeSeriesPoint[],
   vehicle: VehicleProfile = MINI_R50,
 ): { stdDev: number; meanRpm: number; sampleCount: number } | null {
-  // "Hız verisi yok" ile "hız verisi var ama araç hareket hâlinde" farklı
-  // şeylerdir: ilkinde devir bandına güvenip devam ederiz, ikincisinde
-  // rölanti diye bir şey yoktur ve ölçüm yapılmamalıdır.
-  const haveSpeedData = speedSeries.length > 0;
-  const stoppedTimes = speedSeries.filter((s) => s.value <= 1).map((s) => s.ts);
-
-  const idleBand = rpmSeries.filter((r) => {
-    const inIdleRange = r.value > vehicle.idleRpm * 0.6 && r.value < vehicle.idleRpm * 1.8;
-    if (!inIdleRange) return false;
-    if (!haveSpeedData) return true;
-    // Hız örneği tam aynı ts'te olmayabilir; en yakın 2 sn içinde duruyorsa say.
-    return stoppedTimes.some((ts) => Math.abs(ts - r.ts) <= 2000);
-  });
+  const idleBand = idleSamples(rpmSeries, speedSeries, vehicle);
 
   if (idleBand.length < 5) return null;
 
   const values = idleBand.map((p) => p.value);
   const mean = values.reduce((a, b) => a + b, 0) / values.length;
-  const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / values.length;
-  return { stdDev: Math.sqrt(variance), meanRpm: mean, sampleCount: values.length };
+  /**
+   * Sapma KISA PENCERELERDE ölçülüyor, tüm kayıt boyunca değil.
+   *
+   * Aranan şey rölantinin DALGALANMASI; ama tüm pencerenin sapması,
+   * rölantinin yavaş SÜRÜKLENMESİNİ de içine alıyor. Soğuk motor tasarım
+   * gereği yüksek başlayıp iner: 7 Eylül 2026 kaydında 90 saniyede 1767'den
+   * 1071 rpm'e düştü. Tüm pencerenin sapması 88.6 rpm çıktı ve kart
+   * "rölanti dalgalanıyor, araç titriyor" dedi. Oysa 10 saniyelik
+   * pencerelerin sapması 26.5 rpm — yani sağlıklı bir motorun bandında.
+   * Ölçülen şey arıza değil, ısınmaydı.
+   *
+   * Ortanca alınıyor: tek bir gaz vuruşu ya da vitese takma anı bütün
+   * ölçümü sürüklemesin.
+   */
+  const windowSd = idleStabilityRpm(idleBand);
+  /**
+   * n-1 (örneklem standart sapması), n değil.
+   *
+   * Teşhis kartı baştan beri n-1 kullanıyordu; özet n kullanıyordu. Aynı
+   * veriden 40.0 ve 40.3 çıkıyordu — bant farkı düzeltildikten SONRA bile
+   * iki sayı tutmuyordu. Elimizdeki, rölantinin tamamı değil ondan alınmış
+   * bir örneklem; doğru tahminci de n-1 olan.
+   */
+  const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / (values.length - 1);
+  // Kısa pencere hesaplanamadıysa (örnek az) tüm pencereye düşülüyor.
+  return {
+    stdDev: windowSd ?? Math.sqrt(variance),
+    meanRpm: mean,
+    sampleCount: values.length,
+  };
 }
 
 /**
@@ -428,13 +542,23 @@ export function summarizeTrip(series: SeriesMap, vehicle: VehicleProfile = MINI_
   const maf = series['10'] ?? [];
   const accelMag = series['accel_magnitude'] ?? [];
 
-  const allTs = Object.values(series)
-    .flat()
-    .map((p) => p.ts);
-  const durationSec = allTs.length > 0 ? (Math.max(...allTs) - Math.min(...allTs)) / 1000 : 0;
+  /**
+   * Süre: bütün kanalların uçlarından. Tek bir dev dizi kurup spread etmek
+   * yerine kanal kanal geziliyor — uzun oturumlarda spread'in argüman
+   * tavanına takılıp çökmesinin sebebi buydu (bkz. util/agg.ts).
+   */
+  let tsMin: number | null = null;
+  let tsMax: number | null = null;
+  for (const points of Object.values(series)) {
+    const span = extentOf(points.map((p) => p.ts));
+    if (!span) continue;
+    if (tsMin === null || span.min < tsMin) tsMin = span.min;
+    if (tsMax === null || span.max > tsMax) tsMax = span.max;
+  }
+  const durationSec = tsMin !== null && tsMax !== null ? (tsMax - tsMin) / 1000 : 0;
 
   const speedValues = speed.map((p) => p.value);
-  const maxSpeedKmh = speedValues.length > 0 ? Math.max(...speedValues) : null;
+  const maxSpeedKmh = maxOf(speedValues);
   const avgSpeedKmh =
     speedValues.length > 0 ? speedValues.reduce((a, b) => a + b, 0) / speedValues.length : null;
 
@@ -535,6 +659,22 @@ export function summarizeTrip(series: SeriesMap, vehicle: VehicleProfile = MINI_
    */
   const circumference = rollingCircumferenceMm(vehicle.fittedTyre);
   let maxEngineTorqueNm: number | null = null;
+  /**
+   * Vites değişimi torku uyduruyordu.
+   *
+   * Oran anlık ölçülüyor (devir / tekerlek devri). Debriyaj ayrıldığı anda
+   * devir yükselir, hız sabit kalır ve oran fırlar; o oranla geri hesaplanan
+   * "motor torku" da fırlar. 6 Eylül 2026 kaydında tepe tork 200 Nm çıktı —
+   * bu motorun fabrika değeri ~150 Nm. Aynı ekrandaki "aktarma oranı tek
+   * viteste %8.9 geziniyor" kartı zaten aynı kararsızlığı gösteriyordu.
+   *
+   * Çözüm: yalnızca oranın SABİT kaldığı anları say. Sabit vitesteki bir
+   * çekişte oran örnekten örneğe neredeyse hiç oynamaz; oynuyorsa ya vites
+   * değişiyor ya tekerlek patinaj yapıyordur — ikisi de tork ölçümü değil.
+   */
+  const RATIO_STABLE_PCT = 0.03;
+  let prevRatio: number | null = null;
+  let prevRatioTs = 0;
   for (const a of accel) {
     if (a.value < 0.5) continue; // belirgin hızlanma yoksa anlamsız
     const v = nearestValue(speed, a.ts);
@@ -543,6 +683,14 @@ export function summarizeTrip(series: SeriesMap, vehicle: VehicleProfile = MINI_
 
     const ratio = totalDriveRatio(r, v, circumference);
     if (ratio === null) continue;
+
+    const steady =
+      prevRatio !== null &&
+      a.ts - prevRatioTs <= 3000 &&
+      Math.abs(ratio - prevRatio) / prevRatio < RATIO_STABLE_PCT;
+    prevRatio = ratio;
+    prevRatioTs = a.ts;
+    if (!steady) continue;
 
     const force = roadLoadForceN({ speedKmh: v, accelMs2: a.value, vehicle });
     const torque = estimatedEngineTorqueNm({
@@ -609,13 +757,20 @@ export function explainSummaryGaps(
   const values = (key: string) => (series[key] ?? []).map((p) => p.value);
 
   const speed = hasChannel('gps_speed') ? values('gps_speed') : values('0D');
-  const maxSpeed = speed.length > 0 ? Math.max(...speed) : null;
+  const maxSpeed = maxOf(speed);
 
   if (summary.zeroToHundredSec === null) {
+    /**
+     * 100'ün ÜSTÜNE çıkılmış bir kayıtta "tepe hız 109 km/h'ti, tam bir
+     * 0-100 çekişi gerekiyor" cümlesi kendi kendisiyle çelişiyor: 109 zaten
+     * 100'den büyük. Eksik olan hız değil, duruştan kesintisiz çekiş.
+     */
     out.zeroToHundredSec =
       maxSpeed === null
         ? 'needs vehicle speed'
-        : `top speed here was ${Math.round(maxSpeed)} km/h — a full 0-100 run is required`;
+        : maxSpeed >= 100
+          ? 'the car passed 100 km/h but never in one pull from a standstill — start from rest'
+          : `top speed here was ${Math.round(maxSpeed)} km/h — a full 0-100 run is required`;
   }
 
   if (summary.warmupSec === null) {
@@ -730,21 +885,57 @@ export function impossibleSummaryFields(
   ).map((r) => r.field);
 }
 
-/** Verilen zamana en yakın örneğin değeri (2 sn toleransla). */
-function nearestValue(
+/**
+ * Verilen zamana en yakın örneğin değeri (2 sn toleransla).
+ *
+ * İKİLİ ARAMA, doğrusal tarama DEĞİL. Bu fonksiyon iki seriyi zamana göre
+ * eşlemek için kullanılıyor ve her çağrıda seriyi baştan sona taradığında
+ * maliyet iki serinin boyunun ÇARPIMI oluyordu. Kısa kayıtta göze
+ * batmıyordu; 4483 saniyelik 27 kanallı kayıtta `summarizeTrip` masaüstünde
+ * ~9 saniye sürdü, telefonda ise Trips ekranı "Working…" yazısında
+ * kilitlendi (2026-09-06). İkili arama aynı sonucu üretir, maliyeti
+ * çarpım yerine logaritmik.
+ *
+ * `series` zamana göre SIRALI olmak zorunda — `groupSeries` bunu garanti
+ * ediyor, bu modüldeki tüm çağrılar oradan geliyor. Sıralılık varsayımının
+ * kolay doğrulanabilmesi için dışa açık (bkz. tests/longSession.test.ts).
+ */
+export function nearestValue(
   series: readonly TimeSeriesPoint[],
   ts: number,
   toleranceMs = 2000,
 ): number | null {
+  if (series.length === 0) return null;
+
+  // İlk `ts`'ten küçük olmayan örneği bul.
+  let lo = 0;
+  let hi = series.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (series[mid].ts < ts) lo = mid + 1;
+    else hi = mid;
+  }
+
+  // En yakın aday ya bulunan örnek ya da bir öncekidir.
+  const after = lo < series.length ? series[lo] : null;
+  // Aynı zaman damgasını taşıyan örnek grubunda İLKİ seçiliyor: doğrusal
+  // tarama diziyi baştan gezdiği için ilkini bulurdu, davranış korunuyor.
+  let beforeIndex = lo - 1;
+  while (beforeIndex > 0 && series[beforeIndex - 1].ts === series[beforeIndex].ts) beforeIndex--;
+  const before = beforeIndex >= 0 ? series[beforeIndex] : null;
+
   let best: TimeSeriesPoint | null = null;
   let bestDist = Infinity;
-  for (const p of series) {
-    const d = Math.abs(p.ts - ts);
-    if (d < bestDist) {
-      bestDist = d;
-      best = p;
-    }
+  // Eşitlikte ÖNCEKİ kazanır — doğrusal taramanın davranışı da buydu.
+  if (before !== null) {
+    best = before;
+    bestDist = Math.abs(before.ts - ts);
   }
+  if (after !== null && Math.abs(after.ts - ts) < bestDist) {
+    best = after;
+    bestDist = Math.abs(after.ts - ts);
+  }
+
   return best !== null && bestDist <= toleranceMs ? best.value : null;
 }
 

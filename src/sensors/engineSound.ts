@@ -25,6 +25,7 @@ import {
   type EngineLayout,
 } from '../analysis/orderTracking';
 import { dbfsToSpl } from '../analysis/spl';
+import { extentOf } from '../util/agg';
 
 /** Native modül tembel yükleniyor — bkz. micLevel.ts'teki gerekçe. */
 type AudioModuleType = typeof import('expo-audio');
@@ -74,6 +75,8 @@ export interface EngineSoundOptions {
 }
 
 const HOP = ORDER_FFT_SIZE / 2;
+/** Süren bir kilit reddi en fazla bu aralıkla loglanır. */
+const REASON_REPEAT_MS = 60_000;
 
 interface StreamHandle {
   start: () => Promise<void>;
@@ -97,8 +100,10 @@ export class EngineSoundListener {
    * gerektirdiği için min/max farkı pencereyle birlikte gönderiliyor.
    */
   private rpmWindow: number[] = [];
-  /** Kilit reddi sebebi tekrar tekrar loglanmasın diye son sebep. */
-  private lastReason: string | null = null;
+  /** Kilit reddi sebebi tekrar tekrar loglanmasın diye son sebebin KODU. */
+  private lastReasonCode: string | null = null;
+  /** Aynı sebep sürüyorsa en fazla bu aralıkla hatırlatılır. */
+  private lastReasonAt = 0;
 
   constructor(private readonly opts: EngineSoundOptions) {}
 
@@ -206,7 +211,8 @@ export class EngineSoundListener {
 
     const rpms = this.rpmWindow;
     const rpm = rpms.length > 0 ? rpms[rpms.length - 1] : this.opts.getRpm();
-    const spread = rpms.length > 1 ? Math.max(...rpms) - Math.min(...rpms) : null;
+    const rpmExtent = rpms.length > 1 ? extentOf(rpms) : null;
+    const spread = rpmExtent ? rpmExtent.max - rpmExtent.min : null;
     this.rpmWindow = rpm !== null && rpm !== undefined ? [rpm] : [];
 
     const result = analyzeOrderFrame({
@@ -222,21 +228,49 @@ export class EngineSoundListener {
       { key: 'mic_db', value: dbfsToSpl(result.levelDbfsA, this.opts.getCalibrationDb()) },
     ];
 
-    if (result.audioRpm !== null) samples.push({ key: 'audio_rpm', value: result.audioRpm });
-
+    /**
+     * `audio_rpm` YALNIZCA kilit varken kaydediliyor.
+     *
+     * Önce kilit olmadan da yazılıyordu: uygulamanın kendi "mikrofon başka
+     * bir şey duyuyor" dediği değer veriye giriyordu. 6 Eylül 2026 kaydında
+     * bu kanalın yalnızca %56'sı OBD devrine %12 içinde kaldı, %15'i devrin
+     * yarısına kilitlenmişti, oran 0.25 ile 2.08 arasında geziniyordu.
+     * Ölçmediğini kaydetmemek, boş bırakmaktan daha kötü değil.
+     */
     if (result.locked) {
+      if (result.audioRpm !== null) samples.push({ key: 'audio_rpm', value: result.audioRpm });
       if (result.halfOrderRatio !== null) {
         samples.push({ key: 'order_half_ratio', value: result.halfOrderRatio });
       }
       if (result.imbalanceRatio !== null) {
         samples.push({ key: 'order_1_ratio', value: result.imbalanceRatio });
       }
-      this.lastReason = null;
-    } else if (result.reason && result.reason !== this.lastReason) {
-      // Aynı sebebi saniyede dört kez loglamak debug dosyasını boğardı;
-      // yalnızca sebep DEĞİŞTİĞİNDE yazılıyor.
-      this.lastReason = result.reason;
-      this.opts.onNote?.(result.reason);
+      this.lastReasonCode = null;
+    } else if (result.reason) {
+      /**
+       * Aynı sebebi saniyede dört kez loglamak debug dosyasını boğar.
+       * Filtre metni değil KODU karşılaştırıyor: metin ölçülen devirleri
+       * taşıdığı için her pencerede farklıydı ve filtre hiç tutmuyordu —
+       * 55 saniyelik bir log'un %22'si bu satırlardı (6 Eylül 2026).
+       * Sebep sürüyorsa dakikada bir hatırlatılıyor, sussun diye değil,
+       * kullanıcı hâlâ devam ettiğini görebilsin diye.
+       */
+      /**
+       * Tekilleştirme SEBEBE değil ZAMANA bakıyor.
+       *
+       * Önce sebep koduna bakıyordu ve iki sebep dönüşümlü geldiğinde
+       * filtre hiç tutmuyordu: 7 Eylül 2026 kaydında 48 satırın 35'inde
+       * ardışık sebep değişiyordu (`rpm-mismatch` ↔ `rpm-unstable`), yani
+       * neredeyse her pencere loglanıyordu. Kullanıcı için bilgi "order
+       * takibi tutmuyor" cümlesidir; hangi sırayla tutmadığı değil.
+       */
+      const code = result.reasonCode ?? result.reason;
+      const now = Date.now();
+      if (now - this.lastReasonAt > REASON_REPEAT_MS) {
+        this.lastReasonCode = code;
+        this.lastReasonAt = now;
+        this.opts.onNote?.(result.reason);
+      }
     }
 
     this.opts.onSamples(samples);

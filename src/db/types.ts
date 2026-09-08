@@ -12,6 +12,12 @@ export interface Session {
    * Eski oturumlarda ve bağlantısız kayıtlarda null.
    */
   readonly supportedPids: SupportedPidMap | null;
+  /**
+   * Bu oturumun alındığı aracın VIN'i. `null` = bilinmiyor: VIN okuması
+   * eklenmeden önceki oturumlar ve Mode 09'u desteklemeyen ECU'lar.
+   * "Başka araç" anlamına GELMEZ.
+   */
+  readonly vin: string | null;
 }
 
 /** `0100`/`0120`/`0140` cevaplarındaki destek bitmask'leri. */
