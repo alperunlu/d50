@@ -12,7 +12,7 @@
       "bundleIdentifier": "com.alu.d50",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
-        "NSMotionUsageDescription": "İvmeölçer, sürüş kaydına hızlanma/frenleme şiddetini eklemek için kullanılır. Veri telefonundan hiçbir yere gönderilmez."
+        "NSMotionUsageDescription": "The accelerometer is used to add acceleration/braking intensity to your drive recording. This data is never sent anywhere from your phone."
       }
     },
     "android": {
@@ -42,14 +42,14 @@
         {
           "isBackgroundEnabled": true,
       "modes": ["central"],
-          "bluetoothAlwaysPermission": "Bu uygulama OBD2 adaptörünüzden (Vgate iCar Pro) motor verilerini SADECE OKUMAK için Bluetooth kullanır. Araca hiçbir zaman yazma/komut göndermez."
+          "bluetoothAlwaysPermission": "This app uses Bluetooth to READ engine data from your OBD2 adapter (e.g. Vgate iCar Pro) only. It never writes to or sends commands to the vehicle."
         }
       ],
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "Konum, kaydettiğin sürüşe hız/rakım/eğim bilgisini eklemek için kullanılır ve KAYIT SÜRERKEN uygulama arka plandayken de devam eder — böylece sürerken haritaya bakabilir, kaydı kaybetmezsin. 0-100 ölçümü, yokuş düzeltmeli güç tahmini ve kilometre saati sapması bu veriye dayanır. Konum verisi telefonundan hiçbir yere gönderilmez.",
-          "locationWhenInUsePermission": "Konum, kaydettiğin sürüşe hız/rakım/eğim bilgisini eklemek için kullanılır. Veri telefonundan hiçbir yere gönderilmez.",
+          "locationAlwaysAndWhenInUsePermission": "Location is used to add speed, altitude and grade to your drive recording, and continues in the background WHILE A RECORDING IS RUNNING — so you can check the map while driving without losing the recording. The 0-100 km/h time, grade-corrected power estimate, and speedometer error all depend on this data. Location data is never sent anywhere from your phone.",
+          "locationWhenInUsePermission": "Location is used to add speed, altitude and grade to your drive recording. This data is never sent anywhere from your phone.",
           "isIosBackgroundLocationEnabled": true,
           "isAndroidBackgroundLocationEnabled": false
         }
@@ -59,7 +59,7 @@
         "expo-audio",
         {
           "enableBackgroundRecording": true,
-          "microphonePermission": "Mikrofon YALNIZCA ses seviyesini (göreceli dB) ölçmek için kullanılır; ölçüm sırasında oluşan geçici ses dosyası kayıt biter bitmez silinir. Hiçbir ses saklanmaz, dinlenmez ya da telefondan dışarı gönderilmez."
+          "microphonePermission": "The microphone is used ONLY to measure sound level (relative dB); any temporary audio file created during measurement is deleted as soon as it ends. No audio is stored, listened to, or sent anywhere from your phone."
         }
       ]
     ],
