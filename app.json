@@ -56,6 +56,15 @@
       ],
       "expo-font",
       [
+        "expo-splash-screen",
+        {
+          "image": "./assets/icon.png",
+          "imageWidth": 160,
+          "resizeMode": "contain",
+          "backgroundColor": "#0F2A21"
+        }
+      ],
+      [
         "expo-audio",
         {
           "enableBackgroundRecording": true,
