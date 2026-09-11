@@ -6,4 +6,4 @@
  * mi?" sorusunun tartışmasız cevabı. Arabaya çıkmadan Bus ekranına bakıp
  * beklenen değerle karşılaştırmak yeterli.
  */
-export const JS_BUILD_TAG = '2026-09-10 · js-32 (splash screen)';
+export const JS_BUILD_TAG = '2026-09-11 · js-33 (debug into link, cycle preflight)';

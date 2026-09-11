@@ -1,9 +1,29 @@
-import React, { useState } from 'react';
-import { View, Text, StyleSheet, Pressable, ScrollView, ActivityIndicator } from 'react-native';
+import React, { useCallback, useState } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  Pressable,
+  ScrollView,
+  ActivityIndicator,
+  Alert,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import * as Updates from 'expo-updates';
 import { useAppStore } from '../src/state/store';
+import type { RawLogEntry } from '../src/state/store';
+import type { ProfileCandidate } from '../src/ble/profiles';
 import { VehicleChrome } from '../src/ui/VehicleChrome';
-import { SectionRule, PrimaryAction, GhostAction, Note, Label, Frame, Measure } from '../src/ui/primitives';
+import {
+  SectionRule,
+  PrimaryAction,
+  GhostAction,
+  Note,
+  Label,
+  Frame,
+  Measure,
+  Tag,
+} from '../src/ui/primitives';
 import {
   formatTyreSize,
   rollingCircumferenceMm,
@@ -14,6 +34,9 @@ import {
 import type { TyreSize } from '../src/analysis/vehicle';
 import { decodeVin } from '../src/obd/vin';
 import { describeSpl, MIN_SPL_CALIBRATION_DB, MAX_SPL_CALIBRATION_DB } from '../src/analysis/spl';
+import { writeAndShare } from '../src/util/exportFile';
+import { JS_BUILD_TAG } from '../src/ui/buildTag';
+import { readLastCrash, clearLastCrash, type CrashRecord } from '../src/util/crashLog';
 import { color, type, space, hairlineWidth } from '../src/ui/theme';
 
 /**
@@ -22,6 +45,14 @@ import { color, type, space, hairlineWidth } from '../src/ui/theme';
  * Tasarım gerekçesi: araç künyesi artık her ekranda kalıcı olduğu için bu
  * ekran "sürekli bakılan bir sekme" olmaktan çıkıp yalnızca bağlantı
  * kurulmadığında ya da bozulduğunda açılan bir sayfaya dönüşüyor.
+ *
+ * Debug sekmesinin bütün içeriği (sürüm, çökme kaydı, elle GATT profili,
+ * PID taraması, ham trafik) buranın altına taşındı. Gerekçe iki tane:
+ * alt barda altıncı sekmeye yer yoktu ve "Debug" etiketli bir sekme
+ * yayınlanan bir uygulamada yanlış duruyordu. İçerik zaten bu ekranın
+ * cevapladığı soruyla aynı soruyu cevaplıyor — "bağlantıda ne oluyor".
+ * Sıralama bilinçli: her ziyarette bakılan şeyler üstte, yalnızca bir şey
+ * ters gittiğinde bakılanlar altta.
  */
 export default function LinkScreen() {
   const connectionState = useAppStore((s) => s.connectionState);
@@ -56,6 +87,125 @@ export default function LinkScreen() {
   const stopSoundMeter = useAppStore((s) => s.stopSoundMeter);
   const resetSoundStats = useAppStore((s) => s.resetSoundStats);
   const setSplCalibration = useAppStore((s) => s.setSplCalibration);
+
+  // --- Debug sekmesinden taşınan durum ---
+  const rawLog = useAppStore((s) => s.rawLog);
+  const clearLog = useAppStore((s) => s.clearLog);
+  const bleCandidates = useAppStore((s) => s.bleCandidates);
+  const manualNotify = useAppStore((s) => s.manualNotify);
+  const manualWrite = useAppStore((s) => s.manualWrite);
+  const pickManualNotify = useAppStore((s) => s.pickManualNotify);
+  const pickManualWrite = useAppStore((s) => s.pickManualWrite);
+  const connectWithManualProfile = useAppStore((s) => s.connectWithManualProfile);
+  const scanProgress = useAppStore((s) => s.scanProgress);
+  const scanRows = useAppStore((s) => s.scanRows);
+  const runPidScan = useAppStore((s) => s.runPidScan);
+
+  const [logBusy, setLogBusy] = useState(false);
+  const [manualBusy, setManualBusy] = useState(false);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  /**
+   * Son yakalanmamış JS hatası. TestFlight'ın çökme raporu yalnızca yerel
+   * yığını içeriyor — hatanın metni bu dosyada; uygulama yeniden açılınca
+   * burada görünür.
+   */
+  const [crash, setCrash] = useState<CrashRecord | null>(() => readLastCrash());
+
+  /**
+   * Elle güncelleme indirme. Arabada, uygulamayı iki kez kapatıp açmak yerine
+   * tek dokunuşla en son JS sürümüne geçmeyi sağlıyor.
+   */
+  const checkUpdate = useCallback(async () => {
+    if (!Updates.isEnabled) {
+      Alert.alert('Development mode', 'OTA updates only work in a real build.');
+      return;
+    }
+    setUpdateBusy(true);
+    try {
+      const check = await Updates.checkForUpdateAsync();
+      if (!check.isAvailable) {
+        Alert.alert('Up to date', 'Already running the latest version.');
+        return;
+      }
+      await Updates.fetchUpdateAsync();
+      Alert.alert('Update downloaded', 'The app will restart.', [
+        { text: 'OK', onPress: () => void Updates.reloadAsync() },
+      ]);
+    } catch (e) {
+      Alert.alert('Update failed', e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdateBusy(false);
+    }
+  }, []);
+
+  const shareCrash = useCallback(async () => {
+    if (!crash) return;
+    const text =
+      `${new Date(crash.at).toISOString()} ${crash.fatal ? 'FATAL' : 'non-fatal'}\n` +
+      `${crash.message}\n\n${crash.stack ?? '(no stack)'}\n\n` +
+      `Breadcrumbs:\n${crash.breadcrumbs.join('\n')}\n`;
+    try {
+      const { uri, shared } = await writeAndShare(
+        `d50_crash_${crash.at}.txt`,
+        text,
+        'text/plain',
+        'Share crash report',
+      );
+      if (!shared) Alert.alert('Sharing unavailable', `File saved: ${uri}`);
+    } catch (e) {
+      Alert.alert('Error', e instanceof Error ? e.message : String(e));
+    }
+  }, [crash]);
+
+  const dismissCrash = useCallback(() => {
+    clearLastCrash();
+    setCrash(null);
+  }, []);
+
+  const shareLog = useCallback(async () => {
+    setLogBusy(true);
+    try {
+      const text = rawLog
+        .map((e) => `${new Date(e.ts).toISOString()} [${e.direction}] ${e.text}`)
+        .join('\n');
+      const { uri, shared } = await writeAndShare(
+        `obd_debug_${Date.now()}.txt`,
+        text,
+        'text/plain',
+        'Share debug log',
+      );
+      if (!shared) Alert.alert('Sharing unavailable', `File saved: ${uri}`);
+    } catch (e) {
+      Alert.alert('Error', e instanceof Error ? e.message : String(e));
+    } finally {
+      setLogBusy(false);
+    }
+  }, [rawLog]);
+
+  const pidScan = useCallback(async () => {
+    const report = await runPidScan();
+    if (!report) return;
+    try {
+      const { uri, shared } = await writeAndShare(
+        `obd_pid_scan_${Date.now()}.txt`,
+        report,
+        'text/plain',
+        'Share PID scan',
+      );
+      if (!shared) Alert.alert('Sharing unavailable', `File saved: ${uri}`);
+    } catch (e) {
+      Alert.alert('Error', e instanceof Error ? e.message : String(e));
+    }
+  }, [runPidScan]);
+
+  const manualConnect = useCallback(async () => {
+    setManualBusy(true);
+    try {
+      await connectWithManualProfile();
+    } finally {
+      setManualBusy(false);
+    }
+  }, [connectWithManualProfile]);
 
   const busy = connectionState === 'connecting';
   const linked = connectionState === 'connected';
@@ -237,6 +387,150 @@ export default function LinkScreen() {
             onReset={resetSoundStats}
             onCalibrate={(delta) => void setSplCalibration(splCalibrationDb + delta)}
           />
+        </View>
+
+        {/*
+          Buradan aşağısı eski Debug sekmesi. Sırası kasıtlı: sürüm ve çökme
+          kaydı üstte (bir şey ters gittiğinde ilk sorulan bunlar), ham trafik
+          en altta — en teknik olan en derinde.
+        */}
+        <View style={{ marginTop: space(6) }}>
+          <SectionRule label="Build" meta={Updates.isEmbeddedLaunch ? 'Embedded' : 'OTA'} />
+          <View style={styles.buildRow}>
+            <Text style={[type.status, { color: color.ink, fontSize: 14 }]}>{JS_BUILD_TAG}</Text>
+            <Text style={type.metaSmall}>{Updates.runtimeVersion ?? '—'}</Text>
+          </View>
+          <GhostAction
+            label={updateBusy ? 'Checking' : 'Check for update'}
+            onPress={checkUpdate}
+            disabled={updateBusy}
+            style={{ marginTop: space(2.5) }}
+          />
+        </View>
+
+        {crash && (
+          <View style={{ marginTop: space(6) }}>
+            <SectionRule
+              label="Last crash"
+              meta={new Date(crash.at).toLocaleString()}
+              metaColor={color.alert}
+            />
+            <Text style={[type.prose, { color: color.ink, marginTop: space(2) }]}>
+              {crash.message}
+            </Text>
+            {crash.stack ? (
+              <Text style={[type.metaSmall, { marginTop: space(2), lineHeight: 14 }]}>
+                {crash.stack.split('\n').slice(0, 8).join('\n')}
+              </Text>
+            ) : null}
+            {crash.breadcrumbs.length > 0 ? (
+              <Text style={[type.metaSmall, { marginTop: space(2), lineHeight: 14 }]}>
+                {crash.breadcrumbs.slice(-4).join('\n')}
+              </Text>
+            ) : null}
+            <View style={{ flexDirection: 'row', gap: space(3), marginTop: space(2.5) }}>
+              <GhostAction label="Share crash" onPress={shareCrash} style={{ flex: 1 }} />
+              <GhostAction label="Dismiss" onPress={dismissCrash} style={{ flex: 1 }} />
+            </View>
+          </View>
+        )}
+
+        {bleCandidates && bleCandidates.length > 0 && (
+          <View style={{ marginTop: space(6) }}>
+            <SectionRule
+              label="Manual profile"
+              meta="No automatic match"
+              metaColor={color.caution}
+            />
+            <Text style={[type.metaSmall, { marginTop: space(2) }]}>
+              {`Notify ${short(manualNotify)}   Write ${short(manualWrite)}`}
+            </Text>
+            <PrimaryAction
+              label={manualBusy ? 'Connecting' : 'Connect with profile'}
+              onPress={manualConnect}
+              disabled={manualBusy || !manualNotify || !manualWrite}
+              style={{ marginTop: space(2.5) }}
+            />
+            <View style={styles.candidateList}>
+              {bleCandidates.map((c, i) => (
+                <CandidateRow
+                  key={i}
+                  candidate={c}
+                  isNotify={same(manualNotify, c)}
+                  isWrite={same(manualWrite, c)}
+                  onNotify={() => pickManualNotify(c)}
+                  onWrite={() => pickManualWrite(c)}
+                />
+              ))}
+            </View>
+          </View>
+        )}
+
+        <View style={{ marginTop: space(6) }}>
+          <SectionRule
+            label="PID scan"
+            meta={
+              scanProgress
+                ? `${scanProgress.done}/${scanProgress.total}`
+                : scanRows
+                  ? `${scanRows.filter((r) => r.answered).length}/${scanRows.length} answered`
+                  : undefined
+            }
+          />
+          <Note>
+            Probes every PID the ECU claims and writes a report — the definitive answer to what
+            this car actually supports.
+          </Note>
+          <GhostAction
+            label={scanProgress ? `Scanning ${scanProgress.currentPid}` : 'Scan PIDs'}
+            onPress={pidScan}
+            disabled={!linked || scanProgress !== null}
+            style={{ marginTop: space(3) }}
+          />
+        </View>
+
+        {/*
+          Ham trafik. Eskiden ekranın yarısını kaplayan ters çevrilmiş bir
+          FlatList'ti; artık sayfanın içinde sabit yükseklikte bir pencere.
+          VirtualizedList sayfayla aynı yönde kaydırılan bir ScrollView'in
+          içine konulamaz, o yüzden sade ScrollView kullanılıyor — kayıt
+          zaten 500 satırla sınırlı (MAX_LOG_ENTRIES), sanallaştırmaya gerek
+          yok.
+
+          Sıra artık YENİDEN ESKİYE: pencere sayfanın içinde olduğu için
+          otomatik en alta kaydırma yok, dolayısıyla en son satır görünür
+          olan yerde — yani en üstte — durmalı.
+        */}
+        <View style={{ marginTop: space(6) }}>
+          <SectionRule label="Traffic" meta={`${rawLog.length} lines`} />
+          <ScrollView
+            style={styles.logWindow}
+            contentContainerStyle={{ padding: space(2) }}
+            nestedScrollEnabled
+            showsVerticalScrollIndicator={false}
+          >
+            {rawLog.length === 0 ? (
+              <Text style={type.meta}>No traffic yet. Connect the adapter above.</Text>
+            ) : (
+              [...rawLog]
+                .reverse()
+                .map((entry, i) => <LogLine key={`${entry.ts}-${i}`} entry={entry} />)
+            )}
+          </ScrollView>
+          <View style={styles.logActions}>
+            <GhostAction
+              label={logBusy ? 'Preparing' : 'Share log'}
+              onPress={shareLog}
+              disabled={logBusy || rawLog.length === 0}
+              style={{ flex: 1 }}
+            />
+            <GhostAction
+              label="Clear"
+              onPress={clearLog}
+              textTint={color.chrome}
+              style={{ flex: 1 }}
+            />
+          </View>
         </View>
       </ScrollView>
 
@@ -432,6 +726,80 @@ function SoundStat({ label, value }: { label: string; value: number | null }) {
   );
 }
 
+function LogLine({ entry }: { entry: RawLogEntry }) {
+  // Hata satırı: kırmızı metin zemin üzerinde okunmuyor (~2.8:1). Amber
+  // (6.1:1) hem okunur hem "bir şey ters" sinyalini korur; '!' öneki zaten var.
+  const tint =
+    entry.direction === 'error'
+      ? color.caution
+      : entry.direction === 'tx'
+        ? color.linked
+        : entry.direction === 'rx'
+          ? color.ink
+          : color.muted;
+  const prefix =
+    entry.direction === 'tx'
+      ? '>'
+      : entry.direction === 'rx'
+        ? '<'
+        : entry.direction === 'error'
+          ? '!'
+          : '·';
+  return (
+    <Text style={[type.mono, { color: tint, marginVertical: 1 }]}>
+      {`${time(entry.ts)} ${prefix} ${entry.text}`}
+    </Text>
+  );
+}
+
+function CandidateRow({
+  candidate,
+  isNotify,
+  isWrite,
+  onNotify,
+  onWrite,
+}: {
+  candidate: ProfileCandidate;
+  isNotify: boolean;
+  isWrite: boolean;
+  onNotify: () => void;
+  onWrite: () => void;
+}) {
+  return (
+    <View style={styles.candidate}>
+      <Text style={[type.mono, { fontSize: 10 }]}>
+        {`${candidate.serviceUUID.split('-')[0]} / ${candidate.characteristicUUID.split('-')[0]}`}
+      </Text>
+      <View style={styles.candidateActions}>
+        {candidate.isNotifiable && (
+          <Pressable onPress={onNotify} style={styles.candidateBtn}>
+            <Tag text={isNotify ? '✓ Notify' : 'Notify'} tint={isNotify ? color.ink : color.muted} />
+          </Pressable>
+        )}
+        {candidate.isWritable && (
+          <Pressable onPress={onWrite} style={styles.candidateBtn}>
+            <Tag text={isWrite ? '✓ Write' : 'Write'} tint={isWrite ? color.ink : color.muted} />
+          </Pressable>
+        )}
+      </View>
+    </View>
+  );
+}
+
+function same(a: ProfileCandidate | null, b: ProfileCandidate): boolean {
+  return !!a && a.serviceUUID === b.serviceUUID && a.characteristicUUID === b.characteristicUUID;
+}
+
+function short(c: ProfileCandidate | null): string {
+  return c ? c.characteristicUUID.split('-')[0] : '—';
+}
+
+function time(ts: number): string {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 function Fact({ label, value }: { label: string; value: string }) {
   return (
     <View style={styles.factRow}>
@@ -524,4 +892,31 @@ const styles = StyleSheet.create({
   },
   actions: { flexDirection: 'row', gap: space(3), paddingHorizontal: space(5), paddingVertical: space(3) },
   loading: { flex: 1, minHeight: 48, alignItems: 'center', justifyContent: 'center', gap: space(1.5) },
+  buildRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'baseline',
+    paddingTop: space(2.5),
+  },
+  candidateList: { marginTop: space(3) },
+  candidate: {
+    paddingVertical: space(2),
+    borderBottomWidth: hairlineWidth,
+    borderBottomColor: color.hairlineFaint,
+    gap: space(1.5),
+  },
+  candidateActions: { flexDirection: 'row', gap: space(2) },
+  candidateBtn: { minHeight: 32, justifyContent: 'center' },
+  /**
+   * Trafik penceresi. Sabit yükseklik şart: sayfanın içinde yaşayan bir
+   * kayıt, sınırlanmazsa 500 satırla Link ekranını kaydırılamaz hâle getirir.
+   */
+  logWindow: {
+    height: 220,
+    marginTop: space(2),
+    borderWidth: hairlineWidth,
+    borderColor: color.hairlineFaint,
+    backgroundColor: color.groundAlt,
+  },
+  logActions: { flexDirection: 'row', gap: space(3), marginTop: space(3) },
 });

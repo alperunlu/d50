@@ -52,6 +52,15 @@ export default function LiveScreen() {
   const sensorStatus = useAppStore((s) => s.sensorStatus);
 
   const [picking, setPicking] = useState(false);
+  /**
+   * Cycle'ın ön-bilgi ekranı. "Guided" düğmesi doğrudan başlatmıyordu ve
+   * bu yanlıştı: 9 adımlık, soğuk motor isteyen, içinde tam gaz çekiş ve
+   * frensiz yavaşlama olan bir protokole tek dokunuşla, hiçbir şey
+   * okumadan giriliyordu — talimatları sürücü ilk kez ARAÇ HAREKET
+   * HÂLİNDEYKEN görüyordu. Ne yapacağını yola çıkmadan önce bilmesi
+   * gerekiyor.
+   */
+  const [preflight, setPreflight] = useState(false);
   // Sürükleme sırasında ScrollView kilitleniyor; yoksa kart yerine
   // ekran kayıyor.
   const [dragging, setDragging] = useState(false);
@@ -75,6 +84,20 @@ export default function LiveScreen() {
         onToggleSensorChannel={toggleSensorChannel}
         sensorStatus={sensorStatus}
         onDone={() => setPicking(false)}
+      />
+    );
+  }
+
+  if (preflight) {
+    return (
+      <CyclePreflight
+        coolantC={latest(liveSeries['05'])}
+        canStart={!notConnected}
+        onStart={() => {
+          setPreflight(false);
+          void startCycle();
+        }}
+        onCancel={() => setPreflight(false)}
       />
     );
   }
@@ -120,7 +143,7 @@ export default function LiveScreen() {
             {!isRecording && !cycle && (
               <Pressable
                 style={styles.recordChip}
-                onPress={() => void startCycle()}
+                onPress={() => setPreflight(true)}
                 disabled={notConnected}
               >
                 <Text style={[type.status, { color: notConnected ? color.muted : color.chrome }]}>
@@ -207,6 +230,146 @@ export default function LiveScreen() {
   );
 }
 
+
+/** Bir serinin son değeri. */
+function latest(series: readonly { ts: number; value: number }[] | undefined): number | null {
+  if (!series || series.length === 0) return null;
+  return series[series.length - 1].value;
+}
+
+/**
+ * Motorun "soğuk sayılmayı" bıraktığı sıcaklık.
+ *
+ * Cycle'ın ilk üç adımının bütün değeri günün ilk çalıştırmasında: soğuk
+ * rölanti devri, ısınma zenginleştirmesi ve termostat eğrisi başka hiçbir
+ * yerde alınamıyor. Motor zaten ısınmışsa o adımlar çalışır ama ölçmesi
+ * gereken şeyi ölçmez — ve bunu sessizce yapar. Çalışma sıcaklığı 85 °C;
+ * 50 °C "bu araç bugün zaten çalıştı" demek için fazlasıyla yeterli.
+ */
+const COLD_ENGINE_MAX_C = 50;
+
+/**
+ * Cycle'ın ön-bilgi ekranı.
+ *
+ * NEDEN VAR: sürücünün ne yapacağını YOLA ÇIKMADAN ÖNCE bilmesi gerekiyor.
+ * Cycle 9 adım; içinde durur hâlden tam gazla 100'e çıkış ve frene basmadan
+ * 80'den 40'a yavaşlama var. Bunları canlı talimat olarak, araç hareket
+ * hâlindeyken ilk kez okumak hem kötü bir deneyim hem gereksiz bir risk.
+ *
+ * İkinci iş: soğuk motor uyarısı. Adımların üçü yalnızca günün ilk
+ * çalıştırmasında anlamlı ve bunu başlamadan önce söylemek, sonradan
+ * "neden bu ölçüm boş çıktı" sorusunu tamamen ortadan kaldırıyor.
+ */
+function CyclePreflight({
+  coolantC,
+  canStart,
+  onStart,
+  onCancel,
+}: {
+  coolantC: number | null;
+  canStart: boolean;
+  onStart: () => void;
+  onCancel: () => void;
+}) {
+  const holdMinutes = Math.round(
+    CYCLE_STEPS.reduce((total, s) => total + s.holdSeconds, 0) / 60,
+  );
+  const alreadyWarm = coolantC !== null && coolantC > COLD_ENGINE_MAX_C;
+
+  return (
+    <SafeAreaView style={styles.safe} edges={['top', 'bottom']}>
+      <VehicleChrome />
+
+      <View style={styles.body}>
+        <ScrollView contentContainerStyle={styles.scroll} showsVerticalScrollIndicator={false}>
+          <SectionRule label="Guided test cycle" meta={`${CYCLE_STEPS.length} steps`} />
+          <Note>
+            Some measurements need conditions an ordinary drive never produces — a cold start, a
+            steady cruise held in one gear, a clean coast-down. This cycle sets them up in order,
+            and narrows polling to just the channels each step needs so the sensors are sampled
+            fast enough to actually be measured.
+          </Note>
+
+          <View style={styles.preflightFacts}>
+            <PreflightFact
+              label="Time"
+              value={`About ${holdMinutes} minutes of held measurements, plus driving between them.`}
+            />
+            <PreflightFact
+              label="Engine"
+              value="Start cold — ignition on, engine not yet running. Three steps only measure anything on the day's first start."
+            />
+            <PreflightFact
+              label="Road"
+              value="You will need a clear, level stretch: one full-throttle pull to 100 km/h and one coast-down from 80 to 40 with no braking."
+            />
+            <PreflightFact
+              label="Phone"
+              value="Keep the app open and the screen on. Time spent in the background is not recorded."
+            />
+          </View>
+
+          {/*
+            Uyarı yalnızca ÖLÇÜLMÜŞ bir sıcaklık varsa çıkıyor. Veri yokken
+            "motor soğuk mu" diye tahmin etmek, yanlış uyarı üretip
+            uyarının kendisini değersizleştirirdi.
+          */}
+          {alreadyWarm && (
+            <View style={styles.preflightWarning}>
+              <Text style={[type.status, { color: color.caution, fontSize: 12 }]}>
+                ENGINE IS ALREADY WARM
+              </Text>
+              <Text style={[type.meta, { marginTop: space(1.5), lineHeight: 18 }]}>
+                {`Coolant is at ${Math.round(coolantC)} °C, so this is not a cold start. Cold idle, ` +
+                  'oxygen sensor and warm-up steps will run, but they will not measure what they ' +
+                  'are for. Everything after them is unaffected.'}
+              </Text>
+            </View>
+          )}
+
+          <View style={{ marginTop: space(5) }}>
+            <SectionRule label="Steps" />
+            {CYCLE_STEPS.map((step, i) => (
+              <View key={step.id} style={styles.preflightStep}>
+                <Text style={[type.status, styles.preflightStepNumber]}>{String(i + 1)}</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={[type.prose, { color: color.ink }]}>{step.title}</Text>
+                  <Text style={[type.metaSmall, { marginTop: space(0.75), lineHeight: 15 }]}>
+                    {step.instruction}
+                  </Text>
+                </View>
+              </View>
+            ))}
+          </View>
+
+          <Note>
+            You can skip a step you cannot do, and end the cycle at any point. Whatever was
+            recorded up to then is kept.
+          </Note>
+        </ScrollView>
+
+        <View style={styles.preflightActions}>
+          <GhostAction label="Back" onPress={onCancel} style={{ flex: 1 }} />
+          <PrimaryAction
+            label="Start cycle"
+            onPress={onStart}
+            disabled={!canStart}
+            style={{ flex: 1 }}
+          />
+        </View>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+function PreflightFact({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.preflightFact}>
+      <Label small>{label}</Label>
+      <Text style={[type.meta, { marginTop: space(1), lineHeight: 18 }]}>{value}</Text>
+    </View>
+  );
+}
 
 /**
  * Rehberli test cycle'ının paneli.
@@ -549,6 +712,28 @@ const styles = StyleSheet.create({
   },
   rateRow: { flexDirection: 'row', alignItems: 'baseline', gap: space(1.5) },
   topActions: { flexDirection: 'row', gap: space(2.5) },
+  preflightFacts: { marginTop: space(4), gap: space(3.5) },
+  preflightFact: {
+    paddingBottom: space(3),
+    borderBottomWidth: hairlineWidth,
+    borderBottomColor: color.hairlineFaint,
+  },
+  preflightWarning: {
+    marginTop: space(4),
+    padding: space(3),
+    borderWidth: hairlineWidth,
+    borderColor: color.caution,
+    backgroundColor: color.groundAlt,
+  },
+  preflightStep: {
+    flexDirection: 'row',
+    gap: space(3),
+    paddingVertical: space(2.5),
+    borderBottomWidth: hairlineWidth,
+    borderBottomColor: color.hairlineFaint,
+  },
+  preflightStepNumber: { color: color.muted, fontSize: 12, width: 16 },
+  preflightActions: { flexDirection: 'row', gap: space(3), paddingVertical: space(3) },
   cycleTrack: {
     flexDirection: 'row',
     height: hairlineWidth * 3,
