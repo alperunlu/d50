@@ -1,0 +1,173 @@
+/**
+ * SQLite açılışı ve şema migration'ı.
+ *
+ * expo-sqlite kullanır; bu dosya RN'e bağımlı olan tek db modülüdür,
+ * repo.ts ve csv.ts saf mantık içerir ve ayrı test edilebilir olmalıdır.
+ */
+
+import * as SQLite from 'expo-sqlite';
+
+const DB_NAME = 'obd_logger.db';
+
+let dbPromise: Promise<SQLite.SQLiteDatabase> | null = null;
+
+/**
+ * Veritabanını açar (ilk çağrıda) ve şemayı kurar. Sonraki çağrılar aynı
+ * açık bağlantıyı döner.
+ */
+export function getDb(): Promise<SQLite.SQLiteDatabase> {
+  if (!dbPromise) {
+    dbPromise = openAndMigrate();
+  }
+  return dbPromise;
+}
+
+async function openAndMigrate(): Promise<SQLite.SQLiteDatabase> {
+  const db = await SQLite.openDatabaseAsync(DB_NAME);
+
+  await db.execAsync(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      started_at INTEGER NOT NULL,
+      ended_at INTEGER,
+      note TEXT,
+      pids TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS samples (
+      session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      ts INTEGER NOT NULL,
+      pid TEXT NOT NULL,
+      value REAL NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_samples_session_ts
+      ON samples(session_id, ts);
+
+    -- Oturum sırasındaki ham adaptör trafiği. Bellek içi halka tampon
+    -- uygulama kapanınca kayboluyordu; arabadan dönüp "ne olmuştu?" diye
+    -- bakabilmek için oturumla birlikte kalıcılaşıyor.
+    CREATE TABLE IF NOT EXISTS session_logs (
+      session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      ts INTEGER NOT NULL,
+      direction TEXT NOT NULL,
+      text TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_session_logs_session_ts
+      ON session_logs(session_id, ts);
+
+    -- Kullanıcı ayarları (ör. takılı lastik ebadı). Anahtar/değer, çünkü
+    -- ayarların sayısı ve şekli zamanla değişecek; her yeni ayar için
+    -- migration yazmak istemiyoruz.
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
+    -- Rehberli cycle'ın adım sınırları.
+    --
+    -- Trend analizinin ÖN ŞARTI bu tablo: iki rastgele sürüşün rölanti
+    -- sapmasını karşılaştırmak gürültüyü karşılaştırmaktır, aynı cycle
+    -- adımını karşılaştırmak ölçümdür. Hangi örneklerin hangi koşulda
+    -- alındığını yalnızca bu sınırlar söyleyebiliyor.
+    CREATE TABLE IF NOT EXISTS cycle_steps (
+      session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      step_id TEXT NOT NULL,
+      from_ms INTEGER NOT NULL,
+      to_ms INTEGER NOT NULL,
+      skipped INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cycle_steps_session
+      ON cycle_steps(session_id);
+
+    -- Cycle başına çıkarılan skaler ölçümler ("vitals").
+    --
+    -- Ham örnekler zaten duruyor; bunlar onlardan HESAPLANMIŞ, koşulu
+    -- bilinen ve cycle'dan cycle'a karşılaştırılabilir sayılar. Trend
+    -- bunların üstünde kuruluyor: mutlak eşik değil, aracın kendi taban
+    -- çizgisine göre kayma.
+    CREATE TABLE IF NOT EXISTS cycle_vitals (
+      session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+      key TEXT NOT NULL,
+      value REAL NOT NULL,
+      unit TEXT NOT NULL,
+      recorded_at INTEGER NOT NULL,
+      -- Ölçümün koşulu (ör. emme havası sıcaklığı): mevsim etkisini
+      -- ayıklayabilmek için. Onsuz kışın kötüleşen her şey kış olabilir.
+      context TEXT,
+      -- Koşulu KİM kurdu: 'cycle' rehberli adım, 'drive' sıradan bir
+      -- sürüşten veriye bakarak bulunmuş pencere. İkisi aynı seriye
+      -- giriyor çünkü ölçtükleri koşul aynı, ama ayırt edilebilir
+      -- kalmaları gerekiyor: fırsatçı pencere daha gürültülü, ve ileride
+      -- "yalnızca cycle noktalarına bak" demek istenirse veri kaybolmuş
+      -- olmasın.
+      source TEXT NOT NULL DEFAULT 'cycle'
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cycle_vitals_key
+      ON cycle_vitals(key, recorded_at);
+  `);
+
+  await migrateSupportedPids(db);
+  await migrateVitalSource(db);
+  await migrateSessionVin(db);
+
+  return db;
+}
+
+/**
+ * `sessions.supported_pids` sütunu — ECU'nun desteklediğini İDDİA ETTİĞİ
+ * PID bitmask'i (0100/0120/0140), oturumla birlikte saklanıyor.
+ *
+ * Neden gerekiyor: bir oturum sonradan analiz edilirken "bu metrik neden
+ * boş?" sorusunun iki farklı cevabı var — kanal seçilmemiş (kullanıcı
+ * düzeltebilir) ya da araç o sensöre sahip değil (asla düzelmeyecek).
+ * İkisini ayırmak ancak o oturumun aracının ne desteklediğini bilmekle
+ * mümkün; bağlantı koptuktan sonra bu bilgi başka hiçbir yerde yok.
+ *
+ * SQLite'ta "ADD COLUMN IF NOT EXISTS" olmadığı için sütun varlığı
+ * PRAGMA ile kontrol ediliyor. Eski oturumlar NULL kalır ve eskisi gibi
+ * davranır — veri kaybı yok.
+ */
+async function migrateSupportedPids(db: SQLite.SQLiteDatabase): Promise<void> {
+  const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(sessions)');
+  if (columns.some((c) => c.name === 'supported_pids')) return;
+  await db.execAsync('ALTER TABLE sessions ADD COLUMN supported_pids TEXT');
+}
+
+/**
+ * `cycle_vitals.source` sütunu — ölçümün cycle adımından mı yoksa sıradan
+ * bir sürüşten çıkarılmış pencereden mi geldiği.
+ *
+ * `supported_pids` ile aynı gerekçe ve aynı yöntem: SQLite'ta
+ * "ADD COLUMN IF NOT EXISTS" yok. Eski satırlar DEFAULT 'cycle' alır ve bu
+ * doğrudur — sütun eklenmeden önce yazılmış her vital gerçekten bir
+ * cycle'dan gelmişti.
+ */
+async function migrateVitalSource(db: SQLite.SQLiteDatabase): Promise<void> {
+  const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(cycle_vitals)');
+  if (columns.some((c) => c.name === 'source')) return;
+  await db.execAsync("ALTER TABLE cycle_vitals ADD COLUMN source TEXT NOT NULL DEFAULT 'cycle'");
+}
+
+/**
+ * `sessions.vin` sütunu — oturumun HANGİ ARABADAN alındığı.
+ *
+ * Trendin sessiz düşmanı: iki farklı arabanın aynı ölçümü tek seriye
+ * girerse seri anlamını kaybeder ve bunu kimse fark etmez, çünkü sayılar
+ * makul görünmeye devam eder.
+ *
+ * NULL "başka araba" demek değil, "o sırada bilmiyorduk" demek — VIN
+ * okuması eklenmeden önceki her oturum ve Mode 09'u desteklemeyen her ECU
+ * NULL kalır. Bu ayrım `readVitalHistory` içinde kullanılıyor.
+ */
+async function migrateSessionVin(db: SQLite.SQLiteDatabase): Promise<void> {
+  const columns = await db.getAllAsync<{ name: string }>('PRAGMA table_info(sessions)');
+  if (columns.some((c) => c.name === 'vin')) return;
+  await db.execAsync('ALTER TABLE sessions ADD COLUMN vin TEXT');
+}

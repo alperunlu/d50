@@ -1,0 +1,89 @@
+{
+  "expo": {
+    "name": "D50",
+    "slug": "d50",
+    "version": "1.2.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "scheme": "d50",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.alu.d50",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSMotionUsageDescription": "The accelerometer is used to add acceleration/braking intensity to your drive recording. This data is never sent anywhere from your phone."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-sqlite",
+      "expo-sharing",
+      "expo-updates",
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": true,
+      "modes": ["central"],
+          "bluetoothAlwaysPermission": "This app uses Bluetooth to READ engine data from your OBD2 adapter (e.g. Vgate iCar Pro) only. It never writes to or sends commands to the vehicle."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Location is used to add speed, altitude and grade to your drive recording, and continues in the background WHILE A RECORDING IS RUNNING — so you can check the map while driving without losing the recording. The 0-100 km/h time, grade-corrected power estimate, and speedometer error all depend on this data. Location data is never sent anywhere from your phone.",
+          "locationWhenInUsePermission": "Location is used to add speed, altitude and grade to your drive recording. This data is never sent anywhere from your phone.",
+          "isIosBackgroundLocationEnabled": true,
+          "isAndroidBackgroundLocationEnabled": false
+        }
+      ],
+      "expo-font",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/icon.png",
+          "imageWidth": 160,
+          "resizeMode": "contain",
+          "backgroundColor": "#0F2A21"
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "enableBackgroundRecording": true,
+          "microphonePermission": "The microphone is used ONLY to measure sound level (relative dB); any temporary audio file created during measurement is deleted as soon as it ends. No audio is stored, listened to, or sent anywhere from your phone."
+        }
+      ]
+    ],
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "83893338-ca07-458b-9158-992327547057"
+      }
+    },
+    "owner": "alperunlu",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/83893338-ca07-458b-9158-992327547057"
+    }
+  }
+}
