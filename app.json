@@ -42,7 +42,7 @@
         {
           "isBackgroundEnabled": true,
       "modes": ["central"],
-          "bluetoothAlwaysPermission": "This app uses Bluetooth to READ engine data from your OBD2 adapter (e.g. Vgate iCar Pro) only. It never writes to or sends commands to the vehicle."
+          "bluetoothAlwaysPermission": "This app uses Bluetooth to READ engine data from your OBD2 adapter only. It never writes to or sends commands to the vehicle."
         }
       ],
       [

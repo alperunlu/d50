@@ -301,7 +301,7 @@ export function formatDtcReport(
     for (const d of list) {
       const desc =
         d.description ?? (isManufacturerSpecific(d.code) ? '(manufacturer-specific)' : '(no description)');
-      const fc = d.miniFaultCode ? `  [MINI FC ${d.miniFaultCode}]` : '';
+      const fc = d.miniFaultCode ? `  [FC ${d.miniFaultCode}]` : '';
       lines.push(`  ${d.code}  ${desc}${fc}`);
     }
     lines.push('');

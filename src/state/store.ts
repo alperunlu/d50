@@ -767,7 +767,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       appendLog(set, { ts: Date.now(), direction: 'info', text: 'Connecting…' });
       await transport.connect();
-      appendLog(set, { ts: Date.now(), direction: 'info', text: 'Connected, initialising ELM327…' });
+      appendLog(set, { ts: Date.now(), direction: 'info', text: 'Connected, initialising adapter…' });
 
       if (transport instanceof BleTransport) {
         const profile = transport.discoveredProfile;

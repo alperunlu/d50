@@ -217,7 +217,7 @@ function CodeRow({ dtc, dim }: { dtc: Dtc; dim?: boolean }) {
       {(dtc.vehicleSpecific || dtc.miniFaultCode) && (
         <Text style={[type.meta, { marginTop: space(1.25) }]}>
           {[
-            dtc.miniFaultCode ? `MINI fault code ${dtc.miniFaultCode}` : null,
+            dtc.miniFaultCode ? `Manufacturer fault code ${dtc.miniFaultCode}` : null,
             dtc.vehicleSpecific ? 'R50 service data' : null,
           ]
             .filter(Boolean)
@@ -239,7 +239,7 @@ function tagFor(dtc: Dtc): { text: string; tint: string } | null {
   if (/^P03/.test(c)) return { text: 'Misfire', tint: color.caution };
   if (/^P04(4|5)/.test(c)) return { text: 'Evap', tint: color.chrome };
   if (/^P042/.test(c)) return { text: 'Catalyst', tint: color.caution };
-  if (isManufacturerSpecific(c)) return { text: 'MINI', tint: color.chrome };
+  if (isManufacturerSpecific(c)) return { text: 'Maker', tint: color.chrome };
   return null;
 }
 

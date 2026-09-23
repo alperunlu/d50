@@ -55,19 +55,19 @@ const KNOWN_PROFILES: readonly { service: string; notify: string; write: string;
     service: 'e7810a71-73ae-499d-8c15-faa9aef0c3f2',
     notify: 'bef8d6c9-9c21-4c9e-b632-bd58c1009f9f',
     write: 'bef8d6c9-9c21-4c9e-b632-bd58c1009f9f',
-    label: 'Vgate iCar Pro / Vlink (E7810A71)',
+    label: 'Vendor service (E7810A71)',
   },
   {
     service: '0000ffe0-0000-1000-8000-00805f9b34fb',
     notify: '0000ffe1-0000-1000-8000-00805f9b34fb',
     write: '0000ffe1-0000-1000-8000-00805f9b34fb',
-    label: 'FFE0/FFE1 (older iCar Pro unit)',
+    label: 'FFE0/FFE1',
   },
   {
     service: '0000fff0-0000-1000-8000-00805f9b34fb',
     notify: '0000fff1-0000-1000-8000-00805f9b34fb',
     write: '0000fff2-0000-1000-8000-00805f9b34fb',
-    label: 'FFF0/FFF1+FFF2 (iCar Pro v3+)',
+    label: 'FFF0/FFF1+FFF2',
   },
   {
     service: '000018f0-0000-1000-8000-00805f9b34fb',
