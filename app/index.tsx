@@ -243,7 +243,8 @@ export default function LinkScreen() {
 
               {scanning && scanResults.length === 0 && (
                 <Text style={[type.meta, { marginTop: space(3) }]}>
-                  Ignition on, adapter plugged in.
+                  No OBD-II adapter found nearby yet. Only OBD-II adapters are listed — turn
+                  the ignition on and check the adapter is plugged in.
                 </Text>
               )}
             </View>

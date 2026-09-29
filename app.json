@@ -48,9 +48,9 @@
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "Location is used to add speed, altitude and grade to your drive recording, and continues in the background WHILE A RECORDING IS RUNNING — so you can check the map while driving without losing the recording. The 0-100 km/h time, grade-corrected power estimate, and speedometer error all depend on this data. Location data is never sent anywhere from your phone.",
+          "locationAlwaysAndWhenInUsePermission": "Location is used to add speed, altitude and grade to your drive recording while the app is open. The 0-100 km/h time, grade-corrected power estimate, and speedometer error all depend on this data. Location data is never sent anywhere from your phone.",
           "locationWhenInUsePermission": "Location is used to add speed, altitude and grade to your drive recording. This data is never sent anywhere from your phone.",
-          "isIosBackgroundLocationEnabled": true,
+          "isIosBackgroundLocationEnabled": false,
           "isAndroidBackgroundLocationEnabled": false
         }
       ],
@@ -67,7 +67,8 @@
       [
         "expo-audio",
         {
-          "enableBackgroundRecording": true,
+          "enableBackgroundRecording": false,
+          "enableBackgroundPlayback": false,
           "microphonePermission": "The microphone is used ONLY to measure sound level (relative dB); any temporary audio file created during measurement is deleted as soon as it ends. No audio is stored, listened to, or sent anywhere from your phone."
         }
       ]

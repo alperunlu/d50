@@ -25,6 +25,8 @@ export interface ScannedDevice {
   readonly id: string;
   readonly name: string | null;
   readonly rssi: number | null;
+  /** Reklam paketinde duyurulan servisler. Çoğu cihaz boş bırakır. */
+  readonly serviceUUIDs: readonly string[];
 }
 
 interface PendingRequest {
@@ -172,6 +174,7 @@ export class BleTransport implements ObdTransport {
             id: device.id,
             name: device.name ?? device.localName ?? null,
             rssi: device.rssi,
+            serviceUUIDs: device.serviceUUIDs ?? [],
           });
         }
       });
